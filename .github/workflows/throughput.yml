@@ -1,0 +1,89 @@
+name: Throughput benchmark
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  TOLERANCE_PERCENTAGE: 10.0 # 10% tolerance (fitting has more variance than BOOM)
+
+jobs:
+  benchmark:
+    name: Run throughput benchmark
+    runs-on: ubuntu-latest
+    permissions: write-all
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --tests
+
+      - name: Run throughput benchmark
+        run: cargo test --release throughput -- --ignored --nocapture
+
+      - name: Upload wall_time.txt as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-logs
+          path: wall_time.txt
+
+      - name: Download baseline benchmark (PR only)
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v11
+        with:
+          workflow: throughput.yml
+          branch: main
+          name: throughput-logs
+          path: ./baseline
+          if_no_artifact_found: warn
+        continue-on-error: true
+
+      - name: Compare with baseline (PR only)
+        id: compare-with-baseline
+        if: github.event_name == 'pull_request'
+        run: |
+          current=$(cat wall_time.txt)
+          echo "Current wall time: $current seconds"
+          if [ -f ./baseline/wall_time.txt ]; then
+            baseline=$(cat ./baseline/wall_time.txt)
+            echo "Baseline wall time: $baseline seconds"
+            percentage_diff=$(echo "scale=2; (($current - $baseline) / $baseline) * 100" | bc)
+          else
+            echo "No baseline wall time found. Skipping comparison."
+            baseline="N/A"
+            percentage_diff=0
+          fi
+
+          echo "Percentage difference: $percentage_diff%"
+
+          echo "percentage_diff=$percentage_diff" >> $GITHUB_OUTPUT
+          echo "baseline=$baseline" >> $GITHUB_OUTPUT
+          echo "current=$current" >> $GITHUB_OUTPUT
+
+      - name: Post comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Throughput results (`${{ github.sha }}`):
+            | New wall time | Baseline wall time | Difference |
+            | -------------- | ------------------ | ---------- |
+            | ${{ steps.compare-with-baseline.outputs.current }} | ${{ steps.compare-with-baseline.outputs.baseline }} | ${{ steps.compare-with-baseline.outputs.percentage_diff }}% |
+          edit-mode: replace
+
+      - name: Fail if wall time increased too much (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          percentage_diff=${{ steps.compare-with-baseline.outputs.percentage_diff }}
+          if (( $(echo "$percentage_diff > $TOLERANCE_PERCENTAGE" | bc -l) )); then
+            echo "Wall time increased by $percentage_diff%, which is more than the allowed $TOLERANCE_PERCENTAGE%."
+            exit 1
+          fi
