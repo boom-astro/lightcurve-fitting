@@ -1,0 +1,18 @@
+[package]
+name = "lightcurve-fitting"
+version = "0.1.0"
+edition = "2021"
+description = "Lightcurve fitting for astronomical transients"
+license = "GPL-3.0"
+
+[dependencies]
+sklears-gaussian-process = "0.1.0-beta.1"
+sklears-core = "0.1.0-beta.1"
+scirs2-core = { version = "0.2.0", features = ["random", "linalg"] }
+argmin = "0.11.0"
+argmin-math = { version = "0.5", features = ["vec"] }
+ndarray = "0.16.1"
+rand = "0.9.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+itertools = "0.14.0"
