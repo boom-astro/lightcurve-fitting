@@ -5,7 +5,7 @@ use argmin::solver::particleswarm::ParticleSwarm;
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use sklears_core::traits::Predict;
-use sklears_gaussian_process::GprTrained;
+use sklears_gaussian_process::{GaussianProcessRegressor, GprTrained};
 
 use crate::common::BandData;
 use crate::gp::{fit_sklears_gp, subsample_data};
@@ -154,9 +154,9 @@ fn fit_ref_band_gp(
         1e-4
     };
 
-    let amp_candidates = [0.1, 0.2, 0.4];
+    let amp_candidates = [0.1, 0.3];
     let ls_factors = [6.0, 12.0, 24.0];
-    let alpha_candidates = [avg_error_var.max(1e-6), avg_error_var.max(1e-4)];
+    let alpha_candidates = [avg_error_var.max(1e-6)];
 
     let xt_sub = scirs2_core::ndarray::Array1::from_vec(band_data.times.clone())
         .view()
@@ -216,10 +216,12 @@ fn fit_ref_band_gp(
 
 /// Fit a blackbody temperature model to cross-band color differences.
 ///
-/// Fits a GP to the reference band (g preferred, r fallback), then for each
-/// observation in non-reference bands computes a color residual. A 2-parameter
-/// model (log_T0, cooling_rate) is fit via PSO.
-pub fn fit_thermal(bands: &HashMap<String, BandData>) -> Option<ThermalResult> {
+/// If `prefit_gps` is provided (e.g. from `fit_nonparametric`), the reference
+/// band GP is reused instead of fitting a new one.
+pub fn fit_thermal(
+    bands: &HashMap<String, BandData>,
+    prefit_gps: Option<&HashMap<String, GaussianProcessRegressor<GprTrained>>>,
+) -> Option<ThermalResult> {
     // Choose reference band: prefer g (bluest = most temperature-sensitive)
     let ref_band_name = if bands.get("g").map_or(false, |b| b.times.len() >= 5) {
         "g"
@@ -246,8 +248,16 @@ pub fn fit_thermal(bands: &HashMap<String, BandData>) -> Option<ThermalResult> {
         return None;
     }
 
-    // Fit GP to reference band
-    let gp = fit_ref_band_gp(ref_data, duration)?;
+    // Reuse pre-fitted GP if available, otherwise fit one
+    let gp = if let Some(gps) = prefit_gps {
+        if let Some(existing) = gps.get(ref_band_name) {
+            existing.clone()
+        } else {
+            fit_ref_band_gp(ref_data, duration)?
+        }
+    } else {
+        fit_ref_band_gp(ref_data, duration)?
+    };
 
     // Build color observations from non-reference bands
     let mut color_obs = Vec::new();
@@ -320,16 +330,16 @@ pub fn fit_thermal(bands: &HashMap<String, BandData>) -> Option<ThermalResult> {
         lambda_ref,
     };
 
-    // Run 5 PSO restarts to estimate uncertainties
-    let n_restarts = 5;
+    // Run 2 PSO restarts to estimate uncertainties (2D problem converges fast)
+    let n_restarts = 2;
     let mut best_params_all: Vec<[f64; 2]> = Vec::new();
     let mut best_cost_overall = f64::INFINITY;
     let mut best_params_overall = [4.5, -0.005]; // sensible default
 
     for _ in 0..n_restarts {
-        let solver = ParticleSwarm::new((lower.clone(), upper.clone()), 30);
+        let solver = ParticleSwarm::new((lower.clone(), upper.clone()), 10);
         let res = Executor::new(problem.clone(), solver)
-            .configure(|state| state.max_iters(80))
+            .configure(|state| state.max_iters(30))
             .run();
 
         if let Ok(result) = res {
@@ -359,7 +369,7 @@ pub fn fit_thermal(bands: &HashMap<String, BandData>) -> Option<ThermalResult> {
     }
 
     // Estimate uncertainties from std dev of best particles across restarts
-    let (log_t0_err, cooling_rate_err) = if best_params_all.len() >= 3 {
+    let (log_t0_err, cooling_rate_err) = if best_params_all.len() >= 2 {
         let mean_log_t0 =
             best_params_all.iter().map(|p| p[0]).sum::<f64>() / best_params_all.len() as f64;
         let mean_cr =

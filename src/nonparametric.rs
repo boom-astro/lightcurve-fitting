@@ -538,9 +538,14 @@ fn compute_post_peak_monotonicity(pred: &[f64], peak_idx: usize) -> f64 {
 /// Fit nonparametric GP models to all bands.
 ///
 /// `bands` maps band names to `BandData` containing magnitude values.
-pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<NonparametricBandResult> {
+///
+/// Returns the per-band results and the trained GP for each band (for reuse
+/// by downstream fitters such as `fit_thermal`).
+pub fn fit_nonparametric(
+    bands: &HashMap<String, BandData>,
+) -> (Vec<NonparametricBandResult>, HashMap<String, GaussianProcessRegressor<GprTrained>>) {
     if bands.is_empty() {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
 
     let mut t_min = f64::INFINITY;
@@ -553,7 +558,7 @@ pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<Nonparametric
     }
     let duration = t_max - t_min;
     if duration <= 0.0 {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
 
     let n_pred = 50;
@@ -564,10 +569,11 @@ pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<Nonparametric
     let times_pred_2d = times_pred_arr.view().insert_axis(Axis(1)).to_owned();
 
     let min_points_for_independent_fit = 5;
-    let amp_candidates = vec![0.05, 0.1, 0.2, 0.4];
-    let ls_factors = vec![4.0, 6.0, 8.0, 12.0, 16.0, 24.0];
+    let amp_candidates = vec![0.1, 0.3];
+    let ls_factors = vec![6.0, 12.0, 24.0];
 
     let mut results = Vec::new();
+    let mut trained_gps: HashMap<String, GaussianProcessRegressor<GprTrained>> = HashMap::new();
 
     for (band_name, band_data) in bands {
         if band_data.times.len() < min_points_for_independent_fit {
@@ -595,7 +601,7 @@ pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<Nonparametric
         } else {
             1e-4
         };
-        let alpha_candidates = vec![avg_error_var.max(1e-6), avg_error_var.max(1e-4)];
+        let alpha_candidates = vec![avg_error_var.max(1e-6)];
 
         // Compute minimum lengthscale from data sampling
         let mut dt_vec: Vec<f64> = (1..times_arr.len())
@@ -685,6 +691,7 @@ pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<Nonparametric
         }
 
         if let Some(gp_fit) = best_gp {
+            trained_gps.insert(band_name.clone(), gp_fit.clone());
             // Get spatially-varying uncertainty from predict_with_std
             let (pred, mut std_vec) =
                 if let Ok((pred_arr, pred_std_arr)) = gp_fit.predict_with_std(&times_pred_2d) {
@@ -844,5 +851,5 @@ pub fn fit_nonparametric(bands: &HashMap<String, BandData>) -> Vec<Nonparametric
         }
     }
 
-    results
+    (results, trained_gps)
 }

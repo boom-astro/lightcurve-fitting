@@ -6,7 +6,7 @@ use lightcurve_fitting::{build_mag_bands, fit_thermal};
 fn thermal_returns_result() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 700);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands);
+    let result = fit_thermal(&mag_bands, None);
     assert!(result.is_some(), "fit_thermal should return Some");
 }
 
@@ -14,7 +14,7 @@ fn thermal_returns_result() {
 fn thermal_log_temp_in_range() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 800);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands).unwrap();
+    let result = fit_thermal(&mag_bands, None).unwrap();
 
     if let Some(log_temp) = result.log_temp_peak {
         assert!(
@@ -28,7 +28,7 @@ fn thermal_log_temp_in_range() {
 fn thermal_chi2_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 900);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands).unwrap();
+    let result = fit_thermal(&mag_bands, None).unwrap();
 
     if let Some(chi2) = result.chi2 {
         assert!(chi2.is_finite(), "chi2 should be finite, got {chi2}");
@@ -40,7 +40,7 @@ fn thermal_chi2_finite() {
 fn thermal_ref_band_is_g_or_r() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1000);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands).unwrap();
+    let result = fit_thermal(&mag_bands, None).unwrap();
 
     assert!(
         result.ref_band == "g" || result.ref_band == "r",
@@ -53,7 +53,7 @@ fn thermal_ref_band_is_g_or_r() {
 fn thermal_n_bands_used() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1100);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands).unwrap();
+    let result = fit_thermal(&mag_bands, None).unwrap();
 
     // With g, r, i we should use at least 1 non-reference band
     assert!(
@@ -67,7 +67,7 @@ fn thermal_n_bands_used() {
 fn thermal_n_color_obs() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1200);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands).unwrap();
+    let result = fit_thermal(&mag_bands, None).unwrap();
 
     // With 30 points in r and i bands, should have many color observations
     assert!(
@@ -79,7 +79,7 @@ fn thermal_n_color_obs() {
 
 #[test]
 fn thermal_empty_bands() {
-    let result = fit_thermal(&std::collections::HashMap::new());
+    let result = fit_thermal(&std::collections::HashMap::new(), None);
     assert!(result.is_none(), "empty bands should return None");
 }
 
@@ -91,7 +91,7 @@ fn thermal_single_band_returns_none() {
     let errs = vec![0.1; 5];
     let bands: Vec<String> = vec!["r".to_string(); 5];
     let mag_bands = lightcurve_fitting::build_mag_bands(&times, &mags, &errs, &bands);
-    let result = fit_thermal(&mag_bands);
+    let result = fit_thermal(&mag_bands, None);
     // Should return Some but with None fields (no color info) or None
     if let Some(r) = result {
         // Only one band, n_color_obs should be 0

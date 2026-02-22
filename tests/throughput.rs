@@ -16,7 +16,7 @@ fn throughput_benchmark() {
         let mag_bands = build_mag_bands(times, mags, errs, bands);
         let flux_bands = build_flux_bands(times, mags, errs, bands);
 
-        let np_results = fit_nonparametric(&mag_bands);
+        let (np_results, trained_gps) = fit_nonparametric(&mag_bands);
         assert!(
             !np_results.is_empty(),
             "source {i}: nonparametric should return results"
@@ -28,7 +28,7 @@ fn throughput_benchmark() {
             "source {i}: parametric should return results"
         );
 
-        let t_result = fit_thermal(&mag_bands);
+        let t_result = fit_thermal(&mag_bands, Some(&trained_gps));
         assert!(
             t_result.is_some(),
             "source {i}: thermal should return Some"

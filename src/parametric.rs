@@ -904,11 +904,18 @@ fn profile_t0_search(
 // PSO model selection
 // ---------------------------------------------------------------------------
 
-fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>) {
-    const EARLY_STOP: f64 = -3.0;
+/// Bazin-first early stopping threshold for PSO model selection.
+///
+/// If Bazin's per-observation negative log-likelihood is below this value,
+/// the remaining 7 models are skipped.  For well-fit data with typical
+/// photometric errors the cost lands in the range [−4, 0]; a threshold of
+/// 2.0 means "Bazin is an acceptable fit" and avoids spending ~170 ms on
+/// exotic models that won't win.
+const BAZIN_GOOD_ENOUGH: f64 = 2.0;
 
+fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>) {
     let models: &[SviModel] = &[
-        SviModel::Bazin,
+        SviModel::Bazin,      // always first – early-stop gate
         SviModel::Arnett,
         SviModel::Tde,
         SviModel::Afterglow,
@@ -952,7 +959,9 @@ fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<Svi
                 all_chi2.insert(model.to_name(), None);
             }
         }
-        if best_chi2 < EARLY_STOP {
+
+        // After Bazin (first model): if it fits well enough, skip the rest
+        if model == SviModel::Bazin && best_chi2 < BAZIN_GOOD_ENOUGH {
             early_stopped = true;
             break;
         }

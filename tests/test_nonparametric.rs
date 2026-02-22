@@ -6,7 +6,7 @@ use lightcurve_fitting::{build_mag_bands, fit_nonparametric};
 fn nonparametric_returns_results_for_each_band() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 123);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     assert!(
         !results.is_empty(),
@@ -26,7 +26,7 @@ fn nonparametric_returns_results_for_each_band() {
 fn nonparametric_peak_mag_is_brightest() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 456);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     for result in &results {
         if let Some(peak) = result.peak_mag {
@@ -49,7 +49,7 @@ fn nonparametric_peak_mag_is_brightest() {
 fn nonparametric_t0_in_range() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 789);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     // t0 should be within the time range of the data (relative time)
     let t_max: f64 = mag_bands
@@ -71,7 +71,7 @@ fn nonparametric_t0_in_range() {
 fn nonparametric_chi2_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 321);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     for result in &results {
         if let Some(chi2) = result.chi2 {
@@ -85,7 +85,7 @@ fn nonparametric_chi2_finite() {
 fn nonparametric_new_features_present() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 654);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     for result in &results {
         // These fields exist (may be None if data insufficient, but struct has them)
@@ -111,7 +111,7 @@ fn nonparametric_new_features_present() {
 fn nonparametric_n_obs_correct() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 111);
     let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
-    let results = fit_nonparametric(&mag_bands);
+    let (results, _gps) = fit_nonparametric(&mag_bands);
 
     for result in &results {
         let expected = mag_bands[&result.band].values.len();
@@ -124,6 +124,7 @@ fn nonparametric_n_obs_correct() {
 
 #[test]
 fn nonparametric_empty_bands() {
-    let results = fit_nonparametric(&std::collections::HashMap::new());
+    let (results, gps) = fit_nonparametric(&std::collections::HashMap::new());
     assert!(results.is_empty());
+    assert!(gps.is_empty());
 }
