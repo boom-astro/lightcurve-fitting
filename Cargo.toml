@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Lightcurve fitting for astronomical transients"
 license = "GPL-3.0"
+repository = "https://github.com/boom-astro/lightcurve-fitting"
+homepage = "https://github.com/boom-astro/lightcurve-fitting"
 
 [dependencies]
 sklears-gaussian-process = "0.1.0-beta.1"
