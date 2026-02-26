@@ -7,7 +7,7 @@ use lightcurve_fitting::{build_flux_bands, fit_parametric};
 fn parametric_returns_results() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 100);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     assert!(
         !results.is_empty(),
@@ -19,7 +19,7 @@ fn parametric_returns_results() {
 fn parametric_pso_chi2_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 200);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     for result in &results {
         if let Some(chi2) = result.pso_chi2 {
@@ -32,7 +32,7 @@ fn parametric_pso_chi2_finite() {
 fn parametric_svi_mu_correct_length() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 300);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     for result in &results {
         let expected_len = match result.model {
@@ -64,7 +64,7 @@ fn parametric_svi_mu_correct_length() {
 fn parametric_per_model_chi2_populated() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 400);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     for result in &results {
         // per_model_chi2 should have entries (some may be None due to early stopping)
@@ -84,7 +84,7 @@ fn parametric_per_model_chi2_populated() {
 fn parametric_n_obs_correct() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 500);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     for result in &results {
         let band_data = &flux_bands[&result.band];
@@ -98,7 +98,7 @@ fn parametric_n_obs_correct() {
 
 #[test]
 fn parametric_empty_bands() {
-    let results = fit_parametric(&std::collections::HashMap::new());
+    let results = fit_parametric(&std::collections::HashMap::new(), false);
     assert!(results.is_empty());
 }
 
@@ -106,7 +106,7 @@ fn parametric_empty_bands() {
 fn parametric_svi_elbo_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 600);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands);
+    let results = fit_parametric(&flux_bands, false);
 
     for result in &results {
         if let Some(elbo) = result.svi_elbo {

@@ -913,7 +913,7 @@ fn profile_t0_search(
 /// exotic models that won't win.
 const BAZIN_GOOD_ENOUGH: f64 = 2.0;
 
-fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>) {
+fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>, HashMap<SviModelName, Vec<f64>>) {
     let models: &[SviModel] = &[
         SviModel::Bazin,      // always first – early-stop gate
         SviModel::Arnett,
@@ -929,6 +929,7 @@ fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<Svi
     let mut best_params = vec![];
     let mut best_chi2 = f64::INFINITY;
     let mut all_chi2: HashMap<SviModelName, Option<f64>> = HashMap::new();
+    let mut all_params: HashMap<SviModelName, Vec<f64>> = HashMap::new();
 
     let mut early_stopped = false;
     for &model in models {
@@ -948,11 +949,15 @@ fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<Svi
         match res {
             Ok(res) => {
                 let chi2 = res.state().get_cost();
+                let params = res.state().get_best_param().unwrap().position.clone();
                 all_chi2.insert(model.to_name(), finite_or_none(chi2));
+                if fit_all_models {
+                    all_params.insert(model.to_name(), params.clone());
+                }
                 if chi2 < best_chi2 {
                     best_chi2 = chi2;
                     best_model = model;
-                    best_params = res.state().get_best_param().unwrap().position.clone();
+                    best_params = params;
                 }
             }
             Err(_) => {
@@ -961,7 +966,7 @@ fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<Svi
         }
 
         // After Bazin (first model): if it fits well enough, skip the rest
-        if model == SviModel::Bazin && best_chi2 < BAZIN_GOOD_ENOUGH {
+        if !fit_all_models && model == SviModel::Bazin && best_chi2 < BAZIN_GOOD_ENOUGH {
             early_stopped = true;
             break;
         }
@@ -974,7 +979,7 @@ fn pso_model_select(data: &BandFitData) -> (SviModel, Vec<f64>, f64, HashMap<Svi
         }
     }
 
-    (best_model, best_params, best_chi2, all_chi2)
+    (best_model, best_params, best_chi2, all_chi2, all_params)
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,13 +1551,42 @@ pub struct ParametricBandResult {
     pub n_obs: usize,
     pub mag_chi2: Option<f64>,
     pub per_model_chi2: HashMap<SviModelName, Option<f64>>,
+    /// PSO best-fit parameters for every model attempted (populated when
+    /// fit_all_models is true).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub per_model_params: HashMap<SviModelName, Vec<f64>>,
+}
+
+/// Evaluate a parametric model at the given times.
+///
+/// `model` selects which lightcurve model to use.
+/// `params` are the internal (transformed) parameters — pass `pso_params` or
+/// `svi_mu` from a `ParametricBandResult` directly.
+/// `times` are the time values (relative days) at which to evaluate.
+///
+/// Returns a Vec of predicted flux values, one per time point.
+pub fn eval_model_flux(model: SviModelName, params: &[f64], times: &[f64]) -> Vec<f64> {
+    let m = match model {
+        SviModelName::Bazin => SviModel::Bazin,
+        SviModelName::Villar => SviModel::Villar,
+        SviModelName::MetzgerKN => SviModel::MetzgerKN,
+        SviModelName::Tde => SviModel::Tde,
+        SviModelName::Arnett => SviModel::Arnett,
+        SviModelName::Magnetar => SviModel::Magnetar,
+        SviModelName::ShockCooling => SviModel::ShockCooling,
+        SviModelName::Afterglow => SviModel::Afterglow,
+    };
+    if m == SviModel::MetzgerKN {
+        return metzger_kn_eval_batch(params, times);
+    }
+    times.iter().map(|&t| eval_model(m, params, t)).collect()
 }
 
 /// Fit parametric lightcurve models to all bands.
 ///
 /// `bands` maps band names to `BandData` containing flux values.
 /// Uses PSO for model selection, then SVI for posterior inference.
-pub fn fit_parametric(bands: &HashMap<String, BandData>) -> Vec<ParametricBandResult> {
+pub fn fit_parametric(bands: &HashMap<String, BandData>, fit_all_models: bool) -> Vec<ParametricBandResult> {
     if bands.is_empty() {
         return Vec::new();
     }
@@ -1619,7 +1653,7 @@ pub fn fit_parametric(bands: &HashMap<String, BandData>) -> Vec<ParametricBandRe
 
     for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
         // Step 1: PSO model selection
-        let (pso_model, pso_params, pso_chi2, per_model_chi2) = pso_model_select(data);
+        let (pso_model, pso_params, pso_chi2, per_model_chi2, per_model_params) = pso_model_select(data, fit_all_models);
 
         if pso_params.is_empty() {
             continue;
@@ -1681,6 +1715,7 @@ pub fn fit_parametric(bands: &HashMap<String, BandData>) -> Vec<ParametricBandRe
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
             per_model_chi2,
+            per_model_params,
         });
     }
 

@@ -1,0 +1,15 @@
+[package]
+name = "lightcurve-fitting-python"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "lightcurve_fitting"
+crate-type = ["cdylib"]
+
+[dependencies]
+lightcurve-fitting = { path = ".." }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+pythonize = "0.23"
+serde_json = "1.0"

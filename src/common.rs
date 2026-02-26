@@ -7,7 +7,7 @@ use crate::parametric::ParametricBandResult;
 use crate::thermal::ThermalResult;
 
 /// Per-band time/value/error triplet for fitting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BandData {
     pub times: Vec<f64>,
     pub values: Vec<f64>,
