@@ -1,13 +1,13 @@
 mod synthetic;
 
 use lightcurve_fitting::parametric::SviModelName;
-use lightcurve_fitting::{build_flux_bands, fit_parametric};
+use lightcurve_fitting::{build_flux_bands, fit_parametric, UncertaintyMethod};
 
 #[test]
 fn parametric_returns_results() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 100);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     assert!(
         !results.is_empty(),
@@ -19,7 +19,7 @@ fn parametric_returns_results() {
 fn parametric_pso_chi2_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 200);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     for result in &results {
         if let Some(chi2) = result.pso_chi2 {
@@ -32,7 +32,7 @@ fn parametric_pso_chi2_finite() {
 fn parametric_svi_mu_correct_length() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 300);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     for result in &results {
         let expected_len = match result.model {
@@ -64,7 +64,7 @@ fn parametric_svi_mu_correct_length() {
 fn parametric_per_model_chi2_populated() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 400);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     for result in &results {
         // per_model_chi2 should have entries (some may be None due to early stopping)
@@ -84,7 +84,7 @@ fn parametric_per_model_chi2_populated() {
 fn parametric_n_obs_correct() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 500);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     for result in &results {
         let band_data = &flux_bands[&result.band];
@@ -98,7 +98,7 @@ fn parametric_n_obs_correct() {
 
 #[test]
 fn parametric_empty_bands() {
-    let results = fit_parametric(&std::collections::HashMap::new(), false);
+    let results = fit_parametric(&std::collections::HashMap::new(), false, UncertaintyMethod::Svi);
     assert!(results.is_empty());
 }
 
@@ -106,11 +106,101 @@ fn parametric_empty_bands() {
 fn parametric_svi_elbo_finite() {
     let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 600);
     let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
-    let results = fit_parametric(&flux_bands, false);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
 
     for result in &results {
         if let Some(elbo) = result.svi_elbo {
             assert!(elbo.is_finite(), "svi_elbo should be finite, got {elbo}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Laplace approximation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parametric_laplace_returns_results() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 700);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Laplace);
+
+    assert!(
+        !results.is_empty(),
+        "laplace should return at least one band result"
+    );
+    for result in &results {
+        assert_eq!(
+            result.uncertainty_method,
+            UncertaintyMethod::Laplace,
+            "uncertainty_method should be Laplace"
+        );
+    }
+}
+
+#[test]
+fn parametric_laplace_mu_correct_length() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 800);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Laplace);
+
+    for result in &results {
+        let expected_len = match result.model {
+            SviModelName::Bazin => 6,
+            SviModelName::Villar => 7,
+            SviModelName::MetzgerKN => 5,
+            SviModelName::Tde => 7,
+            SviModelName::Arnett => 5,
+            SviModelName::Magnetar => 5,
+            SviModelName::ShockCooling => 5,
+            SviModelName::Afterglow => 6,
+        };
+        assert_eq!(
+            result.svi_mu.len(),
+            expected_len,
+            "laplace mu should have {expected_len} params for {:?}, got {}",
+            result.model,
+            result.svi_mu.len()
+        );
+        assert_eq!(
+            result.svi_log_sigma.len(),
+            expected_len,
+            "laplace log_sigma should match mu length"
+        );
+    }
+}
+
+#[test]
+fn parametric_laplace_log_sigma_finite() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 900);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Laplace);
+
+    for result in &results {
+        for (j, &ls) in result.svi_log_sigma.iter().enumerate() {
+            assert!(
+                ls.is_finite(),
+                "laplace log_sigma[{j}] should be finite, got {ls} for {:?}",
+                result.model
+            );
+        }
+    }
+}
+
+#[test]
+fn parametric_laplace_uncertainties_reasonable() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1000);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric(&flux_bands, false, UncertaintyMethod::Laplace);
+
+    for result in &results {
+        for (j, &ls) in result.svi_log_sigma.iter().enumerate() {
+            let sigma = ls.exp();
+            assert!(
+                sigma > 0.0 && sigma < 1e4,
+                "laplace sigma[{j}] = {sigma} out of (0, 1e4) range for {:?}",
+                result.model
+            );
         }
     }
 }

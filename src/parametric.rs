@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{finite_or_none, BandData};
 
+/// Selects the uncertainty estimation method used after PSO model selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UncertaintyMethod {
+    /// Stochastic Variational Inference (default).
+    #[default]
+    Svi,
+    /// Laplace approximation using Hessian at MAP estimate.
+    Laplace,
+}
+
 // Physical constants (CGS)
 const MSUN_CGS: f64 = 1.989e33;
 const C_CGS: f64 = 2.998e10;
@@ -693,7 +703,9 @@ fn log_normal_cdf(x: f64) -> f64 {
 struct PsoCost<'a> {
     times: &'a [f64],
     flux: &'a [f64],
+    #[allow(dead_code)]
     flux_err: &'a [f64],
+    obs_var: &'a [f64],
     is_upper: &'a [bool],
     upper_flux: &'a [f64],
     model: SviModel,
@@ -731,7 +743,7 @@ impl CostFunction for PsoCost<'_> {
             if !pred.is_finite() {
                 return Ok(1e99);
             }
-            let total_var = self.flux_err[i] * self.flux_err[i] + sigma_extra_sq + 1e-10;
+            let total_var = self.obs_var[i] + sigma_extra_sq;
             if self.is_upper[i] {
                 let z = (self.upper_flux[i] - pred) / total_var.sqrt();
                 neg_ll -= log_normal_cdf(z);
@@ -845,6 +857,7 @@ fn profile_t0_search(
             times: &data.times,
             flux: &data.flux,
             flux_err: &data.flux_err,
+            obs_var: &data.obs_var,
             is_upper: &data.is_upper,
             upper_flux: &data.upper_flux,
             model,
@@ -938,6 +951,7 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
             times: &data.times,
             flux: &data.flux,
             flux_err: &data.flux_err,
+            obs_var: &data.obs_var,
             is_upper: &data.is_upper,
             upper_flux: &data.upper_flux,
             model,
@@ -1154,7 +1168,7 @@ fn svi_fit(
 
     let mut adam = ManualAdam::new(n_variational, lr);
     let mut rng = SmallRng::seed_from_u64(42);
-    let obs_var: Vec<f64> = data.flux_err.iter().map(|e| e * e + 1e-10).collect();
+    let obs_var = &data.obs_var;
     let se_idx = model.sigma_extra_idx();
     let priors = prior_params(model);
 
@@ -1340,6 +1354,219 @@ fn svi_fit(
 }
 
 // ---------------------------------------------------------------------------
+// Laplace approximation
+// ---------------------------------------------------------------------------
+
+/// Unnormalized negative log-posterior: -log p(D|θ) - log p(θ).
+///
+/// Unlike `PsoCost::cost` this is NOT divided by n, because Laplace needs
+/// the true curvature of the posterior.
+fn neg_log_posterior(model: SviModel, data: &BandFitData, params: &[f64]) -> f64 {
+    let se_idx = model.sigma_extra_idx();
+    let sigma_extra = params[se_idx].exp();
+    let sigma_extra_sq = sigma_extra * sigma_extra;
+    let mut preds = eval_model_batch(model, params, &data.times);
+
+    if model == SviModel::MetzgerKN {
+        let max_pred = preds
+            .iter()
+            .zip(data.is_upper.iter())
+            .filter(|(_, is_up)| !**is_up)
+            .map(|(p, _)| *p)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_pred > 1e-10 && max_pred.is_finite() {
+            let scale = (1.0 / max_pred).clamp(0.1, 10.0);
+            for pred in preds.iter_mut() {
+                *pred *= scale;
+            }
+        }
+    }
+
+    let mut neg_ll = 0.0;
+    for i in 0..data.times.len() {
+        let pred = preds[i];
+        if !pred.is_finite() {
+            return 1e99;
+        }
+        let total_var = data.obs_var[i] + sigma_extra_sq;
+        if data.is_upper[i] {
+            let z = (data.upper_flux[i] - pred) / total_var.sqrt();
+            neg_ll -= log_normal_cdf(z);
+        } else {
+            let diff = pred - data.flux[i];
+            neg_ll += 0.5 * (diff * diff / total_var + (2.0 * std::f64::consts::PI * total_var).ln());
+        }
+    }
+
+    // Prior: Gaussian with per-parameter (center, width)
+    let priors = prior_params(model);
+    let mut neg_lp = 0.0;
+    for j in 0..params.len() {
+        let (center, width) = priors[j];
+        let var = width * width;
+        neg_lp += 0.5 * (params[j] - center).powi(2) / var;
+    }
+
+    neg_ll + neg_lp
+}
+
+/// Jacobi eigendecomposition for a symmetric matrix stored row-major.
+///
+/// Returns `(eigenvalues, eigenvectors_row_major)`.
+/// Suitable for matrices up to ~7×7 (our max param count).
+fn symmetric_eigen(matrix: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut a = matrix.to_vec();
+    // Initialize eigenvectors to identity
+    let mut v = vec![0.0; n * n];
+    for i in 0..n {
+        v[i * n + i] = 1.0;
+    }
+
+    let max_iter = 100 * n * n;
+    for _ in 0..max_iter {
+        // Find largest off-diagonal element
+        let mut max_val = 0.0_f64;
+        let mut p = 0;
+        let mut q = 1;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let val = a[i * n + j].abs();
+                if val > max_val {
+                    max_val = val;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if max_val < 1e-15 {
+            break;
+        }
+
+        // Compute rotation angle
+        let app = a[p * n + p];
+        let aqq = a[q * n + q];
+        let apq = a[p * n + q];
+        let theta = if (app - aqq).abs() < 1e-30 {
+            std::f64::consts::FRAC_PI_4
+        } else {
+            0.5 * (2.0 * apq / (app - aqq)).atan()
+        };
+        let c = theta.cos();
+        let s = theta.sin();
+
+        // Apply Givens rotation
+        for i in 0..n {
+            let aip = a[i * n + p];
+            let aiq = a[i * n + q];
+            a[i * n + p] = c * aip + s * aiq;
+            a[i * n + q] = -s * aip + c * aiq;
+        }
+        for j in 0..n {
+            let apj = a[p * n + j];
+            let aqj = a[q * n + j];
+            a[p * n + j] = c * apj + s * aqj;
+            a[q * n + j] = -s * apj + c * aqj;
+        }
+        // Fix diagonal and zero the off-diagonal
+        a[p * n + p] = c * c * app + 2.0 * c * s * apq + s * s * aqq;
+        a[q * n + q] = s * s * app - 2.0 * c * s * apq + c * c * aqq;
+        a[p * n + q] = 0.0;
+        a[q * n + p] = 0.0;
+
+        // Update eigenvectors
+        for i in 0..n {
+            let vip = v[i * n + p];
+            let viq = v[i * n + q];
+            v[i * n + p] = c * vip + s * viq;
+            v[i * n + q] = -s * vip + c * viq;
+        }
+    }
+
+    let eigenvalues: Vec<f64> = (0..n).map(|i| a[i * n + i]).collect();
+    (eigenvalues, v)
+}
+
+/// Compute `log(sqrt(diag(H⁻¹)))` from the Hessian, clamping non-positive eigenvalues.
+fn log_sigma_from_hessian(hessian: &[f64], n: usize) -> Vec<f64> {
+    let (eigenvalues, eigenvectors) = symmetric_eigen(hessian, n);
+
+    // Clamp eigenvalues: non-positive → large variance (conservative)
+    let min_eigenvalue = 1e-6;
+    let inv_eigenvalues: Vec<f64> = eigenvalues
+        .iter()
+        .map(|&ev| 1.0 / ev.max(min_eigenvalue))
+        .collect();
+
+    // Reconstruct diagonal of V * diag(1/λ) * V^T
+    let mut diag_inv = vec![0.0; n];
+    for i in 0..n {
+        let mut sum = 0.0;
+        for k in 0..n {
+            let vik = eigenvectors[i * n + k];
+            sum += vik * vik * inv_eigenvalues[k];
+        }
+        diag_inv[i] = sum;
+    }
+
+    // log(sqrt(diag)) = 0.5 * log(diag)
+    diag_inv.iter().map(|&d| 0.5 * d.max(1e-30).ln()).collect()
+}
+
+/// Laplace approximation: compute Hessian of neg-log-posterior at MAP
+/// estimate via central finite differences, then invert for uncertainties.
+fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFitResult {
+    let n = map_params.len();
+    let f0 = neg_log_posterior(model, data, map_params);
+
+    // Central finite-difference Hessian
+    let mut hessian = vec![0.0; n * n];
+    let mut params_pp = map_params.to_vec();
+    let mut params_pm = map_params.to_vec();
+    let mut params_mp = map_params.to_vec();
+    let mut params_mm = map_params.to_vec();
+
+    for i in 0..n {
+        let hi = 1e-4 * map_params[i].abs().max(1.0);
+        for j in i..n {
+            let hj = 1e-4 * map_params[j].abs().max(1.0);
+
+            // Reset to map_params
+            params_pp.copy_from_slice(map_params);
+            params_pm.copy_from_slice(map_params);
+            params_mp.copy_from_slice(map_params);
+            params_mm.copy_from_slice(map_params);
+
+            params_pp[i] += hi;
+            params_pp[j] += hj;
+            params_pm[i] += hi;
+            params_pm[j] -= hj;
+            params_mp[i] -= hi;
+            params_mp[j] += hj;
+            params_mm[i] -= hi;
+            params_mm[j] -= hj;
+
+            let fpp = neg_log_posterior(model, data, &params_pp);
+            let fpm = neg_log_posterior(model, data, &params_pm);
+            let fmp = neg_log_posterior(model, data, &params_mp);
+            let fmm = neg_log_posterior(model, data, &params_mm);
+
+            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            hessian[i * n + j] = h_ij;
+            hessian[j * n + i] = h_ij;
+        }
+    }
+
+    let log_sigma = log_sigma_from_hessian(&hessian, n);
+
+    SviFitResult {
+        model,
+        mu: map_params.to_vec(),
+        log_sigma,
+        elbo: -f0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Post-SVI t0 profile refinement
 // ---------------------------------------------------------------------------
 
@@ -1367,7 +1594,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
     }
 
     let n_grid: usize = 50;
-    let obs_var: Vec<f64> = data.flux_err.iter().map(|e| e * e + 1e-10).collect();
+    let obs_var = &data.obs_var;
     let sigma_extra = result.mu[se_idx].exp();
     let sigma_extra_sq = sigma_extra * sigma_extra;
 
@@ -1510,6 +1737,8 @@ struct BandFitData {
     times: Vec<f64>,
     flux: Vec<f64>,
     flux_err: Vec<f64>,
+    /// Precomputed observation variance: `flux_err[i]² + 1e-10`.
+    obs_var: Vec<f64>,
     is_upper: Vec<bool>,
     upper_flux: Vec<f64>,
     #[allow(dead_code)]
@@ -1555,6 +1784,9 @@ pub struct ParametricBandResult {
     /// fit_all_models is true).
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub per_model_params: HashMap<SviModelName, Vec<f64>>,
+    /// Which uncertainty method was used for this result.
+    #[serde(default)]
+    pub uncertainty_method: UncertaintyMethod,
 }
 
 /// Evaluate a parametric model at the given times.
@@ -1585,8 +1817,12 @@ pub fn eval_model_flux(model: SviModelName, params: &[f64], times: &[f64]) -> Ve
 /// Fit parametric lightcurve models to all bands.
 ///
 /// `bands` maps band names to `BandData` containing flux values.
-/// Uses PSO for model selection, then SVI for posterior inference.
-pub fn fit_parametric(bands: &HashMap<String, BandData>, fit_all_models: bool) -> Vec<ParametricBandResult> {
+/// Uses PSO for model selection, then the chosen `method` for uncertainty estimation.
+pub fn fit_parametric(
+    bands: &HashMap<String, BandData>,
+    fit_all_models: bool,
+    method: UncertaintyMethod,
+) -> Vec<ParametricBandResult> {
     if bands.is_empty() {
         return Vec::new();
     }
@@ -1634,10 +1870,13 @@ pub fn fit_parametric(bands: &HashMap<String, BandData>, fit_all_models: bool) -
 
         let mags_obs: Vec<f64> = fluxes.iter().map(|f| flux_to_mag(*f, zp)).collect();
 
+        let obs_var: Vec<f64> = normalized_err.iter().map(|e| e * e + 1e-10).collect();
+
         let fit_data = BandFitData {
             times: times.clone(),
             flux: normalized_flux,
             flux_err: normalized_err,
+            obs_var,
             is_upper,
             upper_flux,
             noise_frac_median,
@@ -1666,15 +1905,18 @@ pub fn fit_parametric(bands: &HashMap<String, BandData>, fit_all_models: bool) -
             (pso_params, pso_chi2)
         };
 
-        // Step 2: SVI refinement
-        let mut svi_result = svi_fit(
-            pso_model,
-            data,
-            svi_n_steps,
-            svi_n_samples,
-            svi_lr,
-            Some(&pso_params),
-        );
+        // Step 2: Uncertainty estimation (SVI or Laplace)
+        let mut svi_result = match method {
+            UncertaintyMethod::Svi => svi_fit(
+                pso_model,
+                data,
+                svi_n_steps,
+                svi_n_samples,
+                svi_lr,
+                Some(&pso_params),
+            ),
+            UncertaintyMethod::Laplace => laplace_fit(pso_model, data, &pso_params),
+        };
 
         // Step 3: Profile-likelihood refinement of t0
         profile_t0_refine(&mut svi_result, data);
@@ -1716,6 +1958,7 @@ pub fn fit_parametric(bands: &HashMap<String, BandData>, fit_all_models: bool) -
             mag_chi2: finite_or_none(mag_chi2),
             per_model_chi2,
             per_model_params,
+            uncertainty_method: method,
         });
     }
 

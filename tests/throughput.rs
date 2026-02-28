@@ -1,6 +1,6 @@
 mod synthetic;
 
-use lightcurve_fitting::{build_flux_bands, build_mag_bands, fit_nonparametric, fit_parametric, fit_thermal};
+use lightcurve_fitting::{build_flux_bands, build_mag_bands, fit_nonparametric, fit_parametric, fit_thermal, UncertaintyMethod};
 use std::time::Instant;
 
 #[test]
@@ -22,7 +22,7 @@ fn throughput_benchmark() {
             "source {i}: nonparametric should return results"
         );
 
-        let p_results = fit_parametric(&flux_bands, false);
+        let p_results = fit_parametric(&flux_bands, false, UncertaintyMethod::Svi);
         assert!(
             !p_results.is_empty(),
             "source {i}: parametric should return results"

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::BandData;
 use crate::nonparametric::{fit_nonparametric, NonparametricBandResult};
-use crate::parametric::{fit_parametric, ParametricBandResult};
+use crate::parametric::{fit_parametric, ParametricBandResult, UncertaintyMethod};
 use crate::thermal::{fit_thermal, ThermalResult};
 
 /// Result of the fast (nonparametric + thermal) fitting path for a single source.
@@ -37,9 +37,13 @@ pub fn fit_batch_fast(sources: &[HashMap<String, BandData>]) -> Vec<FastFitResul
 ///
 /// Each source is represented as pre-built per-band flux data.
 /// Sources are processed independently via Rayon.
-pub fn fit_batch_parametric(sources: &[HashMap<String, BandData>], fit_all_models: bool) -> Vec<Vec<ParametricBandResult>> {
+pub fn fit_batch_parametric(
+    sources: &[HashMap<String, BandData>],
+    fit_all_models: bool,
+    method: UncertaintyMethod,
+) -> Vec<Vec<ParametricBandResult>> {
     sources
         .par_iter()
-        .map(|flux_bands| fit_parametric(flux_bands, fit_all_models))
+        .map(|flux_bands| fit_parametric(flux_bands, fit_all_models, method))
         .collect()
 }

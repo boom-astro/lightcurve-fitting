@@ -9,7 +9,7 @@ use ::lightcurve_fitting::{
     eval_model_flux as rs_eval_model_flux, fit_batch_fast as rs_fit_batch_fast,
     fit_batch_parametric as rs_fit_batch_parametric,
     fit_nonparametric as rs_fit_nonparametric, fit_parametric as rs_fit_parametric,
-    fit_thermal as rs_fit_thermal, BandData, FastFitResult, SviModelName,
+    fit_thermal as rs_fit_thermal, BandData, FastFitResult, SviModelName, UncertaintyMethod,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +108,21 @@ fn build_flux_bands(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_uncertainty_method(method: &str) -> PyResult<UncertaintyMethod> {
+    match method.to_lowercase().as_str() {
+        "svi" => Ok(UncertaintyMethod::Svi),
+        "laplace" => Ok(UncertaintyMethod::Laplace),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown uncertainty method '{}'. Expected 'svi' or 'laplace'.",
+            other
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Individual fitters
 // ---------------------------------------------------------------------------
 
@@ -136,14 +151,16 @@ fn fit_nonparametric(py: Python<'_>, bands: &PyBandDataMap) -> PyResult<PyObject
 ///
 /// Returns a list of dicts, one per band.
 #[pyfunction]
-#[pyo3(signature = (bands, fit_all_models=false))]
+#[pyo3(signature = (bands, fit_all_models=false, method="svi"))]
 fn fit_parametric(
     py: Python<'_>,
     bands: &PyBandDataMap,
     fit_all_models: bool,
+    method: &str,
 ) -> PyResult<PyObject> {
+    let method = parse_uncertainty_method(method)?;
     let inner = bands.inner.clone();
-    let results = py.allow_threads(|| rs_fit_parametric(&inner, fit_all_models));
+    let results = py.allow_threads(|| rs_fit_parametric(&inner, fit_all_models, method));
     Ok(pythonize(py, &results)?.unbind())
 }
 
@@ -231,14 +248,16 @@ fn fit_batch_fast(py: Python<'_>, sources: Vec<PyBandDataMap>) -> PyResult<PyObj
 ///
 /// Returns a list of (list of dicts), one inner list per source.
 #[pyfunction]
-#[pyo3(signature = (sources, fit_all_models=false))]
+#[pyo3(signature = (sources, fit_all_models=false, method="svi"))]
 fn fit_batch_parametric(
     py: Python<'_>,
     sources: Vec<PyBandDataMap>,
     fit_all_models: bool,
+    method: &str,
 ) -> PyResult<PyObject> {
+    let method = parse_uncertainty_method(method)?;
     let inner: Vec<HashMap<String, BandData>> = sources.into_iter().map(|s| s.inner).collect();
-    let results = py.allow_threads(|| rs_fit_batch_parametric(&inner, fit_all_models));
+    let results = py.allow_threads(|| rs_fit_batch_parametric(&inner, fit_all_models, method));
     Ok(pythonize(py, &results)?.unbind())
 }
 
