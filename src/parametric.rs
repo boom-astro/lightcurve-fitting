@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use argmin::core::{CostFunction, Error as ArgminError, Executor, State};
-use argmin::solver::particleswarm::ParticleSwarm;
+use argmin::core::{CostFunction, Error as ArgminError};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{finite_or_none, BandData};
@@ -760,32 +760,6 @@ impl CostFunction for PsoCost<'_> {
 // Profile likelihood for t0
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct FixedT0PsoCost<'a> {
-    inner: PsoCost<'a>,
-    t0: f64,
-    t0_idx: usize,
-}
-
-impl CostFunction for FixedT0PsoCost<'_> {
-    type Param = Vec<f64>;
-    type Output = f64;
-
-    fn cost(&self, p: &Self::Param) -> Result<Self::Output, ArgminError> {
-        let mut full = Vec::with_capacity(p.len() + 1);
-        for (i, &val) in p.iter().enumerate() {
-            if i == self.t0_idx {
-                full.push(self.t0);
-            }
-            full.push(val);
-        }
-        if self.t0_idx >= p.len() {
-            full.push(self.t0);
-        }
-        self.inner.cost(&full)
-    }
-}
-
 fn pso_bounds(model: SviModel) -> (Vec<f64>, Vec<f64>) {
     match model {
         SviModel::Bazin => (
@@ -831,6 +805,100 @@ fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
     (lower, upper)
 }
 
+// ---------------------------------------------------------------------------
+// Lightweight PSO with stall-based early stopping
+// ---------------------------------------------------------------------------
+
+/// Run particle-swarm optimisation with early termination when the global
+/// best cost has not improved by more than `stall_tol` (relative) for
+/// `stall_iters` consecutive iterations.
+fn pso_minimize(
+    cost_fn: impl Fn(&[f64]) -> f64,
+    lower: &[f64],
+    upper: &[f64],
+    n_particles: usize,
+    max_iters: usize,
+    stall_iters: usize,
+    seed: u64,
+) -> (Vec<f64>, f64) {
+    let dim = lower.len();
+    let mut rng = SmallRng::seed_from_u64(seed);
+
+    // PSO hyper-parameters (standard defaults)
+    let w = 0.7;   // inertia
+    let c1 = 1.5;  // cognitive
+    let c2 = 1.5;  // social
+
+    // Initialise particles
+    let mut positions: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut velocities: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut pbest_pos: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut pbest_cost: Vec<f64> = Vec::with_capacity(n_particles);
+
+    let mut gbest_pos = vec![0.0; dim];
+    let mut gbest_cost = f64::INFINITY;
+
+    for _ in 0..n_particles {
+        let pos: Vec<f64> = (0..dim)
+            .map(|d| lower[d] + rng.random::<f64>() * (upper[d] - lower[d]))
+            .collect();
+        let vel: Vec<f64> = (0..dim)
+            .map(|d| (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0))
+            .collect();
+        let cost = cost_fn(&pos);
+        if cost < gbest_cost {
+            gbest_cost = cost;
+            gbest_pos = pos.clone();
+        }
+        pbest_cost.push(cost);
+        pbest_pos.push(pos.clone());
+        positions.push(pos);
+        velocities.push(vel);
+    }
+
+    let mut iters_without_improvement = 0usize;
+    let mut prev_gbest = gbest_cost;
+
+    for _ in 0..max_iters {
+        for p in 0..n_particles {
+            // Update velocity and position
+            for d in 0..dim {
+                let r1: f64 = rng.random();
+                let r2: f64 = rng.random();
+                velocities[p][d] = w * velocities[p][d]
+                    + c1 * r1 * (pbest_pos[p][d] - positions[p][d])
+                    + c2 * r2 * (gbest_pos[d] - positions[p][d]);
+                positions[p][d] = (positions[p][d] + velocities[p][d])
+                    .clamp(lower[d], upper[d]);
+            }
+
+            let cost = cost_fn(&positions[p]);
+            if cost < pbest_cost[p] {
+                pbest_cost[p] = cost;
+                pbest_pos[p] = positions[p].clone();
+                if cost < gbest_cost {
+                    gbest_cost = cost;
+                    gbest_pos = positions[p].clone();
+                }
+            }
+        }
+
+        // Stall detection: check relative improvement
+        let improved = prev_gbest - gbest_cost > 0.01 * prev_gbest.abs().max(1e-10);
+        if improved {
+            iters_without_improvement = 0;
+            prev_gbest = gbest_cost;
+        } else {
+            iters_without_improvement += 1;
+            if iters_without_improvement >= stall_iters {
+                break;
+            }
+        }
+    }
+
+    (gbest_pos, gbest_cost)
+}
+
 fn linspace(start: f64, end: f64, n: usize) -> Vec<f64> {
     if n <= 1 {
         return vec![start];
@@ -853,45 +921,49 @@ fn profile_t0_search(
 
     let run_at_t0 = |t0: f64| -> (Vec<f64>, f64) {
         let (lower, upper) = pso_bounds_no_t0(model);
-        let inner = PsoCost {
-            times: &data.times,
-            flux: &data.flux,
-            flux_err: &data.flux_err,
-            obs_var: &data.obs_var,
-            is_upper: &data.is_upper,
-            upper_flux: &data.upper_flux,
-            model,
-        };
-        let problem = FixedT0PsoCost { inner, t0, t0_idx };
-        let solver = ParticleSwarm::new((lower, upper), 40);
-        match Executor::new(problem, solver)
-            .configure(|state| state.max_iters(60))
-            .run()
-        {
-            Ok(res) => {
-                let best = res.state().get_best_param().unwrap();
-                let cost = res.state().get_cost();
-                let mut full = Vec::with_capacity(best.position.len() + 1);
-                for (i, &val) in best.position.iter().enumerate() {
-                    if i == t0_idx {
-                        full.push(t0);
-                    }
-                    full.push(val);
-                }
-                if t0_idx >= best.position.len() {
+        let cost_fn = |params: &[f64]| -> f64 {
+            let mut full = Vec::with_capacity(params.len() + 1);
+            for (i, &val) in params.iter().enumerate() {
+                if i == t0_idx {
                     full.push(t0);
                 }
-                (full, cost)
+                full.push(val);
             }
-            Err(_) => (vec![], f64::INFINITY),
+            if t0_idx >= params.len() {
+                full.push(t0);
+            }
+            let problem = PsoCost {
+                times: &data.times,
+                flux: &data.flux,
+                flux_err: &data.flux_err,
+                obs_var: &data.obs_var,
+                is_upper: &data.is_upper,
+                upper_flux: &data.upper_flux,
+                model,
+            };
+            problem.cost(&full).unwrap_or(1e99)
+        };
+        let (best_reduced, cost) = pso_minimize(
+            cost_fn, &lower, &upper, 20, 30, 8, 42,
+        );
+        let mut full = Vec::with_capacity(best_reduced.len() + 1);
+        for (i, &val) in best_reduced.iter().enumerate() {
+            if i == t0_idx {
+                full.push(t0);
+            }
+            full.push(val);
         }
+        if t0_idx >= best_reduced.len() {
+            full.push(t0);
+        }
+        (full, cost)
     };
 
     let mut best_params = pilot_params.to_vec();
     let mut best_cost = pilot_cost;
     let mut best_t0 = pilot_t0;
 
-    for &t0 in &linspace(t0_min, t0_max, 10) {
+    for &t0 in &linspace(t0_min, t0_max, 5) {
         let (params, cost) = run_at_t0(t0);
         if cost < best_cost && !params.is_empty() {
             best_cost = cost;
@@ -902,7 +974,7 @@ fn profile_t0_search(
 
     let fine_min = (best_t0 - 0.5).max(t0_min);
     let fine_max = (best_t0 + 0.5).min(t0_max);
-    for &t0 in &linspace(fine_min, fine_max, 5) {
+    for &t0 in &linspace(fine_min, fine_max, 3) {
         let (params, cost) = run_at_t0(t0);
         if cost < best_cost && !params.is_empty() {
             best_cost = cost;
@@ -926,9 +998,25 @@ fn profile_t0_search(
 /// exotic models that won't win.
 const BAZIN_GOOD_ENOUGH: f64 = 2.0;
 
+fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f64>, f64) {
+    let (lower, upper) = pso_bounds(model);
+    let problem = PsoCost {
+        times: &data.times,
+        flux: &data.flux,
+        flux_err: &data.flux_err,
+        obs_var: &data.obs_var,
+        is_upper: &data.is_upper,
+        upper_flux: &data.upper_flux,
+        model,
+    };
+    let cost_fn = |p: &[f64]| problem.cost(&p.to_vec()).unwrap_or(1e99);
+    let (params, chi2) = pso_minimize(cost_fn, &lower, &upper, 40, 50, 10, 42);
+    (model, params, chi2)
+}
+
 fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<f64>, f64, HashMap<SviModelName, Option<f64>>, HashMap<SviModelName, Vec<f64>>) {
-    let models: &[SviModel] = &[
-        SviModel::Bazin,      // always first – early-stop gate
+    let all_models: &[SviModel] = &[
+        SviModel::Bazin,
         SviModel::Arnett,
         SviModel::Tde,
         SviModel::Afterglow,
@@ -938,58 +1026,43 @@ fn pso_model_select(data: &BandFitData, fit_all_models: bool) -> (SviModel, Vec<
         SviModel::MetzgerKN,
     ];
 
-    let mut best_model = SviModel::Bazin;
-    let mut best_params = vec![];
-    let mut best_chi2 = f64::INFINITY;
     let mut all_chi2: HashMap<SviModelName, Option<f64>> = HashMap::new();
     let mut all_params: HashMap<SviModelName, Vec<f64>> = HashMap::new();
 
-    let mut early_stopped = false;
-    for &model in models {
-        let (lower, upper) = pso_bounds(model);
-        let problem = PsoCost {
-            times: &data.times,
-            flux: &data.flux,
-            flux_err: &data.flux_err,
-            obs_var: &data.obs_var,
-            is_upper: &data.is_upper,
-            upper_flux: &data.upper_flux,
-            model,
-        };
-        let solver = ParticleSwarm::new((lower, upper), 40);
-        let res = Executor::new(problem, solver)
-            .configure(|state| state.max_iters(50))
-            .run();
-        match res {
-            Ok(res) => {
-                let chi2 = res.state().get_cost();
-                let params = res.state().get_best_param().unwrap().position.clone();
-                all_chi2.insert(model.to_name(), finite_or_none(chi2));
-                if fit_all_models {
-                    all_params.insert(model.to_name(), params.clone());
-                }
-                if chi2 < best_chi2 {
-                    best_chi2 = chi2;
-                    best_model = model;
-                    best_params = params;
-                }
-            }
-            Err(_) => {
-                all_chi2.insert(model.to_name(), None);
-            }
-        }
-
-        // After Bazin (first model): if it fits well enough, skip the rest
-        if !fit_all_models && model == SviModel::Bazin && best_chi2 < BAZIN_GOOD_ENOUGH {
-            early_stopped = true;
-            break;
-        }
+    // Run Bazin first as an early-stop gate
+    let (_, bazin_params, bazin_chi2) = pso_fit_single_model(data, SviModel::Bazin);
+    all_chi2.insert(SviModelName::Bazin, finite_or_none(bazin_chi2));
+    if fit_all_models {
+        all_params.insert(SviModelName::Bazin, bazin_params.clone());
     }
 
-    // Fill None for models skipped by early stopping
-    if early_stopped {
-        for &model in models {
+    let mut best_model = SviModel::Bazin;
+    let mut best_params = bazin_params;
+    let mut best_chi2 = bazin_chi2;
+
+    if !fit_all_models && bazin_chi2 < BAZIN_GOOD_ENOUGH {
+        // Bazin is good enough — fill None for skipped models
+        for &model in all_models {
             all_chi2.entry(model.to_name()).or_insert(None);
+        }
+    } else {
+        // Run remaining 7 models in parallel
+        let rest = &all_models[1..];
+        let results: Vec<(SviModel, Vec<f64>, f64)> = rest
+            .par_iter()
+            .map(|&model| pso_fit_single_model(data, model))
+            .collect();
+
+        for (model, params, chi2) in results {
+            all_chi2.insert(model.to_name(), finite_or_none(chi2));
+            if fit_all_models {
+                all_params.insert(model.to_name(), params.clone());
+            }
+            if chi2 < best_chi2 {
+                best_chi2 = chi2;
+                best_model = model;
+                best_params = params;
+            }
         }
     }
 
@@ -1189,6 +1262,14 @@ fn svi_fit(
 
     let mut final_elbo = f64::NEG_INFINITY;
 
+    // Early stopping: track smoothed ELBO and stop when it stalls.
+    let svi_stall_iters = 50;
+    let svi_min_iters = 200; // always run at least this many
+    let ema_alpha = 0.1;
+    let mut ema_elbo = f64::NEG_INFINITY;
+    let mut best_ema_elbo = f64::NEG_INFINITY;
+    let mut iters_without_improvement = 0usize;
+
     for _step in 0..n_steps {
         let mu = &var_params[..n_params];
         let log_sigma = &var_params[n_params..];
@@ -1335,6 +1416,25 @@ fn svi_fit(
 
         for i in 0..n_params {
             var_params[n_params + i] = var_params[n_params + i].clamp(-6.0, 2.0);
+        }
+
+        // Early stopping based on smoothed ELBO
+        if _step >= svi_min_iters {
+            if ema_elbo == f64::NEG_INFINITY {
+                ema_elbo = final_elbo;
+            } else {
+                ema_elbo = ema_alpha * final_elbo + (1.0 - ema_alpha) * ema_elbo;
+            }
+            let improved = ema_elbo - best_ema_elbo > 0.01 * best_ema_elbo.abs().max(1e-10);
+            if improved {
+                best_ema_elbo = ema_elbo;
+                iters_without_improvement = 0;
+            } else {
+                iters_without_improvement += 1;
+                if iters_without_improvement >= svi_stall_iters {
+                    break;
+                }
+            }
         }
     }
 
@@ -1898,8 +1998,9 @@ pub fn fit_parametric(
             continue;
         }
 
-        // Step 1b: Profile t0 (reference band only)
-        let (pso_params, pso_chi2) = if band_idx == 0 {
+        // Step 1b: Profile t0 (reference band only, SVI only — Laplace
+        // relies on the cheaper post-fit profile_t0_refine instead)
+        let (pso_params, pso_chi2) = if band_idx == 0 && method == UncertaintyMethod::Svi {
             profile_t0_search(data, pso_model, &pso_params, pso_chi2)
         } else {
             (pso_params, pso_chi2)
