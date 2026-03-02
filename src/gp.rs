@@ -16,7 +16,7 @@ pub fn fit_sklears_gp(
     let cst: Box<dyn Kernel> = Box::new(ConstantKernel::new(amp));
     let rbf: Box<dyn Kernel> = Box::new(RBF::new(lengthscale));
     let prod = Box::new(ProductKernel::new(vec![cst, rbf]));
-    let white = Box::new(WhiteKernel::new(1e-10));
+    let white = Box::new(WhiteKernel::new(0.4));
     let kernel = SumKernel::new(vec![prod, white]);
 
     let gp = GaussianProcessRegressor::new()

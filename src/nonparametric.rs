@@ -70,6 +70,12 @@ pub struct NonparametricBandResult {
     /// Fraction of consecutive post-peak GP predictions where mag increases (fading).
     /// ~1.0 for TDEs (monotonic decay), ~0.5 for stochastic AGN.
     pub post_peak_monotonicity: Option<f64>,
+    /// GP predicted times (100-point uniform grid from t_min to t_max).
+    pub gp_pred_times: Vec<f64>,
+    /// GP predicted magnitudes at each grid time.
+    pub gp_pred_mags: Vec<f64>,
+    /// GP predicted standard deviations at each grid time.
+    pub gp_pred_stds: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +567,7 @@ pub fn fit_nonparametric(
         return (Vec::new(), HashMap::new());
     }
 
-    let n_pred = 50;
+    let n_pred = 100;
     let times_pred: Vec<f64> = (0..n_pred)
         .map(|i| t_min + (i as f64) * duration / (n_pred - 1) as f64)
         .collect();
@@ -735,6 +741,18 @@ pub fn fit_nonparametric(
                     }
                 }
 
+                // Enforce a minimum std floor so the uncertainty band is
+                // always visible.  Use the mean photometric error as the
+                // baseline — the GP cannot be more certain than the data.
+                let mean_err = band_data.errors.iter().sum::<f64>()
+                    / band_data.errors.len().max(1) as f64;
+                let std_floor = mean_err.max(0.02);
+                for v in std_vec.iter_mut() {
+                    if *v < std_floor {
+                        *v = std_floor;
+                    }
+                }
+
                 // Compute chi2 and features
                 let mut chi2 = 0.0;
                 let mut baseline_var = 0.0;
@@ -846,6 +864,9 @@ pub fn fit_nonparametric(
                     pre_peak_rms: finite_or_none(pre_peak_rms),
                     rise_amplitude_over_noise: finite_or_none(rise_over_noise),
                     post_peak_monotonicity: finite_or_none(monotonicity),
+                    gp_pred_times: times_pred.clone(),
+                    gp_pred_mags: pred.clone(),
+                    gp_pred_stds: std_vec.clone(),
                 });
             }
         }
