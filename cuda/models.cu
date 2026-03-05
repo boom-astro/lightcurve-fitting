@@ -41,7 +41,7 @@ __device__ inline double log_normal_cdf_d(double x) {
 // ===========================================================================
 
 // Model IDs (must match GpuModelName::model_id() in Rust):
-//   0=Bazin, 1=Villar, 2=TDE, 3=Arnett, 4=Magnetar, 5=ShockCooling, 6=Afterglow
+//   0=Bazin, 1=Villar, 2=TDE, 3=Arnett, 4=Magnetar, 5=ShockCooling, 6=Afterglow, 7=MetzgerKN
 
 __device__ inline double bazin_at(const double* p, double t) {
     double a        = exp(p[0]);
@@ -130,6 +130,157 @@ __device__ inline double afterglow_at(const double* p, double t) {
     return a * pow(u1 + u2, -0.5);
 }
 
+// ===========================================================================
+// Metzger 1-zone kilonova ODE (sequential — one thread per draw)
+// ===========================================================================
+
+// Physical constants
+#define MSUN_CGS  1.989e33
+#define C_CGS_VAL 2.998e10
+#define SECS_DAY  86400.0
+#define METZGER_NGRID 200
+
+// Metzger kernel: one thread per draw, loops over all times.
+// params layout per draw: [log10_mej, log10_vej, log10_kappa, t0, sigma_extra]
+// Output: out[draw * n_times + ti] = normalized flux at times[ti]
+extern "C" __global__ void metzger_kn_eval(
+    const double* __restrict__ params,
+    const double* __restrict__ times,
+    double* __restrict__ out,
+    int n_draws, int n_times, int n_params)
+{
+    int draw = blockIdx.x * blockDim.x + threadIdx.x;
+    if (draw >= n_draws) return;
+
+    const double* p = params + draw * n_params;
+    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
+    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
+    double kappa_r = pow(10.0, p[2]);
+    double t0     = p[3];
+
+    // Find max phase needed
+    double phase_max = 0.01;
+    for (int i = 0; i < n_times; i++) {
+        double ph = times[i] - t0;
+        if (ph > phase_max) phase_max = ph;
+    }
+
+    if (phase_max <= 0.01) {
+        for (int i = 0; i < n_times; i++)
+            out[draw * n_times + i] = 0.0;
+        return;
+    }
+
+    // Build log-spaced time grid
+    double log_t_min = log(0.01);
+    double log_t_max = log(phase_max * 1.05);
+
+    // ODE state
+    double ye = 0.1;
+    double xn0 = 1.0 - 2.0 * ye;
+    double scale = 1e40;
+    double e0 = 0.5 * m_ej * v_ej * v_ej;
+    double e_th = e0 / scale;
+    double e_kin = e0 / scale;
+    double v = v_ej;
+
+    double grid_t_prev = exp(log_t_min);
+    double r = grid_t_prev * SECS_DAY * v;
+
+    // Store grid values in local arrays (stack-allocated, 200 entries)
+    double grid_t[METZGER_NGRID];
+    double grid_lrad[METZGER_NGRID];
+
+    for (int i = 0; i < METZGER_NGRID; i++) {
+        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(METZGER_NGRID - 1));
+        grid_t[i] = t_day;
+        double t_sec = t_day * SECS_DAY;
+
+        // Thermalization efficiency
+        double eth_factor = 0.34 * pow(t_day, 0.74);
+        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
+        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
+
+        // Heating rate
+        double xn = xn0 * exp(-t_sec / 900.0);
+        double eps_neutron = 3.2e14 * xn;
+        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
+        if (time_term < 1e-30) time_term = 1e-30;
+        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
+        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
+
+        // Opacity
+        double xr = 1.0 - xn0;
+        double xn_decayed = xn0 - xn;
+        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
+
+        // Diffusion time
+        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
+
+        // Radiative luminosity
+        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
+        grid_lrad[i] = l_rad;
+
+        // PdV work
+        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
+
+        // Euler step
+        if (i < METZGER_NGRID - 1) {
+            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(METZGER_NGRID - 1));
+            double dt_sec = (t_next - t_day) * SECS_DAY;
+            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
+            if (e_th < 0.0) e_th = 0.0;
+            e_kin += l_pdv * dt_sec;
+            v = sqrt(2.0 * e_kin * scale / m_ej);
+            if (v > C_CGS_VAL) v = C_CGS_VAL;
+            r += v * dt_sec;
+        }
+    }
+
+    // Find peak luminosity for normalization
+    double l_peak = -1e300;
+    for (int i = 0; i < METZGER_NGRID; i++) {
+        if (grid_lrad[i] > l_peak) l_peak = grid_lrad[i];
+    }
+
+    if (l_peak <= 0.0 || !isfinite(l_peak)) {
+        for (int i = 0; i < n_times; i++)
+            out[draw * n_times + i] = 0.0;
+        return;
+    }
+
+    // Normalize
+    for (int i = 0; i < METZGER_NGRID; i++) {
+        grid_lrad[i] /= l_peak;
+    }
+
+    // Interpolate for each observation time
+    for (int ti = 0; ti < n_times; ti++) {
+        double phase = times[ti] - t0;
+        double val = 0.0;
+
+        if (phase <= 0.0) {
+            val = 0.0;
+        } else if (phase <= grid_t[0]) {
+            val = grid_lrad[0];
+        } else if (phase >= grid_t[METZGER_NGRID - 1]) {
+            val = grid_lrad[METZGER_NGRID - 1];
+        } else {
+            // Binary search for interval
+            int lo = 0, hi = METZGER_NGRID - 1;
+            while (hi - lo > 1) {
+                int mid = (lo + hi) / 2;
+                if (grid_t[mid] < phase) lo = mid;
+                else hi = mid;
+            }
+            double frac = (phase - grid_t[lo]) / (grid_t[hi] - grid_t[lo]);
+            val = grid_lrad[lo] + frac * (grid_lrad[hi] - grid_lrad[lo]);
+        }
+
+        out[draw * n_times + ti] = val;
+    }
+}
+
 __device__ inline double eval_model_at(int model_id, const double* p, double t) {
     switch (model_id) {
         case 0: return bazin_at(p, t);
@@ -139,6 +290,7 @@ __device__ inline double eval_model_at(int model_id, const double* p, double t) 
         case 4: return magnetar_at(p, t);
         case 5: return shock_cooling_at(p, t);
         case 6: return afterglow_at(p, t);
+        // case 7 (MetzgerKN) handled by separate kernel
         default: return 0.0;
     }
 }
@@ -185,6 +337,97 @@ DEFINE_EVAL_KERNEL(afterglow_eval,      afterglow_at)
 //   positions: [n_sources × n_particles × n_params], row-major.
 //   costs (output): [n_sources × n_particles].
 
+// Device function: solve MetzgerKN ODE and evaluate at a single time.
+// This is used by batch_pso_cost for model_id=7.
+// It solves the full ODE each time (inefficient but correct for PSO where
+// each particle has different params).
+__device__ double metzger_kn_at_single(const double* p, double obs_time) {
+    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
+    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
+    double kappa_r = pow(10.0, p[2]);
+    double t0     = p[3];
+    double phase  = obs_time - t0;
+
+    if (phase <= 0.0) return 0.0;
+
+    // Build grid up to this phase
+    double phase_max = phase * 1.05;
+    if (phase_max < 0.02) phase_max = 0.02;
+    double log_t_min = log(0.01);
+    double log_t_max = log(phase_max);
+    int ngrid = 100; // Reduced grid for PSO (speed vs accuracy tradeoff)
+
+    double ye = 0.1;
+    double xn0 = 1.0 - 2.0 * ye;
+    double scale = 1e40;
+    double e0 = 0.5 * m_ej * v_ej * v_ej;
+    double e_th = e0 / scale;
+    double e_kin = e0 / scale;
+    double v = v_ej;
+
+    double grid_t_0 = exp(log_t_min);
+    double r = grid_t_0 * SECS_DAY * v;
+
+    double l_peak = 0.0;
+    double l_at_phase = 0.0;
+    double prev_t = grid_t_0;
+    double prev_lrad = 0.0;
+
+    for (int i = 0; i < ngrid; i++) {
+        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(ngrid - 1));
+        double t_sec = t_day * SECS_DAY;
+
+        double eth_factor = 0.34 * pow(t_day, 0.74);
+        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
+        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
+
+        double xn = xn0 * exp(-t_sec / 900.0);
+        double eps_neutron = 3.2e14 * xn;
+        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
+        if (time_term < 1e-30) time_term = 1e-30;
+        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
+        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
+
+        double xr = 1.0 - xn0;
+        double xn_decayed = xn0 - xn;
+        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
+        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
+
+        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
+        if (l_rad > l_peak) l_peak = l_rad;
+
+        // Interpolate if phase falls in this interval
+        if (i > 0 && phase >= prev_t && phase <= t_day) {
+            double frac = (phase - prev_t) / (t_day - prev_t);
+            l_at_phase = prev_lrad + frac * (l_rad - prev_lrad);
+        }
+        if (i == ngrid - 1 && phase >= t_day) {
+            l_at_phase = l_rad;
+        }
+        if (i == 0 && phase <= t_day) {
+            l_at_phase = l_rad;
+        }
+
+        prev_t = t_day;
+        prev_lrad = l_rad;
+
+        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
+        if (i < ngrid - 1) {
+            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(ngrid - 1));
+            double dt_sec = (t_next - t_day) * SECS_DAY;
+            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
+            if (e_th < 0.0) e_th = 0.0;
+            e_kin += l_pdv * dt_sec;
+            v = sqrt(2.0 * e_kin * scale / m_ej);
+            if (v > C_CGS_VAL) v = C_CGS_VAL;
+            r += v * dt_sec;
+        }
+    }
+
+    if (l_peak <= 0.0 || !isfinite(l_peak)) return 0.0;
+    return l_at_phase / l_peak;
+}
+
 extern "C" __global__ void batch_pso_cost(
     const double* __restrict__ all_times,
     const double* __restrict__ all_flux,
@@ -216,18 +459,39 @@ extern "C" __global__ void batch_pso_cost(
     double sigma_extra_sq = sigma_extra * sigma_extra;
 
     double neg_ll = 0.0;
-    for (int i = obs_start; i < obs_end; i++) {
-        double pred = eval_model_at(model_id, p, all_times[i]);
-        if (!isfinite(pred)) { costs[idx] = 1e99; return; }
 
-        double total_var = all_obs_var[i] + sigma_extra_sq;
+    if (model_id == 7) {
+        // MetzgerKN: solve ODE once, evaluate at all observation times
+        // For PSO cost, we solve per-observation (less efficient but avoids
+        // large stack allocation). Each observation gets its own ODE solve.
+        for (int i = obs_start; i < obs_end; i++) {
+            double pred = metzger_kn_at_single(p, all_times[i]);
+            if (!isfinite(pred)) { costs[idx] = 1e99; return; }
 
-        if (all_is_upper[i]) {
-            double z = (all_upper_flux[i] - pred) / sqrt(total_var);
-            neg_ll -= log_normal_cdf_d(z);
-        } else {
-            double diff = pred - all_flux[i];
-            neg_ll += diff * diff / total_var + log(total_var);
+            double total_var = all_obs_var[i] + sigma_extra_sq;
+
+            if (all_is_upper[i]) {
+                double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                neg_ll -= log_normal_cdf_d(z);
+            } else {
+                double diff = pred - all_flux[i];
+                neg_ll += diff * diff / total_var + log(total_var);
+            }
+        }
+    } else {
+        for (int i = obs_start; i < obs_end; i++) {
+            double pred = eval_model_at(model_id, p, all_times[i]);
+            if (!isfinite(pred)) { costs[idx] = 1e99; return; }
+
+            double total_var = all_obs_var[i] + sigma_extra_sq;
+
+            if (all_is_upper[i]) {
+                double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                neg_ll -= log_normal_cdf_d(z);
+            } else {
+                double diff = pred - all_flux[i];
+                neg_ll += diff * diff / total_var + log(total_var);
+            }
         }
     }
 
@@ -253,6 +517,16 @@ DEFINE_LAUNCHER(launch_arnett,         arnett_eval)
 DEFINE_LAUNCHER(launch_magnetar,       magnetar_eval)
 DEFINE_LAUNCHER(launch_shock_cooling,  shock_cooling_eval)
 DEFINE_LAUNCHER(launch_afterglow,      afterglow_eval)
+
+// MetzgerKN uses a different grid: one thread per draw (not per draw×time)
+extern "C" void launch_metzger_kn(
+    const double* params, const double* times, double* out,
+    int n_draws, int n_times, int n_params, int /*grid*/, int block)
+{
+    // Recompute grid for n_draws (not n_draws*n_times)
+    int g = (n_draws + block - 1) / block;
+    metzger_kn_eval<<<g, block>>>(params, times, out, n_draws, n_times, n_params);
+}
 
 extern "C" void launch_batch_pso_cost(
     const double* all_times,

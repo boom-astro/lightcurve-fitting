@@ -20,6 +20,7 @@ pub enum GpuModelName {
     Magnetar,
     ShockCooling,
     Afterglow,
+    MetzgerKN,
 }
 
 impl GpuModelName {
@@ -33,6 +34,7 @@ impl GpuModelName {
             GpuModelName::Magnetar => 5,
             GpuModelName::ShockCooling => 5,
             GpuModelName::Afterglow => 6,
+            GpuModelName::MetzgerKN => 5,
         }
     }
 
@@ -46,6 +48,7 @@ impl GpuModelName {
             GpuModelName::Magnetar => 4,
             GpuModelName::ShockCooling => 5,
             GpuModelName::Afterglow => 6,
+            GpuModelName::MetzgerKN => 7,
         }
     }
 
@@ -80,11 +83,15 @@ impl GpuModelName {
                 vec![-3.0, -100.0, -2.0, -2.0, 0.5, -5.0],
                 vec![3.0, 100.0, 6.0, 3.0, 5.0, 0.0],
             ),
+            GpuModelName::MetzgerKN => (
+                vec![-3.0, -2.0, -1.0, -2.0, -5.0],
+                vec![-0.5, -0.5, 2.0, 1.0, 0.0],
+            ),
         }
     }
 }
 
-/// All GPU-supported models (excludes MetzgerKN which has sequential ODE).
+/// All GPU-supported models.
 pub const ALL_GPU_MODELS: &[GpuModelName] = &[
     GpuModelName::Bazin,
     GpuModelName::Arnett,
@@ -93,6 +100,7 @@ pub const ALL_GPU_MODELS: &[GpuModelName] = &[
     GpuModelName::Villar,
     GpuModelName::Magnetar,
     GpuModelName::ShockCooling,
+    GpuModelName::MetzgerKN,
 ];
 
 // ---------------------------------------------------------------------------
@@ -123,6 +131,7 @@ extern "C" {
     fn launch_magnetar(p: *const f64, t: *const f64, o: *mut f64, nd: c_int, nt: c_int, np: c_int, grid: c_int, block: c_int);
     fn launch_shock_cooling(p: *const f64, t: *const f64, o: *mut f64, nd: c_int, nt: c_int, np: c_int, grid: c_int, block: c_int);
     fn launch_afterglow(p: *const f64, t: *const f64, o: *mut f64, nd: c_int, nt: c_int, np: c_int, grid: c_int, block: c_int);
+    fn launch_metzger_kn(p: *const f64, t: *const f64, o: *mut f64, nd: c_int, nt: c_int, np: c_int, grid: c_int, block: c_int);
 }
 
 // Batch PSO cost launcher
@@ -334,6 +343,7 @@ impl GpuContext {
                 GpuModelName::Magnetar => launch_magnetar(d_params.ptr as _, d_times.ptr as _, d_out.ptr as _, n_draws as _, n_times as _, n_params as _, grid, block),
                 GpuModelName::ShockCooling => launch_shock_cooling(d_params.ptr as _, d_times.ptr as _, d_out.ptr as _, n_draws as _, n_times as _, n_params as _, grid, block),
                 GpuModelName::Afterglow => launch_afterglow(d_params.ptr as _, d_times.ptr as _, d_out.ptr as _, n_draws as _, n_times as _, n_params as _, grid, block),
+                GpuModelName::MetzgerKN => launch_metzger_kn(d_params.ptr as _, d_times.ptr as _, d_out.ptr as _, n_draws as _, n_times as _, n_params as _, grid, block),
             }
             cuda_check(cudaGetLastError())?;
             cuda_check(cudaDeviceSynchronize())?;
