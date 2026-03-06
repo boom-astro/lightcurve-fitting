@@ -22,6 +22,11 @@ pub enum UncertaintyMethod {
 const MSUN_CGS: f64 = 1.989e33;
 const C_CGS: f64 = 2.998e10;
 const SECS_PER_DAY: f64 = 86400.0;
+const H_PLANCK: f64 = 6.626e-27; // erg·s
+const K_BOLTZMANN: f64 = 1.381e-16; // erg/K
+const SIGMA_SB: f64 = 5.6704e-5; // erg/cm²/s/K⁴
+// radiation constant (unused for now, but available if needed for multi-layer)
+// const A_RAD: f64 = 4.0 * SIGMA_SB / C_CGS;
 
 /// Sigma inflation factor for mean-field VI posteriors.
 const SIGMA_INFLATION_FACTOR: f64 = 4.0;
@@ -625,6 +630,180 @@ fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
             grid_norm[idx - 1] + frac * (grid_norm[idx] - grid_norm[idx - 1])
         })
         .collect()
+}
+
+/// Evaluate the Metzger 1-zone kilonova model returning per-band apparent AB
+/// magnitudes via blackbody emission, matching the NMMA `metzger_lc` approach.
+///
+/// # Parameters
+/// - `params`: `[log10(mej/Msun), log10(vej/c), log10(kappa), t0_offset]`
+/// - `obs_times`: rest-frame days since explosion
+/// - `band_frequencies_hz`: slice of `(band_name, frequency_Hz)` for each filter
+/// - `d_l_cm`: luminosity distance in cm
+///
+/// # Returns
+/// `HashMap<band_name, Vec<app_mag>>` — apparent AB magnitudes per band per time.
+pub fn metzger_kn_mags(
+    params: &[f64],
+    obs_times: &[f64],
+    band_frequencies_hz: &[(&str, f64)],
+    d_l_cm: f64,
+) -> HashMap<String, Vec<f64>> {
+    let m_ej = 10f64.powf(params[0]) * MSUN_CGS;
+    let v_ej = 10f64.powf(params[1]) * C_CGS;
+    let kappa_r = 10f64.powf(params[2]);
+    let t0 = params[3];
+
+    let phases: Vec<f64> = obs_times.iter().map(|&t| t - t0).collect();
+    let phase_max = phases.iter().cloned().fold(0.01f64, f64::max);
+
+    let faint = 99.0;
+    if phase_max <= 0.01 {
+        let mut out = HashMap::new();
+        for &(name, _) in band_frequencies_hz {
+            out.insert(name.to_string(), vec![faint; obs_times.len()]);
+        }
+        return out;
+    }
+
+    // Build log-spaced time grid
+    let n_grid: usize = 200;
+    let log_t_min = 0.01f64.ln();
+    let log_t_max = (phase_max * 1.05).ln();
+    let grid_t_day: Vec<f64> = (0..n_grid)
+        .map(|i| (log_t_min + (log_t_max - log_t_min) * i as f64 / (n_grid - 1) as f64).exp())
+        .collect();
+
+    let ye: f64 = 0.1;
+    let xn0: f64 = 1.0 - 2.0 * ye;
+
+    let scale: f64 = 1e40;
+    let e0 = 0.5 * m_ej * v_ej * v_ej;
+    let mut e_th = e0 / scale;
+    let mut e_kin = e0 / scale;
+    let mut v = v_ej;
+    let mut r = grid_t_day[0] * SECS_PER_DAY * v;
+
+    // Store L_rad (scaled) and R at each grid point
+    let mut grid_lrad = Vec::with_capacity(n_grid);
+    let mut grid_r = Vec::with_capacity(n_grid);
+
+    for i in 0..n_grid {
+        let t_day = grid_t_day[i];
+        let t_sec = t_day * SECS_PER_DAY;
+
+        let eth_factor = 0.34 * t_day.powf(0.74);
+        let eth = 0.36
+            * ((-0.56 * t_day).exp()
+                + if eth_factor > 1e-10 {
+                    (1.0 + eth_factor).ln() / eth_factor
+                } else {
+                    1.0
+                });
+
+        let xn = xn0 * (-t_sec / 900.0).exp();
+        let eps_neutron = 3.2e14 * xn;
+        let time_term = (0.5 - ((t_sec - 1.3) / 0.11).atan() / std::f64::consts::PI).max(1e-30);
+        let eps_rp = 2e18 * eth * time_term.powf(1.3);
+        let l_heat = m_ej * (eps_neutron + eps_rp) / scale;
+
+        let xr = 1.0 - xn0;
+        let xn_decayed = xn0 - xn;
+        let kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
+
+        let t_diff =
+            3.0 * kappa_eff * m_ej / (4.0 * std::f64::consts::PI * C_CGS * v * t_sec) + r / C_CGS;
+
+        let l_rad = if e_th > 0.0 && t_diff > 0.0 {
+            e_th / t_diff
+        } else {
+            0.0
+        };
+        grid_lrad.push(l_rad);
+        grid_r.push(r);
+
+        let l_pdv = if r > 0.0 { e_th * v / r } else { 0.0 };
+
+        if i < n_grid - 1 {
+            let dt_sec = (grid_t_day[i + 1] - grid_t_day[i]) * SECS_PER_DAY;
+            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
+            if e_th < 0.0 {
+                e_th = 0.0;
+            }
+            e_kin += l_pdv * dt_sec;
+            v = (2.0 * e_kin * scale / m_ej).sqrt().min(C_CGS);
+            r += v * dt_sec;
+        }
+    }
+
+    // Compute effective temperature on grid:
+    // T_eff = (E_th * scale / (a_rad * (4/3)π R³))^0.25  (from NMMA)
+    // Then L_bol = 4π R² σ T⁴, but we use E_th-derived T directly.
+    // NMMA uses: temp = 1e10 * (3 * E / (arad * 4π R³))^0.25
+    // where E is in 1e40 units. So L_real = grid_lrad * scale (erg/s).
+    // T = (L_real / (4π R² σ))^0.25
+    let mut grid_temp = Vec::with_capacity(n_grid);
+    let dist_sq = d_l_cm * d_l_cm;
+
+    for i in 0..n_grid {
+        let l_real = grid_lrad[i] * scale; // erg/s
+        let r_i = grid_r[i]; // cm
+        if l_real <= 0.0 || r_i <= 0.0 {
+            grid_temp.push(0.0);
+            continue;
+        }
+        let t_eff = (l_real / (4.0 * std::f64::consts::PI * r_i * r_i * SIGMA_SB)).powf(0.25);
+        grid_temp.push(if t_eff.is_finite() { t_eff } else { 0.0 });
+    }
+
+    // For each band, interpolate T_eff and R to obs times, compute BB flux → AB mag
+    let mut result = HashMap::new();
+    for &(band_name, nu) in band_frequencies_hz {
+        let mags: Vec<f64> = phases
+            .iter()
+            .map(|&phase| {
+                if phase <= 0.0 {
+                    return faint;
+                }
+                // Interpolate T_eff and R from grid
+                let (temp, r_photo) = if phase <= grid_t_day[0] {
+                    (grid_temp[0], grid_r[0])
+                } else if phase >= grid_t_day[n_grid - 1] {
+                    (grid_temp[n_grid - 1], grid_r[n_grid - 1])
+                } else {
+                    let idx = grid_t_day
+                        .partition_point(|&gt| gt < phase)
+                        .min(n_grid - 1)
+                        .max(1);
+                    let frac =
+                        (phase - grid_t_day[idx - 1]) / (grid_t_day[idx] - grid_t_day[idx - 1]);
+                    let t_interp = grid_temp[idx - 1] + frac * (grid_temp[idx] - grid_temp[idx - 1]);
+                    let r_interp = grid_r[idx - 1] + frac * (grid_r[idx] - grid_r[idx - 1]);
+                    (t_interp, r_interp)
+                };
+
+                if temp <= 0.0 || r_photo <= 0.0 {
+                    return faint;
+                }
+
+                // Planck spectral flux density at frequency nu, temperature temp:
+                // F_ν = (2h ν³/c²) / (exp(hν/kT) - 1) × (R/d)²
+                let x = H_PLANCK * nu / (K_BOLTZMANN * temp);
+                let x_clamped = x.min(700.0); // avoid overflow
+                let bb_factor = 2.0 * H_PLANCK * nu * nu * nu / (C_CGS * C_CGS);
+                let f_nu = bb_factor / x_clamped.exp_m1() * (r_photo * r_photo / dist_sq);
+
+                if f_nu <= 0.0 || !f_nu.is_finite() {
+                    return faint;
+                }
+
+                // AB magnitude: m = -2.5 log10(F_ν) - 48.6
+                -2.5 * f_nu.log10() - 48.6
+            })
+            .collect();
+        result.insert(band_name.to_string(), mags);
+    }
+    result
 }
 
 #[inline]
