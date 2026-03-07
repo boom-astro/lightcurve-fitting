@@ -29,7 +29,11 @@ jobs:
           python-version: "3.12"
       - name: Install maturin and build
         run: |
-          pip install maturin
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
           cd python && maturin develop --release
       - name: Run Python tests
-        run: python -m pytest python/tests/ -v
+        run: |
+          source .venv/bin/activate
+          python -m pytest python/tests/ -v
