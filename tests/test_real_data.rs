@@ -140,8 +140,8 @@ fn nonparametric_features_are_physical() {
             if let Some(rt) = result.rise_time {
                 assert!(rt >= 0.0, "{} band {}: rise_time={} negative", src.obj_id, result.band, rt);
             }
-            if let Some(dt) = result.decay_time {
-                assert!(dt >= 0.0, "{} band {}: decay_time={} negative", src.obj_id, result.band, dt);
+            if let Some(dt) = result.decay_efold {
+                assert!(dt >= 0.0, "{} band {}: decay_efold={} negative", src.obj_id, result.band, dt);
             }
             if let Some(vn) = result.von_neumann_ratio {
                 assert!(vn > 0.0 && vn < 100.0,
@@ -286,7 +286,7 @@ fn class_feature_medians() -> HashMap<String, (f64, f64, f64, f64, f64, f64)> {
         for r in &results {
             if let Some(v) = r.fwhm { entry.0.push(v); }
             if let Some(v) = r.rise_time { entry.1.push(v); }
-            if let Some(v) = r.decay_time { entry.2.push(v); }
+            if let Some(v) = r.decay_efold { entry.2.push(v); }
             if let Some(v) = r.von_neumann_ratio { entry.3.push(v); }
             if let Some(v) = r.post_peak_monotonicity { entry.4.push(v); }
             if let Some(v) = r.decay_power_law_index { entry.5.push(v); }
@@ -441,7 +441,7 @@ fn large_nonparametric_all_classes() {
         peak_mags: Vec<f64>,
         chi2s: Vec<f64>,
         rise_times: Vec<f64>,
-        decay_times: Vec<f64>,
+        decay_efolds: Vec<f64>,
         fwhms: Vec<f64>,
         temperatures: Vec<f64>,
         thermal_chi2s: Vec<f64>,
@@ -475,7 +475,7 @@ fn large_nonparametric_all_classes() {
             peak_mags: Vec::new(),
             chi2s: Vec::new(),
             rise_times: Vec::new(),
-            decay_times: Vec::new(),
+            decay_efolds: Vec::new(),
             fwhms: Vec::new(),
             temperatures: Vec::new(),
             thermal_chi2s: Vec::new(),
@@ -500,7 +500,7 @@ fn large_nonparametric_all_classes() {
             if let Some(v) = result.peak_mag { stats.peak_mags.push(v); }
             if let Some(v) = result.chi2 { stats.chi2s.push(v); }
             if let Some(v) = result.rise_time { stats.rise_times.push(v); }
-            if let Some(v) = result.decay_time { stats.decay_times.push(v); }
+            if let Some(v) = result.decay_efold { stats.decay_efolds.push(v); }
             if let Some(v) = result.fwhm { stats.fwhms.push(v); }
             if let Some(v) = result.von_neumann_ratio { stats.von_neumann_ratios.push(v); }
             if let Some(v) = result.decay_power_law_index { stats.decay_pl_indices.push(v); }
@@ -581,7 +581,7 @@ fn large_nonparametric_all_classes() {
             median(&s.chi2s),
             median(&s.peak_mags),
             median(&s.rise_times),
-            median(&s.decay_times),
+            median(&s.decay_efolds),
             median(&s.temperatures),
             median(&s.von_neumann_ratios),
         );

@@ -154,32 +154,126 @@ pub fn extract_rise_timescale(times: &[f64], mags: &[f64], peak_idx: usize) -> f
     times[peak_idx] - closest_t_before
 }
 
-pub fn extract_decay_timescale(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
-    if peak_idx >= mags.len() - 1 {
+/// E-folding decay time: time after peak for flux to drop to peak_flux / e.
+/// In magnitudes: find where mag >= peak_mag + 2.5*log10(e) ≈ peak_mag + 1.086.
+/// Uses linear interpolation between grid points for sub-grid accuracy.
+pub fn compute_decay_efold(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
+    // 2.5 * log10(e)
+    const MAG_OFFSET: f64 = 1.0857362047581294;
+    find_decay_crossing(times, mags, peak_idx, MAG_OFFSET)
+}
+
+/// Δm15: magnitude change 15 days after peak.
+/// Linearly interpolates the GP prediction grid to get mag(t_peak + 15) - mag(t_peak).
+/// Positive for fading sources.
+pub fn compute_dm15(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
+    if peak_idx >= mags.len() {
+        return f64::NAN;
+    }
+    let t_target = times[peak_idx] + 15.0;
+    let peak_mag = mags[peak_idx];
+
+    // Find the bracketing interval after peak
+    for i in (peak_idx + 1)..mags.len() {
+        if times[i] >= t_target {
+            // Linear interpolation between times[i-1] and times[i]
+            let t0 = times[i - 1];
+            let t1 = times[i];
+            let m0 = mags[i - 1];
+            let m1 = mags[i];
+            let dt = t1 - t0;
+            if dt.abs() < 1e-15 {
+                return m0 - peak_mag;
+            }
+            let frac = (t_target - t0) / dt;
+            let mag_interp = m0 + frac * (m1 - m0);
+            return mag_interp - peak_mag;
+        }
+    }
+    // t_peak + 15 is beyond the prediction grid
+    f64::NAN
+}
+
+/// Half-max decay time: time from peak for flux to drop to half of peak flux.
+/// In magnitudes: find where mag >= peak_mag + 2.5*log10(2) ≈ peak_mag + 0.753.
+/// Uses linear interpolation between grid points for sub-grid accuracy.
+pub fn compute_decay_halfmax(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
+    // 2.5 * log10(2)
+    const MAG_OFFSET: f64 = 0.7525749891599529;
+    find_decay_crossing(times, mags, peak_idx, MAG_OFFSET)
+}
+
+/// Helper: find time after peak where mag crosses peak_mag + mag_offset,
+/// using linear interpolation between grid points.
+fn find_decay_crossing(times: &[f64], mags: &[f64], peak_idx: usize, mag_offset: f64) -> f64 {
+    if peak_idx >= mags.len().saturating_sub(1) {
         return f64::NAN;
     }
     let peak_mag = mags[peak_idx];
-    let baseline = if peak_idx < mags.len() - 1 {
-        let end_idx = ((peak_idx + mags.len()) / 2).min(mags.len() - 1);
-        let count = (end_idx - peak_idx).max(1);
-        mags[peak_idx + 1..=end_idx].iter().sum::<f64>() / count as f64
-    } else {
-        peak_mag + 0.5
-    };
-    let target_amp = baseline + (peak_mag - baseline) * (-1.0_f64).exp();
-    let mut closest_t_after = f64::NAN;
-    let mut closest_diff = f64::INFINITY;
+    let threshold = peak_mag + mag_offset;
+
     for i in (peak_idx + 1)..mags.len() {
-        let diff = (mags[i] - target_amp).abs();
-        if diff < closest_diff {
-            closest_diff = diff;
-            closest_t_after = times[i];
+        if mags[i] >= threshold {
+            // Linear interpolation between [i-1] and [i]
+            let m_prev = mags[i - 1];
+            let m_curr = mags[i];
+            let t_prev = times[i - 1];
+            let t_curr = times[i];
+            let dm = m_curr - m_prev;
+            if dm.abs() < 1e-15 {
+                return t_curr - times[peak_idx];
+            }
+            let frac = (threshold - m_prev) / dm;
+            let t_cross = t_prev + frac * (t_curr - t_prev);
+            return t_cross - times[peak_idx];
         }
     }
-    if closest_t_after.is_nan() {
+    f64::NAN
+}
+
+/// Helper: find time before peak where mag crosses peak_mag + mag_offset
+/// (searching backwards from peak), with linear interpolation.
+/// Returns time from crossing to peak (positive value).
+fn find_rise_crossing(times: &[f64], mags: &[f64], peak_idx: usize, mag_offset: f64) -> f64 {
+    if peak_idx == 0 {
         return f64::NAN;
     }
-    closest_t_after - times[peak_idx]
+    let peak_mag = mags[peak_idx];
+    let threshold = peak_mag + mag_offset;
+
+    for i in (0..peak_idx).rev() {
+        if mags[i] >= threshold {
+            // Linear interpolation between [i] and [i+1]
+            let m_faint = mags[i];
+            let m_bright = mags[i + 1];
+            let t_faint = times[i];
+            let t_bright = times[i + 1];
+            let dm = m_faint - m_bright;
+            if dm.abs() < 1e-15 {
+                return times[peak_idx] - t_faint;
+            }
+            let frac = (threshold - m_bright) / dm;
+            let t_cross = t_bright + frac * (t_faint - t_bright);
+            return times[peak_idx] - t_cross;
+        }
+    }
+    f64::NAN
+}
+
+/// Rise half-max time: time before peak for flux to rise from half-peak to peak.
+/// In magnitudes: find where mag >= peak_mag + 2.5*log10(2) ≈ peak_mag + 0.753
+/// searching backwards from peak. Uses linear interpolation.
+pub fn compute_rise_halfmax(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
+    const MAG_OFFSET: f64 = 0.7525749891599529; // 2.5 * log10(2)
+    find_rise_crossing(times, mags, peak_idx, MAG_OFFSET)
+}
+
+/// Rise e-fold time: time before peak for flux to rise from peak_flux/e to peak.
+/// In magnitudes: find where mag >= peak_mag + 2.5*log10(e) ≈ peak_mag + 1.086
+/// searching backwards from peak. Uses linear interpolation.
+pub fn compute_rise_efold(times: &[f64], mags: &[f64], peak_idx: usize) -> f64 {
+    const MAG_OFFSET: f64 = 1.0857362047581294; // 2.5 * log10(e)
+    find_rise_crossing(times, mags, peak_idx, MAG_OFFSET)
 }
 
 pub fn compute_fwhm(times: &[f64], mags: &[f64], peak_idx: usize) -> (f64, f64, f64) {
@@ -255,6 +349,76 @@ pub fn compute_decay_rate(times: &[f64], mags: &[f64]) -> f64 {
         return f64::NAN;
     }
     (n * sum_tm - sum_t * sum_m) / denominator
+}
+
+/// Linear slope (mag/day) in a time window around the peak.
+/// Fits a least-squares line to points within [t_peak - window, t_peak] (rise)
+/// or [t_peak, t_peak + window] (decay).
+fn linear_slope(times: &[f64], mags: &[f64]) -> f64 {
+    let n = times.len();
+    if n < 2 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let sum_t: f64 = times.iter().sum();
+    let sum_m: f64 = mags.iter().sum();
+    let sum_tt: f64 = times.iter().map(|t| t * t).sum();
+    let sum_tm: f64 = times.iter().zip(mags.iter()).map(|(t, m)| t * m).sum();
+    let denom = nf * sum_tt - sum_t * sum_t;
+    if denom.abs() < 1e-15 {
+        return f64::NAN;
+    }
+    (nf * sum_tm - sum_t * sum_m) / denom
+}
+
+/// Near-peak rise rate: linear slope (mag/day) in the 30 days before peak.
+/// Negative = brightening (mag decreasing). More negative = faster rise.
+pub fn compute_near_peak_rise_rate(
+    times: &[f64],
+    mags: &[f64],
+    peak_idx: usize,
+    window_days: f64,
+) -> f64 {
+    if peak_idx == 0 || peak_idx >= mags.len() {
+        return f64::NAN;
+    }
+    let t_peak = times[peak_idx];
+    let t_start = t_peak - window_days;
+    // Collect points in [t_start, t_peak]
+    let sel_times: Vec<f64> = (0..=peak_idx)
+        .filter(|&i| times[i] >= t_start)
+        .map(|i| times[i])
+        .collect();
+    let sel_mags: Vec<f64> = (0..=peak_idx)
+        .filter(|&i| times[i] >= t_start)
+        .map(|i| mags[i])
+        .collect();
+    linear_slope(&sel_times, &sel_mags)
+}
+
+/// Near-peak decay rate: linear slope (mag/day) in the 30 days after peak.
+/// Positive = fading (mag increasing). More positive = faster decay.
+pub fn compute_near_peak_decay_rate(
+    times: &[f64],
+    mags: &[f64],
+    peak_idx: usize,
+    window_days: f64,
+) -> f64 {
+    if peak_idx >= mags.len().saturating_sub(1) {
+        return f64::NAN;
+    }
+    let t_peak = times[peak_idx];
+    let t_end = t_peak + window_days;
+    // Collect points in [t_peak, t_end]
+    let sel_times: Vec<f64> = (peak_idx..mags.len())
+        .filter(|&i| times[i] <= t_end)
+        .map(|i| times[i])
+        .collect();
+    let sel_mags: Vec<f64> = (peak_idx..mags.len())
+        .filter(|&i| times[i] <= t_end)
+        .map(|i| mags[i])
+        .collect();
+    linear_slope(&sel_times, &sel_mags)
 }
 
 /// Convert NaN/Inf to None for JSON safety.

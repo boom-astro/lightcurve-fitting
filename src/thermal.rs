@@ -15,17 +15,39 @@ use crate::sparse_gp::DenseGP;
 /// hc/k in Å·K units for blackbody exponent: hc / k_B = 1.4388e8 Å·K
 const HC_OVER_K: f64 = 1.4388e8;
 
-/// ZTF effective wavelengths in Å
-const LAMBDA_G: f64 = 4770.0;
-const LAMBDA_R: f64 = 6231.0;
-const LAMBDA_I: f64 = 7625.0;
+/// Effective wavelengths in Å for supported bands.
+/// ZTF: g=4770, r=6231, i=7625
+/// LSST: u=3671, g=4827, r=6223, i=7546, z=8691, y=9712
+const LAMBDA_U: f64 = 3671.0; // LSST u
+const LAMBDA_G: f64 = 4770.0; // ZTF g / LSST g (~4827, close enough)
+const LAMBDA_R: f64 = 6231.0; // ZTF r / LSST r (~6223, close enough)
+const LAMBDA_I: f64 = 7625.0; // ZTF i / LSST i (~7546, close enough)
+const LAMBDA_Z: f64 = 8691.0; // LSST z
+const LAMBDA_Y: f64 = 9712.0; // LSST y
+
+/// Find the first band name from a list of aliases that exists in the data with ≥5 points.
+fn find_band_name<'a>(bands: &'a HashMap<String, BandData>, aliases: &[&str]) -> Option<&'a str> {
+    for alias in aliases {
+        if let Some(bd) = bands.get(*alias) {
+            if bd.times.len() >= 5 {
+                return bands.keys().find(|k| k.as_str() == *alias).map(|k| k.as_str());
+            }
+        }
+    }
+    None
+}
 
 /// Map band name to effective wavelength in Å.
+/// Recognizes ZTF ("ztfg", "ztfr", "ztfi"), LSST ("lsstu".."lssty"),
+/// and short names ("u", "g", "r", "i", "z", "y").
 fn band_wavelength(band: &str) -> Option<f64> {
     match band {
-        "g" => Some(LAMBDA_G),
-        "r" => Some(LAMBDA_R),
-        "i" => Some(LAMBDA_I),
+        "u" | "lsstu" => Some(LAMBDA_U),
+        "g" | "ztfg" | "lsstg" => Some(LAMBDA_G),
+        "r" | "ztfr" | "lsstr" => Some(LAMBDA_R),
+        "i" | "ztfi" | "lssti" => Some(LAMBDA_I),
+        "z" | "lsstz" => Some(LAMBDA_Z),
+        "y" | "lssty" => Some(LAMBDA_Y),
         _ => None,
     }
 }
@@ -117,6 +139,8 @@ impl CostFunction for ThermalCost {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThermalResult {
     pub log_temp_peak: Option<f64>,
+    /// log10(temperature) at the latest observation time.
+    pub log_temp_latest: Option<f64>,
     pub cooling_rate: Option<f64>,
     pub log_temp_peak_err: Option<f64>,
     pub cooling_rate_err: Option<f64>,
@@ -190,14 +214,11 @@ pub fn fit_thermal(
     bands: &HashMap<String, BandData>,
     prefit_gps: Option<&HashMap<String, DenseGP>>,
 ) -> Option<ThermalResult> {
-    // Choose reference band: prefer g (bluest = most temperature-sensitive)
-    let ref_band_name = if bands.get("g").map_or(false, |b| b.times.len() >= 5) {
-        "g"
-    } else if bands.get("r").map_or(false, |b| b.times.len() >= 5) {
-        "r"
-    } else {
-        return None;
-    };
+    // Choose reference band: prefer bluest available (most temperature-sensitive).
+    // Try u (LSST) → g (ZTF/LSST) → r (ZTF/LSST).
+    let ref_band_name = find_band_name(bands, &["u", "lsstu"])
+        .or_else(|| find_band_name(bands, &["g", "ztfg", "lsstg"]))
+        .or_else(|| find_band_name(bands, &["r", "ztfr", "lsstr"]))?;
 
     let ref_data = bands.get(ref_band_name)?;
     let lambda_ref = band_wavelength(ref_band_name)?;
@@ -276,6 +297,7 @@ pub fn fit_thermal(
     if n_color_obs < 3 {
         return Some(ThermalResult {
             log_temp_peak: None,
+            log_temp_latest: None,
             cooling_rate: None,
             log_temp_peak_err: None,
             cooling_rate_err: None,
@@ -323,6 +345,7 @@ pub fn fit_thermal(
     if best_params_all.is_empty() {
         return Some(ThermalResult {
             log_temp_peak: None,
+            log_temp_latest: None,
             cooling_rate: None,
             log_temp_peak_err: None,
             cooling_rate_err: None,
@@ -360,8 +383,21 @@ pub fn fit_thermal(
         None
     };
 
+    // Compute temperature at the latest observation time, clamped to physical range
+    let t_last = color_obs
+        .iter()
+        .map(|o| o.time)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let log_temp_latest = if t_last.is_finite() {
+        let lt = best_params_overall[0] + best_params_overall[1] * t_last;
+        if lt.is_finite() { Some(lt.clamp(2.0, 7.0)) } else { None }
+    } else {
+        None
+    };
+
     Some(ThermalResult {
         log_temp_peak: Some(best_params_overall[0]),
+        log_temp_latest,
         cooling_rate: Some(best_params_overall[1]),
         log_temp_peak_err: log_t0_err,
         cooling_rate_err,

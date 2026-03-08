@@ -1,8 +1,9 @@
 mod synthetic;
 
 use lightcurve_fitting::common::{
-    build_flux_bands, build_mag_bands, compute_decay_rate, compute_fwhm, compute_rise_rate,
-    extract_decay_timescale, extract_rise_timescale, finite_or_none, mag2flux, median,
+    build_flux_bands, build_mag_bands, compute_decay_efold, compute_decay_rate, compute_dm15,
+    compute_decay_halfmax, compute_fwhm, compute_rise_rate, extract_rise_timescale,
+    finite_or_none, mag2flux, median,
 };
 
 // ---------------------------------------------------------------------------
@@ -201,7 +202,7 @@ fn extract_rise_timescale_reasonable() {
 }
 
 #[test]
-fn extract_decay_timescale_reasonable() {
+fn compute_decay_metrics_reasonable() {
     let (times, mags) = make_peaked_data();
     let peak_idx = mags
         .iter()
@@ -209,12 +210,19 @@ fn extract_decay_timescale_reasonable() {
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .unwrap()
         .0;
-    let decay = extract_decay_timescale(&times, &mags, peak_idx);
-    assert!(decay.is_finite(), "decay timescale should be finite");
-    assert!(
-        decay > 0.0,
-        "decay timescale should be positive, got {decay}"
-    );
+    let efold = compute_decay_efold(&times, &mags, peak_idx);
+    assert!(efold.is_finite(), "decay efold should be finite");
+    assert!(efold > 0.0, "decay efold should be positive, got {efold}");
+
+    let dm15 = compute_dm15(&times, &mags, peak_idx);
+    // dm15 may be NaN if the data doesn't extend 15 days past peak
+    if dm15.is_finite() {
+        assert!(dm15 >= 0.0, "dm15 should be non-negative, got {dm15}");
+    }
+
+    let halfmax = compute_decay_halfmax(&times, &mags, peak_idx);
+    assert!(halfmax.is_finite(), "decay halfmax should be finite");
+    assert!(halfmax > 0.0, "decay halfmax should be positive, got {halfmax}");
 }
 
 #[test]

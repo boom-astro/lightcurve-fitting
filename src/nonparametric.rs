@@ -4,7 +4,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    compute_decay_rate, compute_fwhm, compute_rise_rate, extract_decay_timescale,
+    compute_decay_efold, compute_decay_halfmax, compute_decay_rate, compute_dm15,
+    compute_fwhm, compute_near_peak_decay_rate, compute_near_peak_rise_rate,
+    compute_rise_efold, compute_rise_halfmax, compute_rise_rate,
     extract_rise_timescale, finite_or_none, mag2flux, BandData,
 };
 use crate::gp::subsample_data;
@@ -72,8 +74,18 @@ fn filter_upper_limits(band_data: &BandData) -> (BandData, usize) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NonparametricBandResult {
     pub band: String,
+    /// Rise e-fold timescale (old method, uses baseline average). Deprecated in favor of rise_halfmax.
     pub rise_time: Option<f64>,
-    pub decay_time: Option<f64>,
+    /// Rise half-max time: days before peak for flux to rise from half-peak to peak.
+    pub rise_halfmax: Option<f64>,
+    /// Rise e-fold time: days before peak for flux to rise from peak/e to peak.
+    pub rise_efold: Option<f64>,
+    /// E-folding decay time: days from peak for flux to drop to peak_flux / e.
+    pub decay_efold: Option<f64>,
+    /// Δm15: magnitude change 15 days after peak (positive for fading).
+    pub dm15: Option<f64>,
+    /// Half-max decay time: days from peak for flux to drop to half of peak flux.
+    pub decay_halfmax: Option<f64>,
     pub t0: Option<f64>,
     pub peak_mag: Option<f64>,
     pub chi2: Option<f64>,
@@ -82,6 +94,10 @@ pub struct NonparametricBandResult {
     pub fwhm: Option<f64>,
     pub rise_rate: Option<f64>,
     pub decay_rate: Option<f64>,
+    /// Near-peak rise rate: linear slope (mag/day) in 30 days before peak. Negative = brightening.
+    pub near_peak_rise_rate: Option<f64>,
+    /// Near-peak decay rate: linear slope (mag/day) in 30 days after peak. Positive = fading.
+    pub near_peak_decay_rate: Option<f64>,
     pub gp_dfdt_now: Option<f64>,
     pub gp_dfdt_next: Option<f64>,
     pub gp_d2fdt2_now: Option<f64>,
@@ -433,6 +449,98 @@ fn predict_mag_at_offset(
     }
 }
 
+/// Features computed on a fine (1-day) GP prediction grid for accuracy.
+struct FineGridMetrics {
+    decay_efold: f64,
+    dm15: f64,
+    decay_halfmax: f64,
+    fwhm: f64,
+    rise_time: f64,
+    rise_halfmax: f64,
+    rise_efold: f64,
+    rise_rate: f64,
+    decay_rate: f64,
+    near_peak_rise_rate: f64,
+    near_peak_decay_rate: f64,
+}
+
+/// Compute features using a fine GP prediction grid around the peak.
+fn compute_fine_grid_metrics(
+    gp: &dyn GpPredictor,
+    _t_peak: f64,
+    t_min: f64,
+    t_max: f64,
+) -> FineGridMetrics {
+    // Fine grid: 1-day spacing covering the full observation window
+    let start = t_min;
+    let end = t_max;
+    let n_fine = ((end - start).max(1.0)) as usize + 1;
+    // Cap at 2000 points to avoid excessive cost for very long baselines
+    let step = if n_fine > 2000 { (end - start) / 1999.0 } else { 1.0 };
+    let n_fine = n_fine.min(2000);
+    let fine_times: Vec<f64> = (0..n_fine).map(|i| start + i as f64 * step).collect();
+
+    let nan_result = FineGridMetrics {
+        decay_efold: f64::NAN, dm15: f64::NAN, decay_halfmax: f64::NAN,
+        fwhm: f64::NAN, rise_time: f64::NAN, rise_halfmax: f64::NAN,
+        rise_efold: f64::NAN, rise_rate: f64::NAN, decay_rate: f64::NAN,
+        near_peak_rise_rate: f64::NAN, near_peak_decay_rate: f64::NAN,
+    };
+
+    let fine_pred = match gp.predict_times(&fine_times) {
+        Some(p) => p,
+        None => return nan_result,
+    };
+
+    // Find peak on the fine grid
+    let peak_idx = fine_pred.iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let decay_efold = compute_decay_efold(&fine_times, &fine_pred, peak_idx);
+    let dm15 = compute_dm15(&fine_times, &fine_pred, peak_idx);
+    let decay_halfmax = compute_decay_halfmax(&fine_times, &fine_pred, peak_idx);
+    let (fwhm, _, _) = compute_fwhm(&fine_times, &fine_pred, peak_idx);
+    let rise_time = extract_rise_timescale(&fine_times, &fine_pred, peak_idx);
+    let rise_halfmax = compute_rise_halfmax(&fine_times, &fine_pred, peak_idx);
+    let rise_efold = compute_rise_efold(&fine_times, &fine_pred, peak_idx);
+    let rise_rate = compute_rise_rate(&fine_times, &fine_pred);
+    let decay_rate = compute_decay_rate(&fine_times, &fine_pred);
+    let near_peak_rise_rate = compute_near_peak_rise_rate(&fine_times, &fine_pred, peak_idx, 30.0);
+    let near_peak_decay_rate = compute_near_peak_decay_rate(&fine_times, &fine_pred, peak_idx, 30.0);
+
+    FineGridMetrics {
+        decay_efold, dm15, decay_halfmax, fwhm, rise_time, rise_halfmax, rise_efold,
+        rise_rate, decay_rate, near_peak_rise_rate, near_peak_decay_rate,
+    }
+}
+
+/// Compute features from a coarse grid (fallback when no GP predictor available).
+#[allow(dead_code)]
+fn compute_coarse_grid_metrics(
+    times_pred: &[f64],
+    pred: &[f64],
+    peak_idx: usize,
+) -> FineGridMetrics {
+    let (fwhm, _, _) = compute_fwhm(times_pred, pred, peak_idx);
+    FineGridMetrics {
+        decay_efold: compute_decay_efold(times_pred, pred, peak_idx),
+        dm15: compute_dm15(times_pred, pred, peak_idx),
+        decay_halfmax: compute_decay_halfmax(times_pred, pred, peak_idx),
+        fwhm,
+        rise_time: extract_rise_timescale(times_pred, pred, peak_idx),
+        rise_halfmax: compute_rise_halfmax(times_pred, pred, peak_idx),
+        rise_efold: compute_rise_efold(times_pred, pred, peak_idx),
+        rise_rate: compute_rise_rate(times_pred, pred),
+        decay_rate: compute_decay_rate(times_pred, pred),
+        near_peak_rise_rate: compute_near_peak_rise_rate(times_pred, pred, peak_idx, 30.0),
+        near_peak_decay_rate: compute_near_peak_decay_rate(times_pred, pred, peak_idx, 30.0),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Variability / rise features (TDE vs AGN discrimination)
 // ---------------------------------------------------------------------------
@@ -708,15 +816,25 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
         let t0 = times_pred[peak_idx];
         let peak_mag = pred[peak_idx];
 
-        let rise_time = extract_rise_timescale(&times_pred, pred, peak_idx);
-        let decay_time = extract_decay_timescale(&times_pred, pred, peak_idx);
-        let (fwhm_calc, t_before, t_after) = compute_fwhm(&times_pred, pred, peak_idx);
-        let fwhm = if !t_before.is_nan() && !t_after.is_nan() { t_after - t_before } else { fwhm_calc };
-        let rise_rate = compute_rise_rate(&times_pred, pred);
-        let decay_rate = compute_decay_rate(&times_pred, pred);
-
-        // Predictive features — need GpPredictor for point queries
         let t_last = band_data.times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let t_min = *times_pred.first().unwrap_or(&t0);
+        let t_max = *times_pred.last().unwrap_or(&t0);
+        let fine = if let Some(ref gp) = gpu_out.dense_gp {
+                compute_fine_grid_metrics(gp, t0, t_min, t_max)
+            } else {
+                compute_coarse_grid_metrics(&times_pred, pred, peak_idx)
+            };
+        let rise_time = fine.rise_time;
+        let rise_halfmax = fine.rise_halfmax;
+        let rise_efold = fine.rise_efold;
+        let decay_efold = fine.decay_efold;
+        let dm15 = fine.dm15;
+        let decay_halfmax = fine.decay_halfmax;
+        let fwhm = fine.fwhm;
+        let rise_rate = fine.rise_rate;
+        let decay_rate = fine.decay_rate;
+        let near_peak_rise_rate = fine.near_peak_rise_rate;
+        let near_peak_decay_rate = fine.near_peak_decay_rate;
         let predictive = if let Some(ref gp) = gpu_out.dense_gp {
             compute_predictive_features(
                 gp, t_last, t0, &times_pred, pred, &std_vec,
@@ -750,7 +868,11 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
         let result = NonparametricBandResult {
             band: band_name.to_string(),
             rise_time: finite_or_none(rise_time),
-            decay_time: finite_or_none(decay_time),
+            rise_halfmax: finite_or_none(rise_halfmax),
+            rise_efold: finite_or_none(rise_efold),
+            decay_efold: finite_or_none(decay_efold),
+            dm15: finite_or_none(dm15),
+            decay_halfmax: finite_or_none(decay_halfmax),
             t0: finite_or_none(t0),
             peak_mag: finite_or_none(peak_mag),
             chi2: finite_or_none(chi2_reduced),
@@ -759,6 +881,8 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
             fwhm: finite_or_none(fwhm),
             rise_rate: finite_or_none(rise_rate),
             decay_rate: finite_or_none(decay_rate),
+            near_peak_rise_rate: finite_or_none(near_peak_rise_rate),
+            near_peak_decay_rate: finite_or_none(near_peak_decay_rate),
             gp_dfdt_now: finite_or_none(predictive.gp_dfdt_now),
             gp_dfdt_next: finite_or_none(predictive.gp_dfdt_next),
             gp_d2fdt2_now: finite_or_none(predictive.gp_d2fdt2_now),
@@ -1046,22 +1170,25 @@ fn process_band(
     let t0 = times_pred[peak_idx];
     let peak_mag = pred[peak_idx];
 
-    let rise_time = extract_rise_timescale(times_pred, &pred, peak_idx);
-    let decay_time = extract_decay_timescale(times_pred, &pred, peak_idx);
-    let (fwhm_calc, t_before, t_after) = compute_fwhm(times_pred, &pred, peak_idx);
-    let fwhm = if !t_before.is_nan() && !t_after.is_nan() {
-        t_after - t_before
-    } else {
-        fwhm_calc
-    };
-    let rise_rate = compute_rise_rate(times_pred, &pred);
-    let decay_rate = compute_decay_rate(times_pred, &pred);
-
     let t_last = band_data
         .times
         .iter()
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
+    let t_min = *times_pred.first().unwrap_or(&t0);
+    let t_max = *times_pred.last().unwrap_or(&t0);
+    let fine = compute_fine_grid_metrics(gp_predictor.as_ref(), t0, t_min, t_max);
+    let rise_time = fine.rise_time;
+    let rise_halfmax = fine.rise_halfmax;
+    let rise_efold = fine.rise_efold;
+    let decay_efold = fine.decay_efold;
+    let dm15 = fine.dm15;
+    let decay_halfmax = fine.decay_halfmax;
+    let fwhm = fine.fwhm;
+    let rise_rate = fine.rise_rate;
+    let decay_rate = fine.decay_rate;
+    let near_peak_rise_rate = fine.near_peak_rise_rate;
+    let near_peak_decay_rate = fine.near_peak_decay_rate;
     let predictive = compute_predictive_features(
         gp_predictor.as_ref(),
         t_last,
@@ -1096,7 +1223,11 @@ fn process_band(
     let result = NonparametricBandResult {
         band: band_name.to_string(),
         rise_time: finite_or_none(rise_time),
-        decay_time: finite_or_none(decay_time),
+        rise_halfmax: finite_or_none(rise_halfmax),
+        rise_efold: finite_or_none(rise_efold),
+        decay_efold: finite_or_none(decay_efold),
+        dm15: finite_or_none(dm15),
+        decay_halfmax: finite_or_none(decay_halfmax),
         t0: finite_or_none(t0),
         peak_mag: finite_or_none(peak_mag),
         chi2: finite_or_none(chi2_reduced),
@@ -1105,6 +1236,8 @@ fn process_band(
         fwhm: finite_or_none(fwhm),
         rise_rate: finite_or_none(rise_rate),
         decay_rate: finite_or_none(decay_rate),
+        near_peak_rise_rate: finite_or_none(near_peak_rise_rate),
+        near_peak_decay_rate: finite_or_none(near_peak_decay_rate),
         gp_dfdt_now: finite_or_none(predictive.gp_dfdt_now),
         gp_dfdt_next: finite_or_none(predictive.gp_dfdt_next),
         gp_d2fdt2_now: finite_or_none(predictive.gp_d2fdt2_now),
