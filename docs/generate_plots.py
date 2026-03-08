@@ -301,6 +301,157 @@ def plot_nonparametric(source, outpath, is_persistent=False):
 
 
 # ---------------------------------------------------------------------------
+# Parametric plot
+# ---------------------------------------------------------------------------
+def plot_parametric(source, outpath, is_persistent=False):
+    """Generate a multi-panel parametric model plot for one source."""
+    import math
+
+    obj_id = source["obj_id"]
+    label_name = source["label_name"]
+    raw_bands = source["bands"]
+    band_names = [
+        b for b in sorted_bands(raw_bands)
+        if detection_mask(
+            np.array(raw_bands[b]["values"]),
+            np.array(raw_bands[b]["errors"]),
+        ).sum() >= MIN_DET_PER_BAND
+    ]
+    if not band_names:
+        print(f"  Skipping {obj_id}: no bands with >= {MIN_DET_PER_BAND} detections")
+        return
+
+    # Build flux-space bands (strip ztf prefix)
+    times_all, mags_all, errs_all, bands_list = [], [], [], []
+    short_map = {}  # short_name -> original band name
+    for b in band_names:
+        short = b.replace("ztf", "")
+        short_map[short] = b
+        bd = raw_bands[b]
+        for t, v, e in zip(bd["times"], bd["values"], bd["errors"]):
+            times_all.append(t)
+            mags_all.append(v)
+            errs_all.append(e)
+            bands_list.append(short)
+
+    flux_bands = lcf.build_flux_bands(times_all, mags_all, errs_all, bands_list)
+    param_results = lcf.fit_parametric(flux_bands, method="laplace")
+    if not param_results:
+        print(f"  Skipping {obj_id}: parametric fit returned no results")
+        return
+
+    result_by_band = {r["band"]: r for r in param_results}
+
+    # Find display window
+    win_lo, win_hi = find_display_window(raw_bands, band_names, is_persistent)
+    if win_lo is None:
+        print(f"  Skipping {obj_id}: could not determine display window")
+        return
+
+    # Only keep bands that have parametric results
+    short_names = [b.replace("ztf", "") for b in band_names
+                   if b.replace("ztf", "") in result_by_band]
+    band_names = [b for b in band_names if b.replace("ztf", "") in result_by_band]
+
+    n_bands = len(short_names)
+    if n_bands == 0:
+        print(f"  Skipping {obj_id}: no parametric results for any band")
+        return
+    fig, axes = plt.subplots(1, n_bands, figsize=(3.5 * n_bands, 3.0), squeeze=False)
+    fig.suptitle(f"{obj_id} ({label_name}) — Parametric", fontsize=12, fontweight="bold")
+
+    zp = 23.9
+    for col, (short_name, orig_name) in enumerate(zip(short_names, band_names)):
+        ax = axes[0, col]
+        bd = raw_bands[orig_name]
+        t = np.array(bd["times"])
+        v = np.array(bd["values"])
+        e = np.array(bd["errors"])
+        color = BAND_COLORS.get(orig_name, BAND_COLORS.get(short_name, "#377eb8"))
+
+        # Convert to flux
+        flux = 10 ** ((zp - v) / 2.5)
+        flux_err = flux * e * np.log(10) / 2.5
+
+        mask = detection_mask(v, e)
+        in_win = (t >= win_lo) & (t <= win_hi)
+        det_in = mask & in_win
+        ul_in = (~mask) & in_win
+
+        ax.errorbar(
+            t[det_in], flux[det_in], yerr=flux_err[det_in],
+            fmt="o", color=color, markersize=3, alpha=0.6,
+            label=f"{short_name} data ({det_in.sum()})", zorder=3,
+        )
+        if ul_in.sum() > 0:
+            ax.scatter(
+                t[ul_in], flux[ul_in],
+                marker="v", color=color, s=30, alpha=0.5,
+                label=f"{short_name} UL ({ul_in.sum()})", zorder=4,
+            )
+
+        # Model prediction curve
+        r = result_by_band.get(short_name)
+        if r is not None:
+            model = r.get("model")
+            params = r.get("svi_mu") or r.get("pso_params")
+            if model and params and det_in.sum() > 0:
+                t_pred = np.linspace(win_lo, win_hi, 300).tolist()
+                try:
+                    f_pred = np.array(lcf.eval_model(model, params, t_pred))
+                    # Scale model flux to match observed flux (least-squares)
+                    f_at_obs = np.array(lcf.eval_model(
+                        model, params, t[det_in].tolist()))
+                    obs_flux = flux[det_in]
+                    denom = np.dot(f_at_obs, f_at_obs)
+                    if denom > 1e-30:
+                        scale = np.dot(obs_flux, f_at_obs) / denom
+                    else:
+                        scale = 1.0
+                    f_scaled = f_pred * scale
+                    # Clip to reasonable range to avoid runaway tails
+                    flux_lo = -0.1 * np.max(obs_flux)
+                    flux_hi = 1.5 * np.max(obs_flux)
+                    f_clipped = np.clip(f_scaled, flux_lo, flux_hi)
+                    ax.plot(t_pred, f_clipped, "-", color=color,
+                            linewidth=1.5, alpha=0.85, zorder=5,
+                            label=model)
+                except Exception:
+                    pass
+
+            # Feature annotation
+            info = []
+            if model:
+                info.append(f"model: {model}")
+            chi2 = r.get("pso_chi2")
+            if chi2 is not None:
+                info.append(f"chi2={chi2:.2f}")
+            mag_chi2 = r.get("mag_chi2")
+            if mag_chi2 is not None:
+                info.append(f"mag_chi2={mag_chi2:.2f}")
+            if info:
+                ax.text(
+                    0.03, 0.97, "\n".join(info),
+                    transform=ax.transAxes, fontsize=7,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                              alpha=0.8, edgecolor="gray"),
+                )
+
+        ax.set_xlim(win_lo, win_hi)
+        ax.set_xlabel("Time (days)")
+        if col == 0:
+            ax.set_ylabel("Flux")
+        ax.set_title(f"{short_name}-band", fontsize=11)
+        ax.legend(fontsize=7, loc="upper right")
+
+    plt.tight_layout()
+    fig.savefig(outpath, dpi=90, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {outpath}")
+
+
+# ---------------------------------------------------------------------------
 # Curated source list — well-sampled transients from real ZTF data
 # ---------------------------------------------------------------------------
 PLOT_SOURCES = {
@@ -331,6 +482,9 @@ def main():
 
         np_path = os.path.join(IMG_DIR, f"np_{slug}.png")
         plot_nonparametric(source, np_path, is_persistent=is_persistent)
+
+        param_path = os.path.join(IMG_DIR, f"param_{slug}.png")
+        plot_parametric(source, param_path, is_persistent=is_persistent)
 
 
 if __name__ == "__main__":
