@@ -291,6 +291,16 @@ fn parametric_source_scaling() {
         print_row("CPU", n_src, FIXED_POINTS, wall);
         csv.add_row("parametric", "CPU", n_src, FIXED_POINTS, wall);
 
+        // CPU-parallel: rayon par_iter over sources
+        let all_bands: Vec<_> = sources.iter()
+            .map(|(t, m, e, b)| build_flux_bands(t, m, e, b))
+            .collect();
+        let wall = bench_best_of(N_WARMUP, N_REPEAT, || {
+            let _ = fit_batch_parametric(&all_bands, false, UncertaintyMethod::Laplace);
+        });
+        print_row("CPU-par", n_src, FIXED_POINTS, wall);
+        csv.add_row("parametric", "CPU-par", n_src, FIXED_POINTS, wall);
+
         #[cfg(feature = "cuda")]
         {
             let ctx = GpuContext::new(0).expect("CUDA init");

@@ -2,7 +2,7 @@
 """Generate throughput plot from benchmark CSVs.
 
 Produces:
-  - docs/throughput_points.png  (point-count scaling, all 4 lines)
+  - docs/throughput_points.png  (point-count scaling, all 5 lines)
 
 Reads:
   - benchmarks/nonparametric_points.csv
@@ -21,10 +21,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "..", "docs")
 
 LINES = [
-    ("parametric",    "GPU", "#1f77b4", "-",  "o", 2.5),
-    ("nonparametric", "GPU", "#ff7f0e", "-",  "s", 2.5),
-    ("parametric",    "CPU", "#1f77b4", "--", "o", 2),
-    ("nonparametric", "CPU", "#ff7f0e", "--", "s", 2),
+    ("parametric",    "GPU",     "#1f77b4", "-",  "o", 2.5),
+    ("nonparametric", "GPU",     "#ff7f0e", "-",  "s", 2.5),
+    ("parametric",    "CPU-par", "#1f77b4", ":",  "o", 2),
+    ("parametric",    "CPU",     "#1f77b4", "--", "o", 2),
+    ("nonparametric", "CPU",     "#ff7f0e", "--", "s", 2),
 ]
 
 
@@ -82,12 +83,13 @@ def main():
     ]
     backend_handles = [
         Line2D([0], [0], color="black", linestyle="-", linewidth=2.5),
+        Line2D([0], [0], color="black", linestyle=":", linewidth=2),
         Line2D([0], [0], color="black", linestyle="--", linewidth=2),
     ]
     leg1 = ax.legend(fitter_handles, ["parametric", "nonparametric"],
                      fontsize=10, loc="upper left", title="Fitter", title_fontsize=10)
     ax.add_artist(leg1)
-    ax.legend(backend_handles, ["GPU", "CPU"],
+    ax.legend(backend_handles, ["GPU", "CPU-par (32t)", "CPU"],
               fontsize=10, loc="lower right", title="Backend", title_fontsize=10)
 
     fig.tight_layout()

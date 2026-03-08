@@ -35,16 +35,16 @@ Both implementations use hand-rolled inline RBF kernels and row-major Cholesky.
 
 ### Throughput table (observations/sec)
 
-| pts/band | NP CPU | NP GPU | Param CPU | Param GPU |
-|---------:|-------:|-------:|----------:|----------:|
-| 64 | 55K | 2.0M | 14K | 5.4M |
-| 128 | 75K | 3.3M | 14K | 8.0M |
-| 256 | 88K | 4.8M | 15K | 10.2M |
-| 512 | 106K | 6.7M | 14K | 12.0M |
-| 1,024 | 122K | 7.2M | 16K | 12.2M |
-| 2,048 | 141K | 8.1M | 17K | 12.6M |
-| 4,096 | 155K | 7.9M | 17K | 12.9M |
-| 8,192 | 279K | 7.8M | 17K | 13.1M |
+| pts/band | NP CPU | NP GPU | Param CPU | Param CPU-par (32t) | Param GPU |
+|---------:|-------:|-------:|----------:|--------------------:|----------:|
+| 64 | 55K | 2.0M | 14K | 347K | 5.4M |
+| 128 | 75K | 3.3M | 14K | 396K | 8.0M |
+| 256 | 88K | 4.8M | 15K | 400K | 10.2M |
+| 512 | 106K | 6.7M | 14K | 387K | 12.0M |
+| 1,024 | 122K | 7.2M | 16K | 422K | 12.2M |
+| 2,048 | 141K | 8.1M | 17K | 427K | 12.6M |
+| 4,096 | 155K | 7.9M | 17K | 428K | 12.9M |
+| 8,192 | 279K | 7.8M | 17K | 431K | 13.1M |
 
 ### Source-count scaling
 
@@ -72,6 +72,12 @@ as both fitters plateau near GPU memory bandwidth limits.
 Nonparametric throughput scales well with point count (sparse GP is linear
 in n), while parametric CPU plateaus at ~17K obs/sec as PSO iteration
 cost dominates.
+
+**CPU-par (rayon)**: The parametric CPU-par backend uses Rayon to
+parallelize source-level fitting across 32 threads. It achieves 25-31x
+speedup over single-threaded parametric CPU, peaking at ~430K obs/sec at
+high point counts. Scaling is near-linear with core count, making it a
+practical choice when GPU hardware is unavailable.
 
 **LSST DDF implications**: At 8,192 pts/band (representative of a
 well-sampled DDF source), GPU processing reaches 13M obs/sec — fitting
