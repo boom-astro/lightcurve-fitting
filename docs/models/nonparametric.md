@@ -11,10 +11,31 @@ The entry point is `fit_nonparametric`, which returns per-band feature structs
 (`NonparametricBandResult`) and a map of trained `DenseGP` objects that can be
 reused by downstream fitters (e.g. thermal temperature estimation).
 
+## Upper-Limit Handling
+
+Observations with flux SNR < 3 are treated as **upper limits** (non-detections)
+and are automatically excluded from GP training data before fitting. This
+prevents faint non-detections from biasing the GP posterior toward artificially
+faint magnitudes in regions where only upper limits exist.
+
+The filter converts each magnitude/error pair to flux space (AB zeropoint 23.9)
+and checks `flux / flux_err >= 3`. Points that fail this cut are excluded from:
+
+- GP kernel fitting (both DenseGP and SparseGP paths)
+- Residual and chi2 computation
+- Predictive feature extraction (`gp_snr_max`, `gp_sigma_f`, etc.)
+
+Upper limits are **kept** for raw-lightcurve features that measure overall
+variability (`von_neumann_ratio`, `pre_peak_rms`, `rise_amplitude_over_noise`)
+and for the total observation count (`n_obs`).
+
+The number of excluded upper limits is reported in the `n_upper_limits` field
+of each `NonparametricBandResult`.
+
 ## GP Strategy
 
 Two GP implementations are selected automatically based on the number of
-observations in a band:
+**detections** (after upper-limit filtering) in a band:
 
 | Regime | Implementation | Complexity | Details |
 |--------|---------------|------------|---------|
@@ -120,13 +141,21 @@ band:
 | `rise_amplitude_over_noise` | Rise significance: (pre-peak mean mag - peak mag) / median error. Large for TDEs (clear rise from quiescence), smaller for AGN. |
 | `post_peak_monotonicity` | Fraction of consecutive post-peak GP predictions where magnitude increases (fading). ~1.0 for TDEs (monotonic decay), ~0.5 for stochastic AGN. |
 
+### GP kernel hyperparameters
+
+| Feature | Description |
+|---------|-------------|
+| `gp_fit_amp` | Best-fit RBF kernel amplitude (σ²). Higher values indicate stronger variability signal captured by the GP. |
+| `gp_fit_lengthscale` | Best-fit RBF kernel lengthscale (ρ) in days. Short (~days) for rapid transients, long (~100s of days) for slow AGN variability. |
+
 ### Fit quality
 
 | Feature | Description |
 |---------|-------------|
-| `chi2` | Reduced chi2 of GP fit vs. observations |
+| `chi2` | Reduced chi2 of GP fit vs. detections (upper limits excluded) |
 | `baseline_chi2` | Reduced chi2 of a constant (mean magnitude) model |
-| `n_obs` | Number of observations in the band |
+| `n_obs` | Total number of observations in the band (including upper limits) |
+| `n_upper_limits` | Number of upper-limit observations (flux SNR < 3) excluded from GP training |
 
 ## Example Images
 
@@ -182,6 +211,8 @@ for band_result in results:
     print(f"  Peak mag: {band_result['peak_mag']}")
     print(f"  Rise time: {band_result['rise_time']}")
     print(f"  FWHM: {band_result['fwhm']}")
+    print(f"  n_obs: {band_result['n_obs']}")
+    print(f"  n_upper_limits: {band_result['n_upper_limits']}")
     print(f"  Von Neumann ratio: {band_result['von_neumann_ratio']}")
     print(f"  Decay power-law index: {band_result['decay_power_law_index']}")
 
@@ -189,4 +220,51 @@ for band_result in results:
 combined = lcf.fit_fast(bands)
 np_results = combined["nonparametric"]
 thermal = combined["thermal"]
+```
+
+## Extracting GP Predictions for Plotting
+
+Use `fit_gp_predict` to get the GP mean and uncertainty at arbitrary query
+times. The optional `snr_threshold` parameter automatically filters upper
+limits before fitting, matching the behavior of the nonparametric fitter:
+
+```python
+import numpy as np
+import lightcurve_fitting as lcf
+
+times  = [0, 5, 12, 20, 35, 55, 80, 110, 150]
+mags   = [18.5, 18.2, 18.0, 18.3, 18.8, 19.4, 19.9, 20.3, 20.7]
+errors = [0.05, 0.04, 0.04, 0.05, 0.06, 0.08, 0.10, 0.13, 0.16]
+
+duration = max(times) - min(times)
+query_t = np.linspace(min(times), max(times), 200).tolist()
+
+# Fit GP with automatic upper-limit filtering (SNR < 3 excluded)
+pred, std = lcf.fit_gp_predict(
+    times, mags, errors, query_t,
+    amp_candidates=[0.1, 0.3],
+    ls_candidates=[duration / 6, duration / 12, duration / 24],
+    snr_threshold=3.0,
+)
+
+# Plot with matplotlib
+import matplotlib.pyplot as plt
+
+plt.errorbar(times, mags, yerr=errors, fmt='o', label='data')
+plt.plot(query_t, pred, '-', label='GP mean')
+plt.fill_between(query_t, np.array(pred) - 2*np.array(std),
+                 np.array(pred) + 2*np.array(std), alpha=0.2,
+                 label='2-sigma')
+plt.gca().invert_yaxis()
+plt.xlabel('Time (days)')
+plt.ylabel('Magnitude')
+plt.legend()
+```
+
+## Regenerating Documentation Plots
+
+All plots on this page are generated from the real source test fixtures by:
+
+```bash
+python docs/generate_plots.py
 ```

@@ -116,6 +116,14 @@ impl DenseGP {
         Some(DenseGP { x: times.to_vec(), alpha, l, n, amp, inv_2ls2, y_mean })
     }
 
+    /// Return the kernel amplitude (σ²).
+    #[inline]
+    pub fn kernel_amp(&self) -> f64 { self.amp }
+
+    /// Return the kernel lengthscale (ρ), in the same units as training times.
+    #[inline]
+    pub fn kernel_lengthscale(&self) -> f64 { (0.5 / self.inv_2ls2).sqrt() }
+
     #[inline]
     pub fn predict(&self, query: &[f64]) -> Vec<f64> {
         let n = self.n;

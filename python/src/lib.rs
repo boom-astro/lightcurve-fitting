@@ -285,14 +285,18 @@ fn fit_batch_parametric(
 ///
 /// Args:
 ///     train_times: Training time values.
-///     train_values: Training observed values.
-///     train_errors: Training measurement errors.
+///     train_values: Training observed values (magnitudes).
+///     train_errors: Training measurement errors (mag errors).
 ///     query_times: Times at which to predict.
 ///     amp_candidates: Amplitude values to try in grid search.
 ///     ls_candidates: Lengthscale values to try in grid search.
+///     snr_threshold: If set, exclude points with flux SNR below this
+///         value before fitting (default: None = keep all points).
+///         A typical value is 3.0.
 ///
 /// Returns a tuple of (predictions, std_devs) or None if fitting fails.
 #[pyfunction]
+#[pyo3(signature = (train_times, train_values, train_errors, query_times, amp_candidates, ls_candidates, snr_threshold=None))]
 fn fit_gp_predict(
     py: Python<'_>,
     train_times: Vec<f64>,
@@ -301,6 +305,7 @@ fn fit_gp_predict(
     query_times: Vec<f64>,
     amp_candidates: Vec<f64>,
     ls_candidates: Vec<f64>,
+    snr_threshold: Option<f64>,
 ) -> PyResult<Option<(Vec<f64>, Vec<f64>)>> {
     let result = py.allow_threads(|| {
         rs_fit_gp_predict(
@@ -310,6 +315,7 @@ fn fit_gp_predict(
             &query_times,
             &amp_candidates,
             &ls_candidates,
+            snr_threshold,
         )
     });
     Ok(result)

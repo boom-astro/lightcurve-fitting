@@ -97,6 +97,7 @@ fn fit_gp_predict_returns_predictions() {
     let result = fit_gp_predict(
         &times, &mags, &errors, &query,
         &[0.1, 0.3], &[5.0, 10.0, 20.0],
+        None,
     );
     assert!(result.is_some());
     let (pred, std) = result.unwrap();

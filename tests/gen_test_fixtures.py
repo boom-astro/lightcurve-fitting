@@ -70,6 +70,92 @@ def load_source(npz_path):
     return bands
 
 
+def select_best_transients(rows, per_label=2):
+    """Select bright, well-sampled transients for showcase fixtures.
+
+    For SN types (0-6) and TDE (9): pick sources with short time spans
+    (<200d), large amplitude (>1.5 mag), bright peaks (<19.5 mag), and
+    30-300 total events.  Ranked by amplitude then peak brightness.
+
+    For AGN (8) and Cataclysmic (7): pick most-observed sources since
+    long baselines are legitimate for these classes.
+    """
+    by_label = defaultdict(list)
+    for row in rows:
+        obj_id = row["obj_id"]
+        local_path = PHOTO_EVENTS_DIR / "train" / f"{obj_id}.npz"
+        if not local_path.exists():
+            continue
+        by_label[row["label"]].append(
+            (obj_id, str(local_path), row["label"], int(row["n_events"]))
+        )
+
+    transient_labels = {str(i) for i in list(range(7)) + [9]}
+    selected = []
+
+    for label in sorted(by_label.keys()):
+        candidates = by_label[label]
+
+        if label not in transient_labels:
+            # AGN / Cataclysmic: just pick most observed
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            selected.extend(candidates[:per_label])
+            continue
+
+        # For transients: score by lightcurve quality
+        scored = []
+        check_pool = [c for c in candidates if 30 <= c[3] <= 300]
+        for obj_id, path, lbl, n_events in check_pool[:300]:
+            try:
+                d = np.load(path)
+                data = d["data"]
+                cols = list(d["columns"])
+                dt_idx = cols.index("dt")
+                band_idx = cols.index("band_id")
+                logflux_idx = cols.index("logflux")
+
+                mags = -2.5 * data[:, logflux_idx] + 23.9
+                times = data[:, dt_idx]
+                bands_arr = data[:, band_idx].astype(int)
+
+                best_amp, best_peak = 0.0, 99.0
+                short_span = False
+                for bid in [0, 1]:  # g, r
+                    mask = (bands_arr == bid) & np.isfinite(mags)
+                    if mask.sum() < 10:
+                        continue
+                    t_b = times[mask]
+                    m_b = mags[mask]
+                    span = t_b.max() - t_b.min()
+                    amp = m_b.max() - m_b.min()
+                    peak = m_b.min()
+                    if span < 200:
+                        short_span = True
+                    if amp > best_amp:
+                        best_amp = amp
+                        best_peak = peak
+
+                if short_span and best_amp > 1.5 and best_peak < 19.5:
+                    scored.append((obj_id, path, lbl, n_events, best_amp, best_peak))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: (-x[4], x[5]))  # largest amp, brightest peak
+        for s in scored[:per_label]:
+            selected.append((s[0], s[1], s[2], s[3]))
+
+        # Fallback if not enough quality sources found
+        if len(scored) < per_label:
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            for c in candidates:
+                if c[0] not in {s[0] for s in selected}:
+                    selected.append(c)
+                    if sum(1 for s in selected if s[2] == label) >= per_label:
+                        break
+
+    return selected
+
+
 def select_sources(rows, n_total, min_events=10, prefer_most_points=False,
                     max_events_by_label=None):
     """Select a balanced sample across labels."""
@@ -147,13 +233,10 @@ def main():
     with open(MANIFEST) as f:
         rows = list(csv.DictReader(f))
 
-    # --- Small fixture (20 sources, best-sampled per class) ---
-    # For SN types (labels 0-6), cap at 500 to avoid host-contaminated sources
-    # that have 1000+ points spanning years (not actual transients).
-    # AGN (8), Cataclysmic (7), TDE (9) legitimately have long baselines.
-    selected_small = select_sources(rows, 20, min_events=10,
-                                    prefer_most_points=True,
-                                    max_events_by_label={str(i): 500 for i in range(7)})
+    # --- Small fixture (20 sources, best quality per class) ---
+    # For SN types + TDE: pick bright transients with short spans and large amplitudes.
+    # For AGN + Cataclysmic: pick most-observed (long baselines are legitimate).
+    selected_small = select_best_transients(rows, per_label=2)
     sources_small = build_fixture(selected_small)
 
     small_path = FIXTURES_DIR / "real_sources.json"
