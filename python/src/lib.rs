@@ -13,7 +13,10 @@ use ::lightcurve_fitting::{
     fit_nonparametric_with_opts as rs_fit_nonparametric_with_opts,
     fit_parametric as rs_fit_parametric,
     fit_thermal as rs_fit_thermal, fit_gp_predict as rs_fit_gp_predict,
+    fit_gp_2d_with_thermal as rs_fit_gp_2d_with_thermal,
     metzger_kn_mags as rs_metzger_kn_mags,
+    extract_features as rs_extract_features,
+    extract_features_batch as rs_extract_features_batch,
     BandData, FastFitResult, SviModelName, UncertaintyMethod,
 };
 
@@ -395,6 +398,82 @@ fn fit_batch_nonparametric(py: Python<'_>, sources: Vec<PyBandDataMap>) -> PyRes
 }
 
 // ---------------------------------------------------------------------------
+// 2D GP
+// ---------------------------------------------------------------------------
+
+/// Fit a 2D GP (time x wavelength) to multi-band magnitude data and extract
+/// blackbody temperature evolution from the resulting SED surface.
+///
+/// Returns a dict with "gp" (GP hyperparameters and diagnostics) and "thermal"
+/// (temperature evolution) sub-dicts, or None if insufficient data.
+#[pyfunction]
+#[pyo3(signature = (bands, n_time_steps=50))]
+fn fit_gp_2d(py: Python<'_>, bands: &PyBandDataMap, n_time_steps: usize) -> PyResult<PyObject> {
+    let result = py.allow_threads(|| rs_fit_gp_2d_with_thermal(&bands.inner, n_time_steps));
+    match result {
+        Some((gp_result, thermal_result)) => {
+            let dict = PyDict::new(py);
+            dict.set_item("gp", pythonize(py, &gp_result)?)?;
+            dict.set_item("thermal", pythonize(py, &thermal_result)?)?;
+            Ok(dict.into_any().unbind())
+        }
+        None => Ok(py.None()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature extraction
+// ---------------------------------------------------------------------------
+
+/// Extract ~80 features from a single source by running all fitters.
+///
+/// Args:
+///     mag_bands: Magnitude-space band data (for nonparametric, thermal, 2D GP).
+///     flux_bands: Flux-space band data (for parametric).
+///     ref_band: Reference band for feature extraction (default "r").
+///
+/// Returns a dict of {feature_name: value_or_None}.
+#[pyfunction]
+#[pyo3(signature = (mag_bands, flux_bands, ref_band="r"))]
+fn extract_features(py: Python<'_>, mag_bands: &PyBandDataMap, flux_bands: &PyBandDataMap, ref_band: &str) -> PyResult<PyObject> {
+    let mag = mag_bands.inner.clone();
+    let flux = flux_bands.inner.clone();
+    let rb = ref_band.to_string();
+    let features = py.allow_threads(move || rs_extract_features(&mag, &flux, &rb));
+    let dict = PyDict::new(py);
+    for (k, v) in &features {
+        dict.set_item(k, *v)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+/// Extract features for multiple sources in parallel.
+///
+/// Args:
+///     mag_sources: List of magnitude-space BandDataMap objects.
+///     flux_sources: List of flux-space BandDataMap objects.
+///     ref_band: Reference band (default "r").
+///
+/// Returns a list of feature dicts.
+#[pyfunction]
+#[pyo3(signature = (mag_sources, flux_sources, ref_band="r"))]
+fn extract_features_batch(py: Python<'_>, mag_sources: Vec<PyBandDataMap>, flux_sources: Vec<PyBandDataMap>, ref_band: &str) -> PyResult<PyObject> {
+    let mags: Vec<HashMap<String, BandData>> = mag_sources.into_iter().map(|s| s.inner).collect();
+    let fluxes: Vec<HashMap<String, BandData>> = flux_sources.into_iter().map(|s| s.inner).collect();
+    let rb = ref_band.to_string();
+    let all_features = py.allow_threads(move || rs_extract_features_batch(&mags, &fluxes, &rb));
+    let dicts: Vec<_> = all_features.iter().map(|features| {
+        let dict = PyDict::new(py);
+        for (k, v) in features {
+            dict.set_item(k, *v).unwrap();
+        }
+        dict.into_any()
+    }).collect();
+    let list = PyList::new(py, &dicts)?;
+    Ok(list.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -414,5 +493,8 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_batch_parametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_gp_predict, m)?)?;
     m.add_function(wrap_pyfunction!(metzger_kn_mags, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_gp_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_features, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_features_batch, m)?)?;
     Ok(())
 }

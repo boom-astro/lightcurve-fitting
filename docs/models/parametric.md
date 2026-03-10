@@ -24,6 +24,59 @@ uncertainties (mean and log-sigma for each parameter).
 | **Afterglow** | 6 | GRB afterglow power-law model. Smoothly-broken double power-law with indices alpha1 and alpha2, transitioning at break time t_b. |
 | **MetzgerKN** | 5 | Kilonova model (Metzger 2017 semi-analytic). One-zone ejecta with r-process heating, neutron-rich composition (Ye = 0.1), solved on a 200-point log-spaced time grid via forward Euler integration. Parameters: log10(M_ej/M_sun), log10(v_ej/c), log10(kappa), t0. |
 
+## MultiBazin: Variable-Component Anomaly Model
+
+In addition to the 8 physical models above, `fit_parametric` runs a **MultiBazin**
+fit on the first band. This is a sum of K Bazin components (K=1..4) plus a
+baseline, designed to capture multi-peaked, recurrent, or anomalous transients
+without assuming a specific physical mechanism — analogous to sums of
+sine-Gaussians used in gravitational-wave burst searches.
+
+### Model
+
+$$f(t) = \sum_{c=1}^{K} A_c \frac{\exp(-(t - t_{0,c})/\tau_{\mathrm{fall},c})}{1 + \exp(-(t - t_{0,c})/\tau_{\mathrm{rise},c})} + B$$
+
+Each component has 4 parameters: `[log_A, t0, log_tau_rise, log_tau_fall]`.
+The full parameter vector is `[comp_1..., comp_K..., B, log_sigma_extra]`
+(4K + 2 total parameters).
+
+### Greedy Fitting with BIC Selection
+
+For each K=1..4:
+
+1. **PSO** runs 3 restarts (30 particles, 60 iterations each)
+2. For K>1, one restart is **seeded** from the K-1 solution: the previous
+   components are carried over, and a new component is initialized at the peak
+   of the residuals
+3. **BIC** = 2 × NLL × n_obs + n_params × ln(n_obs) selects the optimal K
+4. **Early stop**: if adding a component worsens BIC by >2, higher K values
+   are skipped
+
+### Output
+
+The `MultiBazinResult` is stored in `multi_bazin` on the first band's
+`ParametricBandResult`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `best_k` | int | Number of components selected by BIC (1-4) |
+| `params` | list[float] | Best-fit parameter vector for selected K |
+| `cost` | float | Reduced negative log-likelihood at best K |
+| `bic` | float | BIC at best K |
+| `per_k_cost` | list[float] | Cost for each K tried (index 0 = K=1) |
+| `per_k_bic` | list[float] | BIC for each K tried (index 0 = K=1) |
+
+**Interpretation**: `best_k > 1` suggests recurrent or multi-peaked transient
+behavior (e.g., CVs, AGN flares). The BIC improvement from K=1 to K=2
+quantifies how much better a two-component model fits versus a single Bazin.
+
+### GPU Batch Path
+
+A CUDA kernel (`batch_pso_cost_multi_bazin`) supports GPU-accelerated MultiBazin
+fitting via `GpuContext::batch_pso_multi_bazin`. The GPU kernel accepts a
+per-source K array, enabling all sources to be processed in a single batch even
+when different sources are at different K iterations.
+
 ## PSO Settings
 
 Each model is fit independently using a custom particle swarm optimizer with

@@ -28,6 +28,11 @@ fn throughput_benchmark() {
             "source {i}: parametric should return results"
         );
 
+        // MultiBazin is run as part of fit_parametric on band_idx==0.
+        // Verify it produced a result for the first band.
+        let has_mb = p_results.iter().any(|r| r.multi_bazin.is_some());
+        assert!(has_mb, "source {i}: parametric should include a MultiBazin result");
+
         let t_result = fit_thermal(&mag_bands, Some(&trained_gps));
         assert!(
             t_result.is_some(),

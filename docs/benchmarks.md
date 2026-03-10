@@ -18,6 +18,7 @@ Each run fits **100 light curves** simultaneously.
 | Fitter | Description |
 |--------|-------------|
 | **parametric** | PSO model selection (8 models, 30 particles × 60 iters × 2-3 adaptive restarts) + Laplace uncertainty |
+| **parametric + MultiBazin** | As above, plus greedy MultiBazin fit (K=1..4, 3 restarts each) on the first band |
 | **nonparametric** | Gaussian-process interpolation + feature extraction |
 
 ### GP strategy
@@ -35,16 +36,16 @@ Both implementations use hand-rolled inline RBF kernels and row-major Cholesky.
 
 ### Throughput table (observations/sec)
 
-| pts/band | NP CPU | NP GPU | Param CPU | Param CPU-par (32t) | Param GPU |
-|---------:|-------:|-------:|----------:|--------------------:|----------:|
-| 64 | 55K | 2.0M | 14K | 347K | 5.4M |
-| 128 | 75K | 3.3M | 14K | 396K | 8.0M |
-| 256 | 88K | 4.8M | 15K | 400K | 10.2M |
-| 512 | 106K | 6.7M | 14K | 387K | 12.0M |
-| 1,024 | 122K | 7.2M | 16K | 422K | 12.2M |
-| 2,048 | 141K | 8.1M | 17K | 427K | 12.6M |
-| 4,096 | 155K | 7.9M | 17K | 428K | 12.9M |
-| 8,192 | 279K | 7.8M | 17K | 431K | 13.1M |
+| pts/band | NP CPU | NP GPU | Param CPU | Param CPU-par (32t) | Param GPU | MultiBazin GPU |
+|---------:|-------:|-------:|----------:|--------------------:|----------:|---------------:|
+| 64 | 55K | 2.0M | 14K | 347K | 5.4M | TBD |
+| 128 | 75K | 3.3M | 14K | 396K | 8.0M | TBD |
+| 256 | 88K | 4.8M | 15K | 400K | 10.2M | TBD |
+| 512 | 106K | 6.7M | 14K | 387K | 12.0M | TBD |
+| 1,024 | 122K | 7.2M | 16K | 422K | 12.2M | TBD |
+| 2,048 | 141K | 8.1M | 17K | 427K | 12.6M | TBD |
+| 4,096 | 155K | 7.9M | 17K | 428K | 12.9M | TBD |
+| 8,192 | 279K | 7.8M | 17K | 431K | 13.1M | TBD |
 
 ### Source-count scaling
 
@@ -78,6 +79,14 @@ parallelize source-level fitting across 32 threads. It achieves 25-31x
 speedup over single-threaded parametric CPU, peaking at ~430K obs/sec at
 high point counts. Scaling is near-linear with core count, making it a
 practical choice when GPU hardware is unavailable.
+
+**MultiBazin GPU**: The MultiBazin greedy fitter (K=1..4 Bazin components,
+3 PSO restarts per K) runs as a standalone GPU batch kernel. It iterates
+K sequentially (each K runs all sources in parallel), with CPU-side
+residual-based seeding between K steps. Expected throughput is lower than
+the 8-model parametric GPU due to the sequential K loop (4 rounds of PSO
+vs 8 independent models), but benefits from warm-start seeding and
+per-source early stopping.
 
 **LSST DDF implications**: At 8,192 pts/band (representative of a
 well-sampled DDF source), GPU processing reaches 13M obs/sec — fitting

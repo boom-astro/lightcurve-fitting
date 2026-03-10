@@ -175,6 +175,19 @@ impl SviModel {
             SviModel::Afterglow => SviModelName::Afterglow,
         }
     }
+
+    fn from_name(name: &SviModelName) -> Self {
+        match name {
+            SviModelName::Bazin => SviModel::Bazin,
+            SviModelName::Villar => SviModel::Villar,
+            SviModelName::MetzgerKN => SviModel::MetzgerKN,
+            SviModelName::Tde => SviModel::Tde,
+            SviModelName::Arnett => SviModel::Arnett,
+            SviModelName::Magnetar => SviModel::Magnetar,
+            SviModelName::ShockCooling => SviModel::ShockCooling,
+            SviModelName::Afterglow => SviModel::Afterglow,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +896,367 @@ fn log_normal_cdf(x: f64) -> f64 {
         1.0 - 0.5 * erfc_z
     };
     (phi.max(1e-300)).ln()
+}
+
+// ---------------------------------------------------------------------------
+// MultiBazin: variable-component sum of Bazin pulses
+// ---------------------------------------------------------------------------
+//
+// Parameterisation for K components:
+//   [log_A_1, t0_1, log_tau_rise_1, log_tau_fall_1,   // component 1
+//    log_A_2, t0_2, log_tau_rise_2, log_tau_fall_2,   // component 2
+//    ...
+//    B, log_sigma_extra]                               // shared (last 2)
+//
+// Total params = 4*K + 2.
+
+const MULTI_BAZIN_MAX_K: usize = 4;
+/// Params per Bazin component (log_A, t0, log_tau_rise, log_tau_fall).
+const MULTI_BAZIN_COMP_PARAMS: usize = 4;
+
+/// Evaluate a single Bazin component (no baseline).
+#[inline]
+fn bazin_component_eval(log_a: f64, t0: f64, log_tau_rise: f64, log_tau_fall: f64, t: f64) -> f64 {
+    let a = log_a.exp();
+    let tau_rise = log_tau_rise.exp();
+    let tau_fall = log_tau_fall.exp();
+    let dt = t - t0;
+    let e_fall = (-dt / tau_fall).exp();
+    let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
+    a * e_fall * sig
+}
+
+/// Evaluate MultiBazin model: sum of K components + baseline B.
+fn multi_bazin_eval(params: &[f64], k: usize, t: f64) -> f64 {
+    let mut sum = 0.0;
+    for c in 0..k {
+        let off = c * MULTI_BAZIN_COMP_PARAMS;
+        sum += bazin_component_eval(params[off], params[off + 1], params[off + 2], params[off + 3], t);
+    }
+    let b_idx = k * MULTI_BAZIN_COMP_PARAMS;
+    sum + params[b_idx] // B
+}
+
+fn multi_bazin_eval_batch(params: &[f64], k: usize, times: &[f64], out: &mut [f64]) {
+    for (i, &t) in times.iter().enumerate() {
+        out[i] = multi_bazin_eval(params, k, t);
+    }
+}
+
+/// Number of parameters for MultiBazin with K components.
+fn multi_bazin_n_params(k: usize) -> usize {
+    MULTI_BAZIN_COMP_PARAMS * k + 2 // +B +log_sigma_extra
+}
+
+fn multi_bazin_sigma_extra_idx(k: usize) -> usize {
+    MULTI_BAZIN_COMP_PARAMS * k + 1
+}
+
+/// PSO bounds for MultiBazin with K components.
+fn multi_bazin_bounds(k: usize, t_range: (f64, f64)) -> (Vec<f64>, Vec<f64>) {
+    let n = multi_bazin_n_params(k);
+    let mut lo = Vec::with_capacity(n);
+    let mut hi = Vec::with_capacity(n);
+    let (t_min, t_max) = t_range;
+    for _ in 0..k {
+        lo.extend_from_slice(&[-3.0, t_min - 30.0, -2.0, -2.0]); // log_A, t0, log_tau_rise, log_tau_fall
+        hi.extend_from_slice(&[3.0, t_max + 30.0, 5.0, 6.0]);
+    }
+    lo.push(-0.3); hi.push(0.3);   // B
+    lo.push(-5.0); hi.push(0.0);   // log_sigma_extra
+    (lo, hi)
+}
+
+/// Cost function for MultiBazin PSO.
+fn multi_bazin_cost(
+    params: &[f64],
+    k: usize,
+    times: &[f64],
+    flux: &[f64],
+    obs_var: &[f64],
+    is_upper: &[bool],
+    upper_flux: &[f64],
+    pred_buf: &mut [f64],
+) -> f64 {
+    let se_idx = multi_bazin_sigma_extra_idx(k);
+    let sigma_extra = params[se_idx].exp();
+    let sigma_extra_sq = sigma_extra * sigma_extra;
+    multi_bazin_eval_batch(params, k, times, pred_buf);
+    let n = times.len().max(1) as f64;
+    let mut neg_ll = 0.0;
+    for i in 0..times.len() {
+        let pred = pred_buf[i];
+        if !pred.is_finite() {
+            return 1e99;
+        }
+        let total_var = obs_var[i] + sigma_extra_sq;
+        if is_upper[i] {
+            let z = (upper_flux[i] - pred) / total_var.sqrt();
+            neg_ll -= log_normal_cdf(z);
+        } else {
+            let diff = pred - flux[i];
+            neg_ll += diff * diff / total_var + total_var.ln();
+        }
+    }
+    neg_ll / n
+}
+
+/// Greedy MultiBazin fit: fit K=1..max_k, each time initializing the new
+/// component from the residual of the previous best fit.
+fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
+    let n_obs = data.times.len();
+    if n_obs < 5 {
+        return MultiBazinResult {
+            best_k: 1,
+            params: Vec::new(),
+            cost: f64::NAN,
+            bic: f64::NAN,
+            per_k_cost: Vec::new(),
+            per_k_bic: Vec::new(),
+        };
+    }
+
+    let t_min = data.times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let t_max = data.times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let t_range = (t_min, t_max);
+    let n_obs_f = n_obs as f64;
+    let ln_n = n_obs_f.ln();
+
+    let mut pred_buf = vec![0.0; n_obs];
+    let mut residual_buf = vec![0.0; n_obs];
+
+    let mut best_k = 1;
+    let mut best_params: Vec<f64> = Vec::new();
+    let mut best_cost = f64::INFINITY;
+    let mut best_bic = f64::INFINITY;
+    let mut per_k_cost = Vec::with_capacity(MULTI_BAZIN_MAX_K);
+    let mut per_k_bic = Vec::with_capacity(MULTI_BAZIN_MAX_K);
+
+    // Previous fit params used to seed next K
+    let mut prev_params: Vec<f64> = Vec::new();
+
+    for k in 1..=MULTI_BAZIN_MAX_K {
+        let np = multi_bazin_n_params(k);
+        let (lo, hi) = multi_bazin_bounds(k, t_range);
+
+        // Build initial guess by extending the previous fit
+        let init: Option<Vec<f64>> = if k == 1 {
+            None // pure PSO
+        } else if prev_params.len() == multi_bazin_n_params(k - 1) {
+            // Copy previous components, add a new component seeded from residual
+            let mut init = Vec::with_capacity(np);
+            let prev_n_comp_params = (k - 1) * MULTI_BAZIN_COMP_PARAMS;
+            init.extend_from_slice(&prev_params[..prev_n_comp_params]);
+
+            // Compute residuals from previous fit
+            multi_bazin_eval_batch(&prev_params, k - 1, &data.times, &mut pred_buf);
+            for i in 0..n_obs {
+                residual_buf[i] = data.flux[i] - pred_buf[i];
+            }
+
+            // Find peak residual to seed new component
+            let mut peak_idx = 0;
+            let mut peak_val = f64::NEG_INFINITY;
+            for i in 0..n_obs {
+                if !data.is_upper[i] && residual_buf[i] > peak_val {
+                    peak_val = residual_buf[i];
+                    peak_idx = i;
+                }
+            }
+            let seed_t0 = data.times[peak_idx];
+            let seed_log_a = peak_val.max(1e-10).ln();
+            init.extend_from_slice(&[seed_log_a, seed_t0, 1.0, 1.0]); // new component
+
+            // Copy B and sigma_extra from previous
+            let prev_b = prev_params[prev_n_comp_params];
+            let prev_se = prev_params[prev_n_comp_params + 1];
+            init.push(prev_b);
+            init.push(prev_se);
+
+            // Clamp to bounds
+            for i in 0..np {
+                init[i] = init[i].clamp(lo[i], hi[i]);
+            }
+            Some(init)
+        } else {
+            None
+        };
+
+        // Run PSO restarts. Each closure needs its own pred_buf since
+        // pso_minimize takes ownership of the FnMut.
+        let mk_cost = |buf: &mut Vec<f64>| {
+            let times = &data.times;
+            let flux = &data.flux;
+            let obs_var = &data.obs_var;
+            let is_upper = &data.is_upper;
+            let upper_flux = &data.upper_flux;
+            let buf = buf as *mut Vec<f64>;
+            move |p: &[f64]| -> f64 {
+                multi_bazin_cost(
+                    p, k, times, flux, obs_var,
+                    is_upper, upper_flux, unsafe { &mut *buf },
+                )
+            }
+        };
+
+        // First run: standard PSO
+        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42);
+
+        // If we have a seed, run a second PSO restart with the seed injected
+        if let Some(ref seed) = init {
+            let (params2, cost2) = pso_minimize_seeded(
+                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, seed,
+            );
+            if cost2 < cost1 {
+                params1 = params2;
+                cost1 = cost2;
+            }
+        }
+
+        // Third restart
+        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271);
+        if cost3 < cost1 {
+            params1 = params3;
+            cost1 = cost3;
+        }
+
+        let k_bic = 2.0 * cost1 * n_obs_f + (np as f64) * ln_n;
+        per_k_cost.push(cost1);
+        per_k_bic.push(k_bic);
+
+        if k_bic < best_bic {
+            best_bic = k_bic;
+            best_cost = cost1;
+            best_k = k;
+            best_params = params1.clone();
+        }
+
+        prev_params = params1;
+
+        // Early stop: if adding a component didn't help BIC, unlikely that more will
+        if k > 1 && k_bic > per_k_bic[k - 2] + 2.0 {
+            // Fill remaining slots
+            for _ in (k + 1)..=MULTI_BAZIN_MAX_K {
+                per_k_cost.push(f64::NAN);
+                per_k_bic.push(f64::NAN);
+            }
+            break;
+        }
+    }
+
+    MultiBazinResult {
+        best_k,
+        params: best_params,
+        cost: best_cost,
+        bic: best_bic,
+        per_k_cost,
+        per_k_bic,
+    }
+}
+
+/// PSO variant that injects a seed particle into the initial swarm.
+fn pso_minimize_seeded(
+    mut cost_fn: impl FnMut(&[f64]) -> f64,
+    lower: &[f64],
+    upper: &[f64],
+    n_particles: usize,
+    max_iters: usize,
+    stall_iters: usize,
+    seed_rng: u64,
+    seed_particle: &[f64],
+) -> (Vec<f64>, f64) {
+    let dim = lower.len();
+    let mut rng = SmallRng::seed_from_u64(seed_rng);
+
+    let w = 0.7;
+    let c1 = 1.5;
+    let c2 = 1.5;
+
+    let mut positions: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut velocities: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut pbest_pos: Vec<Vec<f64>> = Vec::with_capacity(n_particles);
+    let mut pbest_cost: Vec<f64> = Vec::with_capacity(n_particles);
+
+    let mut gbest_pos = vec![0.0; dim];
+    let mut gbest_cost = f64::INFINITY;
+
+    for p in 0..n_particles {
+        let pos: Vec<f64> = if p == 0 {
+            // First particle is the seed
+            seed_particle.to_vec()
+        } else {
+            (0..dim)
+                .map(|d| lower[d] + rng.random::<f64>() * (upper[d] - lower[d]))
+                .collect()
+        };
+        let vel: Vec<f64> = (0..dim)
+            .map(|d| (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0))
+            .collect();
+        let cost = cost_fn(&pos);
+        if cost < gbest_cost {
+            gbest_cost = cost;
+            gbest_pos = pos.clone();
+        }
+        pbest_cost.push(cost);
+        pbest_pos.push(pos.clone());
+        positions.push(pos);
+        velocities.push(vel);
+    }
+
+    let mut iters_without_improvement = 0usize;
+    let mut prev_gbest = gbest_cost;
+
+    for _ in 0..max_iters {
+        for p in 0..n_particles {
+            for d in 0..dim {
+                let r1: f64 = rng.random();
+                let r2: f64 = rng.random();
+                velocities[p][d] = w * velocities[p][d]
+                    + c1 * r1 * (pbest_pos[p][d] - positions[p][d])
+                    + c2 * r2 * (gbest_pos[d] - positions[p][d]);
+                positions[p][d] = (positions[p][d] + velocities[p][d])
+                    .clamp(lower[d], upper[d]);
+            }
+            let cost = cost_fn(&positions[p]);
+            if cost < pbest_cost[p] {
+                pbest_cost[p] = cost;
+                pbest_pos[p] = positions[p].clone();
+                if cost < gbest_cost {
+                    gbest_cost = cost;
+                    gbest_pos = positions[p].clone();
+                }
+            }
+        }
+        let improved = prev_gbest - gbest_cost > 0.01 * prev_gbest.abs().max(1e-10);
+        if improved {
+            iters_without_improvement = 0;
+            prev_gbest = gbest_cost;
+        } else {
+            iters_without_improvement += 1;
+            if iters_without_improvement >= stall_iters {
+                break;
+            }
+        }
+    }
+
+    (gbest_pos, gbest_cost)
+}
+
+/// Result of MultiBazin greedy fit for a single band.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiBazinResult {
+    /// Number of components selected by BIC.
+    pub best_k: usize,
+    /// Best-fit parameters for the selected K.
+    pub params: Vec<f64>,
+    /// Reduced negative log-likelihood at best K.
+    pub cost: f64,
+    /// BIC at best K.
+    pub bic: f64,
+    /// Cost for each K tried (index 0 = K=1).
+    pub per_k_cost: Vec<f64>,
+    /// BIC for each K tried (index 0 = K=1).
+    pub per_k_bic: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -2148,6 +2522,10 @@ pub struct ParametricBandResult {
     /// Which uncertainty method was used for this result.
     #[serde(default)]
     pub uncertainty_method: UncertaintyMethod,
+    /// MultiBazin greedy fit: variable number of Bazin components.
+    /// BIC selects K; best_k > 1 suggests recurrent or multi-peaked transients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_bazin: Option<MultiBazinResult>,
 }
 
 /// Evaluate a parametric model at the given times.
@@ -2173,6 +2551,328 @@ pub fn eval_model_flux(model: SviModelName, params: &[f64], times: &[f64]) -> Ve
         return metzger_kn_eval_batch(params, times);
     }
     times.iter().map(|&t| eval_model(m, params, t)).collect()
+}
+
+/// Pre-computed PSO result for one band, from GPU batch fitting.
+#[derive(Clone)]
+pub struct GpuPsoBandResult {
+    /// Best model name.
+    pub model: SviModelName,
+    /// Best-fit PSO parameters (normalized, as used by the model).
+    pub pso_params: Vec<f64>,
+    /// PSO cost (negative log-likelihood, normalized by n_obs).
+    pub pso_cost: f64,
+    /// Per-model chi2 (cost × 2, may have None for models not fitted).
+    pub per_model_chi2: HashMap<SviModelName, Option<f64>>,
+    /// Per-model best params (populated when fit_all_models=true).
+    pub per_model_params: HashMap<SviModelName, Vec<f64>>,
+    /// MultiBazin result (if fitted on GPU).
+    pub multi_bazin: Option<MultiBazinResult>,
+}
+
+/// Finalize parametric results using pre-computed GPU PSO params.
+///
+/// Runs SVI/Laplace uncertainty estimation on CPU (seeded from GPU PSO),
+/// computes mag-space chi2, and assembles the final ParametricBandResult.
+///
+/// `flux_bands`: maps band_name → BandData in flux space.
+/// `gpu_results`: per-band GPU PSO results, indexed by band sort order
+///   (most-populated band first). Must match the band ordering that would
+///   be produced by sorting bands by descending observation count.
+/// `method`: uncertainty estimation method.
+pub fn finalize_parametric_from_gpu(
+    flux_bands: &HashMap<String, BandData>,
+    gpu_results: &[GpuPsoBandResult],
+    method: UncertaintyMethod,
+) -> Vec<ParametricBandResult> {
+    if flux_bands.is_empty() || gpu_results.is_empty() {
+        return Vec::new();
+    }
+
+    let snr_threshold = 3.0;
+    let svi_lr = 0.01;
+    let svi_n_steps = 1000;
+    let svi_n_samples = 4;
+    let zp = 23.9;
+
+    // Prepare band data (same as fit_parametric)
+    let mut band_entries: Vec<(String, BandFitData, Vec<f64>)> = Vec::new();
+
+    for (band_name, band_data) in flux_bands {
+        let fluxes = &band_data.values;
+        let flux_errs = &band_data.errors;
+        let times = &band_data.times;
+
+        if fluxes.is_empty() { continue; }
+        let peak_flux = fluxes.iter().cloned().fold(f64::MIN, f64::max);
+        if peak_flux <= 0.0 { continue; }
+
+        let normalized_flux: Vec<f64> = fluxes.iter().map(|f| f / peak_flux).collect();
+        let normalized_err: Vec<f64> = flux_errs.iter().map(|e| e / peak_flux).collect();
+
+        let is_upper: Vec<bool> = fluxes.iter().zip(flux_errs.iter())
+            .map(|(f, e)| *e > 0.0 && (*f / *e) < snr_threshold)
+            .collect();
+        let upper_flux: Vec<f64> = flux_errs.iter()
+            .map(|e| snr_threshold * e / peak_flux)
+            .collect();
+
+        let mut frac_noises: Vec<f64> = normalized_flux.iter().zip(normalized_err.iter())
+            .filter_map(|(f, e)| if *f > 0.0 { Some(e / f) } else { None })
+            .collect();
+        let noise_frac_median = median_f64(&mut frac_noises).unwrap_or(0.0);
+
+        let mags_obs: Vec<f64> = fluxes.iter().map(|f| flux_to_mag(*f, zp)).collect();
+        let obs_var: Vec<f64> = normalized_err.iter().map(|e| e * e + 1e-10).collect();
+
+        let fit_data = BandFitData {
+            times: times.clone(),
+            flux: normalized_flux,
+            flux_err: normalized_err,
+            obs_var,
+            is_upper,
+            upper_flux,
+            noise_frac_median,
+            peak_flux_obs: peak_flux,
+        };
+
+        band_entries.push((band_name.clone(), fit_data, mags_obs));
+    }
+
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+
+    let mut results: Vec<ParametricBandResult> = Vec::new();
+
+    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
+        if band_idx >= gpu_results.len() { break; }
+        let gpu = &gpu_results[band_idx];
+
+        if gpu.pso_params.is_empty() { continue; }
+
+        let pso_model = SviModel::from_name(&gpu.model);
+
+        // SVI/Laplace on CPU, seeded from GPU PSO
+        let mut svi_result = match method {
+            UncertaintyMethod::Svi => svi_fit(
+                pso_model, data, svi_n_steps, svi_n_samples, svi_lr,
+                Some(&gpu.pso_params),
+            ),
+            UncertaintyMethod::Laplace => laplace_fit(pso_model, data, &gpu.pso_params),
+        };
+
+        profile_t0_refine(&mut svi_result, data);
+
+        // Mag-space chi2
+        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
+        let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
+        let mag_preds = if use_pso_for_mag {
+            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
+        } else {
+            svi_preds
+        };
+        let mut mag_chi2_sum = 0.0;
+        let mut mag_chi2_n = 0usize;
+        for i in 0..data.times.len() {
+            let pred_flux = mag_preds[i] * data.peak_flux_obs;
+            if pred_flux > 0.0 && data.flux[i] * data.peak_flux_obs > 0.0 {
+                let mag_pred = flux_to_mag(pred_flux, zp);
+                let mag_obs = mags_obs[i];
+                let mag_err = 1.0857 * data.flux_err[i] / data.flux[i];
+                if mag_err > 0.0 {
+                    let residual = mag_obs - mag_pred;
+                    mag_chi2_sum += residual * residual / (mag_err * mag_err);
+                    mag_chi2_n += 1;
+                }
+            }
+        }
+        let mag_chi2 = if mag_chi2_n > 0 { mag_chi2_sum / mag_chi2_n as f64 } else { f64::NAN };
+
+        results.push(ParametricBandResult {
+            band: band_name.clone(),
+            model: gpu.model.clone(),
+            pso_params: gpu.pso_params.clone(),
+            pso_chi2: finite_or_none(gpu.pso_cost),
+            svi_mu: svi_result.mu,
+            svi_log_sigma: svi_result.log_sigma,
+            svi_elbo: finite_or_none(svi_result.elbo),
+            n_obs: data.times.len(),
+            mag_chi2: finite_or_none(mag_chi2),
+            per_model_chi2: gpu.per_model_chi2.clone(),
+            per_model_params: gpu.per_model_params.clone(),
+            uncertainty_method: method,
+            multi_bazin: if band_idx == 0 { gpu.multi_bazin.clone() } else { None },
+        });
+    }
+
+    results
+}
+
+/// Return the SVI prior (centers, widths) for a model, with centers recentered
+/// on PSO init params (except sigma_extra which keeps original center).
+///
+/// Used by the GPU SVI path to prepare `SviBatchInput`.
+pub fn svi_prior_for_model(model_name: &SviModelName, pso_params: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let model = SviModel::from_name(model_name);
+    let priors = prior_params(model);
+    let se_idx = model.sigma_extra_idx();
+    let np = model.n_params();
+    let mut centers = vec![0.0; np];
+    let mut widths = vec![0.0; np];
+    for j in 0..np {
+        let (orig_center, width) = priors[j];
+        // Center on PSO params for all except sigma_extra
+        centers[j] = if j == se_idx { orig_center } else { pso_params[j.min(pso_params.len() - 1)] };
+        widths[j] = width;
+    }
+    (centers, widths)
+}
+
+/// Return the model_id (matching CUDA kernel), n_params, and sigma_extra index
+/// for a given model name.
+pub fn svi_model_meta(model_name: &SviModelName) -> (usize, usize, usize) {
+    let model = SviModel::from_name(model_name);
+    let model_id = match model_name {
+        SviModelName::Bazin => 0,
+        SviModelName::Villar => 1,
+        SviModelName::Tde => 2,
+        SviModelName::Arnett => 3,
+        SviModelName::Magnetar => 4,
+        SviModelName::ShockCooling => 5,
+        SviModelName::Afterglow => 6,
+        SviModelName::MetzgerKN => 7,
+    };
+    (model_id, model.n_params(), model.sigma_extra_idx())
+}
+
+/// Finalize parametric results using pre-computed GPU SVI outputs.
+///
+/// Like `finalize_parametric_from_gpu` but skips CPU SVI — uses pre-computed
+/// mu/log_sigma/elbo from GPU SVI kernel.
+///
+/// `svi_outputs` must be parallel to `gpu_results` (same length and ordering).
+pub fn finalize_parametric_with_gpu_svi(
+    flux_bands: &HashMap<String, BandData>,
+    gpu_results: &[GpuPsoBandResult],
+    svi_outputs: &[(Vec<f64>, Vec<f64>, f64)], // (mu, log_sigma, elbo) per band
+) -> Vec<ParametricBandResult> {
+    if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
+        return Vec::new();
+    }
+
+    let zp = 23.9;
+    let snr_threshold = 3.0;
+
+    // Prepare band data (same as finalize_parametric_from_gpu)
+    let mut band_entries: Vec<(String, BandFitData, Vec<f64>)> = Vec::new();
+
+    for (band_name, band_data) in flux_bands {
+        let fluxes = &band_data.values;
+        let flux_errs = &band_data.errors;
+        let times = &band_data.times;
+
+        if fluxes.is_empty() { continue; }
+        let peak_flux = fluxes.iter().cloned().fold(f64::MIN, f64::max);
+        if peak_flux <= 0.0 { continue; }
+
+        let normalized_flux: Vec<f64> = fluxes.iter().map(|f| f / peak_flux).collect();
+        let normalized_err: Vec<f64> = flux_errs.iter().map(|e| e / peak_flux).collect();
+
+        let is_upper: Vec<bool> = fluxes.iter().zip(flux_errs.iter())
+            .map(|(f, e)| *e > 0.0 && (*f / *e) < snr_threshold)
+            .collect();
+        let upper_flux: Vec<f64> = flux_errs.iter()
+            .map(|e| snr_threshold * e / peak_flux)
+            .collect();
+
+        let mut frac_noises: Vec<f64> = normalized_flux.iter().zip(normalized_err.iter())
+            .filter_map(|(f, e)| if *f > 0.0 { Some(e / f) } else { None })
+            .collect();
+        let noise_frac_median = median_f64(&mut frac_noises).unwrap_or(0.0);
+
+        let mags_obs: Vec<f64> = fluxes.iter().map(|f| flux_to_mag(*f, zp)).collect();
+        let obs_var: Vec<f64> = normalized_err.iter().map(|e| e * e + 1e-10).collect();
+
+        let fit_data = BandFitData {
+            times: times.clone(),
+            flux: normalized_flux,
+            flux_err: normalized_err,
+            obs_var,
+            is_upper,
+            upper_flux,
+            noise_frac_median,
+            peak_flux_obs: peak_flux,
+        };
+
+        band_entries.push((band_name.clone(), fit_data, mags_obs));
+    }
+
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+
+    let mut results: Vec<ParametricBandResult> = Vec::new();
+
+    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
+        if band_idx >= gpu_results.len() || band_idx >= svi_outputs.len() { break; }
+        let gpu = &gpu_results[band_idx];
+        let (ref svi_mu, ref svi_log_sigma, svi_elbo) = svi_outputs[band_idx];
+
+        if gpu.pso_params.is_empty() { continue; }
+
+        let pso_model = SviModel::from_name(&gpu.model);
+
+        // profile_t0_refine on the GPU SVI result
+        let mut svi_result = SviFitResult {
+            model: pso_model,
+            mu: svi_mu.clone(),
+            log_sigma: svi_log_sigma.clone(),
+            elbo: svi_elbo,
+        };
+        profile_t0_refine(&mut svi_result, data);
+
+        // Mag-space chi2
+        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
+        let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
+        let mag_preds = if use_pso_for_mag {
+            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
+        } else {
+            svi_preds
+        };
+        let mut mag_chi2_sum = 0.0;
+        let mut mag_chi2_n = 0usize;
+        for i in 0..data.times.len() {
+            let pred_flux = mag_preds[i] * data.peak_flux_obs;
+            if pred_flux > 0.0 && data.flux[i] * data.peak_flux_obs > 0.0 {
+                let mag_pred = flux_to_mag(pred_flux, zp);
+                let mag_obs = mags_obs[i];
+                let mag_err = 1.0857 * data.flux_err[i] / data.flux[i];
+                if mag_err > 0.0 {
+                    let residual = mag_obs - mag_pred;
+                    mag_chi2_sum += residual * residual / (mag_err * mag_err);
+                    mag_chi2_n += 1;
+                }
+            }
+        }
+        let mag_chi2 = if mag_chi2_n > 0 { mag_chi2_sum / mag_chi2_n as f64 } else { f64::NAN };
+
+        results.push(ParametricBandResult {
+            band: band_name.clone(),
+            model: gpu.model.clone(),
+            pso_params: gpu.pso_params.clone(),
+            pso_chi2: finite_or_none(gpu.pso_cost),
+            svi_mu: svi_result.mu,
+            svi_log_sigma: svi_result.log_sigma,
+            svi_elbo: finite_or_none(svi_result.elbo),
+            n_obs: data.times.len(),
+            mag_chi2: finite_or_none(mag_chi2),
+            per_model_chi2: gpu.per_model_chi2.clone(),
+            per_model_params: gpu.per_model_params.clone(),
+            uncertainty_method: UncertaintyMethod::Svi,
+            multi_bazin: if band_idx == 0 { gpu.multi_bazin.clone() } else { None },
+        });
+    }
+
+    results
 }
 
 /// Fit parametric lightcurve models to all bands.
@@ -2316,6 +3016,14 @@ pub fn fit_parametric(
             f64::NAN
         };
 
+        // MultiBazin: run on the first (most-populated) band
+        let multi_bazin = if band_idx == 0 {
+            let mb = fit_multi_bazin(data);
+            if mb.params.is_empty() { None } else { Some(mb) }
+        } else {
+            None
+        };
+
         results.push(ParametricBandResult {
             band: band_name.clone(),
             model: pso_model.to_name(),
@@ -2329,6 +3037,7 @@ pub fn fit_parametric(
             per_model_chi2,
             per_model_params,
             uncertainty_method: method,
+            multi_bazin,
         });
     }
 

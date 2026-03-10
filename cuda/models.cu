@@ -281,6 +281,91 @@ extern "C" __global__ void metzger_kn_eval(
     }
 }
 
+// ===========================================================================
+// MultiBazin: sum of K Bazin components + baseline
+// ===========================================================================
+//
+// Params layout for K components:
+//   [log_A_1, t0_1, log_tau_rise_1, log_tau_fall_1,   // component 1
+//    log_A_2, t0_2, log_tau_rise_2, log_tau_fall_2,   // component 2
+//    ...
+//    B, log_sigma_extra]                               // shared (last 2)
+// Total = 4*K + 2 params.
+
+#define MB_COMP_PARAMS 4
+
+__device__ inline double bazin_component_at(const double* p, double t) {
+    double a        = exp(p[0]);
+    double t0       = p[1];
+    double tau_rise = exp(p[2]);
+    double tau_fall = exp(p[3]);
+    double dt       = t - t0;
+    return a * exp(-dt / tau_fall) * sigmoid(dt / tau_rise);
+}
+
+__device__ inline double multi_bazin_at(const double* p, int k, double t) {
+    double sum = 0.0;
+    for (int c = 0; c < k; c++) {
+        sum += bazin_component_at(p + c * MB_COMP_PARAMS, t);
+    }
+    int b_idx = k * MB_COMP_PARAMS;
+    return sum + p[b_idx]; // + B
+}
+
+// Batch PSO cost kernel for MultiBazin.
+// Thread grid: n_sources × n_particles.
+// Each source can have a different K, passed via source_k[].
+// n_params must equal 4*max_k + 2 (positions are padded).
+extern "C" __global__ void batch_pso_cost_multi_bazin(
+    const double* __restrict__ all_times,
+    const double* __restrict__ all_flux,
+    const double* __restrict__ all_obs_var,
+    const int*    __restrict__ all_is_upper,
+    const double* __restrict__ all_upper_flux,
+    const int*    __restrict__ source_offsets,
+    const double* __restrict__ positions,
+    double* __restrict__ costs,
+    const int*    __restrict__ source_k,
+    int n_sources,
+    int n_particles,
+    int n_params)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_sources * n_particles) return;
+
+    int src = idx / n_particles;
+    int pid = idx % n_particles;
+
+    int obs_start = source_offsets[src];
+    int obs_end   = source_offsets[src + 1];
+    int n_obs     = obs_end - obs_start;
+    if (n_obs <= 0) { costs[idx] = 1e99; return; }
+
+    int k = source_k[src];
+    const double* p = positions + (long long)(src * n_particles + pid) * n_params;
+    int se_idx = k * MB_COMP_PARAMS + 1;  // sigma_extra is after B
+    double sigma_extra = exp(p[se_idx]);
+    double sigma_extra_sq = sigma_extra * sigma_extra;
+
+    double neg_ll = 0.0;
+    for (int i = obs_start; i < obs_end; i++) {
+        double pred = multi_bazin_at(p, k, all_times[i]);
+        if (!isfinite(pred)) { costs[idx] = 1e99; return; }
+
+        double total_var = all_obs_var[i] + sigma_extra_sq;
+
+        if (all_is_upper[i]) {
+            double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+            neg_ll -= log_normal_cdf_d(z);
+        } else {
+            double diff = pred - all_flux[i];
+            neg_ll += diff * diff / total_var + log(total_var);
+        }
+    }
+
+    costs[idx] = neg_ll / (double)n_obs;
+}
+
 __device__ inline double eval_model_at(int model_id, const double* p, double t) {
     switch (model_id) {
         case 0: return bazin_at(p, t);
@@ -548,4 +633,26 @@ extern "C" void launch_batch_pso_cost(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, positions, costs,
         n_sources, n_particles, n_params, model_id);
+}
+
+extern "C" void launch_batch_pso_cost_multi_bazin(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* positions,
+    double* costs,
+    const int*    source_k,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int grid,
+    int block)
+{
+    batch_pso_cost_multi_bazin<<<grid, block>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, positions, costs, source_k,
+        n_sources, n_particles, n_params);
 }

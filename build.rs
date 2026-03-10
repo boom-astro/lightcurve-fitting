@@ -11,12 +11,17 @@ fn build_cuda() {
         .flag("-Wno-deprecated-gpu-targets")
         .file("cuda/models.cu")
         .file("cuda/gp.cu")
+        .file("cuda/gp2d.cu")
+        .file("cuda/svi.cu")
         .compile("lightcurve_cuda");
 
     // Link against the CUDA runtime
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rerun-if-changed=cuda/models_device.h");
     println!("cargo:rerun-if-changed=cuda/models.cu");
     println!("cargo:rerun-if-changed=cuda/gp.cu");
+    println!("cargo:rerun-if-changed=cuda/gp2d.cu");
+    println!("cargo:rerun-if-changed=cuda/svi.cu");
 }
 
 fn main() {

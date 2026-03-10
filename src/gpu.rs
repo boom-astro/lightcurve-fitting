@@ -38,6 +38,20 @@ impl GpuModelName {
         }
     }
 
+    /// Convert to the parametric module's model name type.
+    pub fn to_svi_name(self) -> crate::parametric::SviModelName {
+        match self {
+            GpuModelName::Bazin => crate::parametric::SviModelName::Bazin,
+            GpuModelName::Villar => crate::parametric::SviModelName::Villar,
+            GpuModelName::Tde => crate::parametric::SviModelName::Tde,
+            GpuModelName::Arnett => crate::parametric::SviModelName::Arnett,
+            GpuModelName::Magnetar => crate::parametric::SviModelName::Magnetar,
+            GpuModelName::ShockCooling => crate::parametric::SviModelName::ShockCooling,
+            GpuModelName::Afterglow => crate::parametric::SviModelName::Afterglow,
+            GpuModelName::MetzgerKN => crate::parametric::SviModelName::MetzgerKN,
+        }
+    }
+
     /// Integer model ID matching the CUDA kernel's switch statement.
     fn model_id(self) -> c_int {
         match self {
@@ -166,6 +180,33 @@ extern "C" {
     );
 }
 
+// Batch 2D GP fit + predict launcher
+extern "C" {
+    fn launch_batch_gp2d_fit_predict(
+        all_times: *const f64,
+        all_waves: *const f64,
+        all_mags: *const f64,
+        all_noise_var: *const f64,
+        src_offsets: *const c_int,
+        query_times: *const f64,
+        query_waves: *const f64,
+        hp_amps: *const f64,
+        hp_lst: *const f64,
+        hp_lsw: *const f64,
+        gp_state: *mut f64,
+        pred_grid: *mut f64,
+        std_grid: *mut f64,
+        n_sources: c_int,
+        n_pred: c_int,
+        n_hp_amp: c_int,
+        n_hp_lst: c_int,
+        n_hp_lsw: c_int,
+        max_subsample: c_int,
+        grid: c_int,
+        block: c_int,
+    );
+}
+
 // Batch PSO cost launcher
 extern "C" {
     fn launch_batch_pso_cost(
@@ -181,6 +222,51 @@ extern "C" {
         n_particles: c_int,
         n_params: c_int,
         model_id: c_int,
+        grid: c_int,
+        block: c_int,
+    );
+
+    fn launch_batch_pso_cost_multi_bazin(
+        all_times: *const f64,
+        all_flux: *const f64,
+        all_obs_var: *const f64,
+        all_is_upper: *const c_int,
+        all_upper_flux: *const f64,
+        source_offsets: *const c_int,
+        positions: *const f64,
+        costs: *mut f64,
+        source_k: *const c_int,
+        n_sources: c_int,
+        n_particles: c_int,
+        n_params: c_int,
+        grid: c_int,
+        block: c_int,
+    );
+}
+
+// Batch SVI fit launcher
+extern "C" {
+    fn launch_batch_svi_fit(
+        all_times: *const f64,
+        all_flux: *const f64,
+        all_obs_var: *const f64,
+        all_is_upper: *const c_int,
+        all_upper_flux: *const f64,
+        source_offsets: *const c_int,
+        pso_params: *const f64,
+        model_ids: *const c_int,
+        n_params_arr: *const c_int,
+        se_idx_arr: *const c_int,
+        prior_centers: *const f64,
+        prior_widths: *const f64,
+        out_mu: *mut f64,
+        out_log_sigma: *mut f64,
+        out_elbo: *mut f64,
+        n_sources: c_int,
+        max_params: c_int,
+        n_steps: c_int,
+        n_samples: c_int,
+        lr: f64,
         grid: c_int,
         block: c_int,
     );
@@ -256,6 +342,7 @@ impl Drop for DevBuf {
 // ---------------------------------------------------------------------------
 
 /// Pre-normalized observation data for one source.
+#[derive(Clone)]
 pub struct BatchSource {
     pub times: Vec<f64>,
     pub flux: Vec<f64>,
@@ -601,6 +688,308 @@ impl GpuContext {
     }
 
     // -----------------------------------------------------------------------
+    // Batch MultiBazin PSO
+    // -----------------------------------------------------------------------
+
+    /// Run greedy MultiBazin fitting (K=1..4) across many sources on the GPU.
+    ///
+    /// For each K, runs PSO with GPU cost evaluation. K>1 seeds one particle
+    /// from the K-1 solution extended with a residual-peak component.
+    /// Selects best K per source via BIC.
+    ///
+    /// `sources` is needed on the CPU side for residual computation when seeding.
+    pub fn batch_pso_multi_bazin(
+        &self,
+        data: &GpuBatchData,
+        sources: &[BatchSource],
+        n_particles: usize,
+        max_iters: usize,
+        stall_iters: usize,
+        seed: u64,
+    ) -> Result<Vec<crate::parametric::MultiBazinResult>, String> {
+        use crate::parametric::MultiBazinResult;
+
+        const MAX_K: usize = 4;
+        const COMP_PARAMS: usize = 4; // log_A, t0, log_tau_rise, log_tau_fall
+
+        let n_sources = data.n_sources;
+        assert_eq!(n_sources, sources.len());
+
+        // Compute per-source time ranges
+        let t_ranges: Vec<(f64, f64)> = sources
+            .iter()
+            .map(|s| {
+                let tmin = s.times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let tmax = s.times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                (tmin, tmax)
+            })
+            .collect();
+
+        // Global time range for shared bounds
+        let global_t_min = t_ranges.iter().map(|r| r.0).fold(f64::INFINITY, f64::min) - 30.0;
+        let global_t_max = t_ranges.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max) + 30.0;
+
+        // Per-source tracking
+        let mut best_k = vec![1usize; n_sources];
+        let mut best_params: Vec<Vec<f64>> = vec![Vec::new(); n_sources];
+        let mut best_cost = vec![f64::INFINITY; n_sources];
+        let mut best_bic = vec![f64::INFINITY; n_sources];
+        let mut per_k_cost: Vec<Vec<f64>> = vec![Vec::with_capacity(MAX_K); n_sources];
+        let mut per_k_bic: Vec<Vec<f64>> = vec![Vec::with_capacity(MAX_K); n_sources];
+        let mut prev_params: Vec<Vec<f64>> = vec![Vec::new(); n_sources];
+        let mut source_stopped = vec![false; n_sources]; // early-stop per source
+
+        // PSO hyperparameters
+        let w_inertia = 0.7;
+        let c1 = 1.5;
+        let c2 = 1.5;
+
+        for k in 1..=MAX_K {
+            let n_params = COMP_PARAMS * k + 2;
+
+            // Build bounds for this K using global time range
+            let mut lower = Vec::with_capacity(n_params);
+            let mut upper = Vec::with_capacity(n_params);
+            for _ in 0..k {
+                lower.extend_from_slice(&[-3.0, global_t_min, -2.0, -2.0]);
+                upper.extend_from_slice(&[3.0, global_t_max, 5.0, 6.0]);
+            }
+            lower.push(-0.3); upper.push(0.3);   // B
+            lower.push(-5.0); upper.push(0.0);    // log_sigma_extra
+
+            let dim = n_params;
+            let total_particles = n_sources * n_particles;
+
+            // Initialize particles
+            let mut positions = vec![0.0; total_particles * dim];
+            let mut velocities = vec![0.0; total_particles * dim];
+            let mut pbest_pos = vec![0.0; total_particles * dim];
+            let mut pbest_cost = vec![f64::INFINITY; total_particles];
+            let mut gbest_pos = vec![0.0; n_sources * dim];
+            let mut gbest_cost = vec![f64::INFINITY; n_sources];
+
+            for s in 0..n_sources {
+                let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(s as u64).wrapping_add(k as u64 * 1000));
+
+                // For k > 1, build a seeded particle from previous K-1 solution
+                let seed_particle: Option<Vec<f64>> = if k > 1 && prev_params[s].len() == COMP_PARAMS * (k - 1) + 2 {
+                    let prev = &prev_params[s];
+                    let prev_n_comp = (k - 1) * COMP_PARAMS;
+                    let mut init = Vec::with_capacity(n_params);
+                    // Copy previous components
+                    init.extend_from_slice(&prev[..prev_n_comp]);
+
+                    // Compute residuals from previous fit on CPU
+                    let src = &sources[s];
+                    let n_obs = src.times.len();
+                    let mut peak_idx = 0;
+                    let mut peak_val = f64::NEG_INFINITY;
+                    for i in 0..n_obs {
+                        let mut pred = 0.0;
+                        for c in 0..(k - 1) {
+                            let off = c * COMP_PARAMS;
+                            let a = prev[off].exp();
+                            let t0 = prev[off + 1];
+                            let tau_rise = prev[off + 2].exp();
+                            let tau_fall = prev[off + 3].exp();
+                            let dt = src.times[i] - t0;
+                            let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
+                            pred += a * (-dt / tau_fall).exp() * sig;
+                        }
+                        pred += prev[prev_n_comp]; // B
+                        let resid = src.flux[i] - pred;
+                        if !src.is_upper[i] && resid > peak_val {
+                            peak_val = resid;
+                            peak_idx = i;
+                        }
+                    }
+
+                    let seed_t0 = src.times[peak_idx];
+                    let seed_log_a = peak_val.max(1e-10).ln();
+                    init.extend_from_slice(&[seed_log_a, seed_t0, 1.0, 1.0]);
+
+                    // Copy B and sigma_extra from previous
+                    init.push(prev[prev_n_comp]);
+                    init.push(prev[prev_n_comp + 1]);
+
+                    // Clamp to bounds
+                    for i in 0..n_params {
+                        init[i] = init[i].clamp(lower[i], upper[i]);
+                    }
+                    Some(init)
+                } else {
+                    None
+                };
+
+                for p in 0..n_particles {
+                    let base = (s * n_particles + p) * dim;
+                    if p == 0 {
+                        if let Some(ref sp) = seed_particle {
+                            // First particle is seeded
+                            positions[base..base + dim].copy_from_slice(sp);
+                            for d in 0..dim {
+                                velocities[base + d] = (upper[d] - lower[d]) * 0.02 * (2.0 * rng.random::<f64>() - 1.0);
+                            }
+                            continue;
+                        }
+                    }
+                    // Random initialization
+                    for d in 0..dim {
+                        positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                        velocities[base + d] = (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0);
+                    }
+                }
+            }
+
+            // All sources use the same K for this iteration
+            let source_k: Vec<c_int> = vec![k as c_int; n_sources];
+
+            // GPU buffers
+            let d_positions = DevBuf::alloc(total_particles * dim * size_of::<f64>())?;
+            let d_costs = DevBuf::alloc(total_particles * size_of::<f64>())?;
+            let d_source_k = DevBuf::upload(&source_k)?;
+            let mut h_costs = vec![0.0f64; total_particles];
+
+            let block: c_int = 256;
+
+            let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(n_sources as u64 + k as u64));
+            let mut prev_gbest = vec![f64::INFINITY; n_sources];
+            let mut stall_count = vec![0usize; n_sources];
+            let mut iter_done = vec![false; n_sources];
+
+            for _iter in 0..max_iters {
+                d_positions.upload_from(&positions)?;
+
+                let grid: c_int = ((total_particles as c_int) + block - 1) / block;
+                unsafe {
+                    launch_batch_pso_cost_multi_bazin(
+                        data.d_times.ptr as _,
+                        data.d_flux.ptr as _,
+                        data.d_obs_var.ptr as _,
+                        data.d_is_upper.ptr as _,
+                        data.d_upper_flux.ptr as _,
+                        data.d_offsets.ptr as _,
+                        d_positions.ptr as _,
+                        d_costs.ptr as _,
+                        d_source_k.ptr as _,
+                        n_sources as c_int,
+                        n_particles as c_int,
+                        n_params as c_int,
+                        grid,
+                        block,
+                    );
+                    cuda_check(cudaGetLastError())?;
+                    cuda_check(cudaDeviceSynchronize())?;
+                }
+
+                d_costs.download_into(&mut h_costs)?;
+
+                // Update personal and global bests
+                for s in 0..n_sources {
+                    for p in 0..n_particles {
+                        let idx = s * n_particles + p;
+                        let cost = h_costs[idx];
+                        if cost < pbest_cost[idx] {
+                            pbest_cost[idx] = cost;
+                            let base = idx * dim;
+                            pbest_pos[base..base + dim].copy_from_slice(&positions[base..base + dim]);
+                            if cost < gbest_cost[s] {
+                                gbest_cost[s] = cost;
+                                let gb = s * dim;
+                                gbest_pos[gb..gb + dim].copy_from_slice(&positions[base..base + dim]);
+                            }
+                        }
+                    }
+                }
+
+                // Update velocities and positions
+                for s in 0..n_sources {
+                    if iter_done[s] || source_stopped[s] { continue; }
+                    for p in 0..n_particles {
+                        let idx = s * n_particles + p;
+                        let base = idx * dim;
+                        let gb = s * dim;
+                        for d in 0..dim {
+                            let r1: f64 = rng.random();
+                            let r2: f64 = rng.random();
+                            velocities[base + d] = w_inertia * velocities[base + d]
+                                + c1 * r1 * (pbest_pos[base + d] - positions[base + d])
+                                + c2 * r2 * (gbest_pos[gb + d] - positions[base + d]);
+                            positions[base + d] = (positions[base + d] + velocities[base + d])
+                                .clamp(lower[d], upper[d]);
+                        }
+                    }
+                }
+
+                // Per-source stall detection
+                let mut all_done = true;
+                for s in 0..n_sources {
+                    if iter_done[s] || source_stopped[s] { continue; }
+                    let improved = prev_gbest[s] - gbest_cost[s] > 0.01 * prev_gbest[s].abs().max(1e-10);
+                    if improved {
+                        stall_count[s] = 0;
+                        prev_gbest[s] = gbest_cost[s];
+                    } else {
+                        stall_count[s] += 1;
+                        if stall_count[s] >= stall_iters {
+                            iter_done[s] = true;
+                        }
+                    }
+                    if !iter_done[s] { all_done = false; }
+                }
+                if all_done { break; }
+            }
+
+            // Collect K results and update BIC tracking
+            for s in 0..n_sources {
+                if source_stopped[s] {
+                    per_k_cost[s].push(f64::NAN);
+                    per_k_bic[s].push(f64::NAN);
+                    continue;
+                }
+
+                let cost = gbest_cost[s];
+                let n_obs = sources[s].times.len() as f64;
+                let k_bic = 2.0 * cost * n_obs + (n_params as f64) * n_obs.ln();
+
+                per_k_cost[s].push(cost);
+                per_k_bic[s].push(k_bic);
+
+                if k_bic < best_bic[s] {
+                    best_bic[s] = k_bic;
+                    best_cost[s] = cost;
+                    best_k[s] = k;
+                    let gb = s * dim;
+                    best_params[s] = gbest_pos[gb..gb + dim].to_vec();
+                }
+
+                // Store params for seeding next K
+                let gb = s * dim;
+                prev_params[s] = gbest_pos[gb..gb + dim].to_vec();
+
+                // Early stop: adding component didn't help BIC
+                if k > 1 && k_bic > per_k_bic[s][k - 2] + 2.0 {
+                    source_stopped[s] = true;
+                }
+            }
+        }
+
+        // Build results
+        let results: Vec<MultiBazinResult> = (0..n_sources)
+            .map(|s| MultiBazinResult {
+                best_k: best_k[s],
+                params: best_params[s].clone(),
+                cost: best_cost[s],
+                bic: best_bic[s],
+                per_k_cost: per_k_cost[s].clone(),
+                per_k_bic: per_k_bic[s].clone(),
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
     // Batch GP fitting
     // -----------------------------------------------------------------------
 
@@ -779,6 +1168,322 @@ impl GpuContext {
 
         Ok(results)
     }
+
+    /// Batch 2D GP (time × wavelength) fitting for many sources simultaneously.
+    ///
+    /// Each source's observations across all bands are combined into a single
+    /// 2D GP with an anisotropic RBF kernel.
+    ///
+    /// Returns per-source: (predictions at query grid, std at query grid,
+    /// best hyperparams: amp, ls_time, ls_wave, train_rms, n_train).
+    pub fn batch_gp_2d(
+        &self,
+        sources: &[Gp2dInput],
+        query_times: &[f64],
+        query_waves: &[f64],
+        amp_candidates: &[f64],
+        lst_candidates: &[f64],
+        lsw_candidates: &[f64],
+        max_subsample: usize,
+    ) -> Result<Vec<Gp2dOutput>, String> {
+        let n_sources = sources.len();
+        if n_sources == 0 {
+            return Ok(Vec::new());
+        }
+        let n_pred = query_times.len();
+        assert_eq!(n_pred, query_waves.len(), "query_times and query_waves must have same length");
+
+        let n_hp_total = amp_candidates.len() * lst_candidates.len() * lsw_candidates.len();
+        assert!(n_hp_total <= 64, "max 64 hyperparameter combos for 2D GP");
+
+        // Pack source data into concatenated arrays + offset table
+        let mut all_times = Vec::new();
+        let mut all_waves = Vec::new();
+        let mut all_mags = Vec::new();
+        let mut all_noise_var = Vec::new();
+        let mut offsets: Vec<c_int> = Vec::with_capacity(n_sources + 1);
+        offsets.push(0);
+
+        for src in sources {
+            all_times.extend_from_slice(&src.times);
+            all_waves.extend_from_slice(&src.waves);
+            all_mags.extend_from_slice(&src.mags);
+            all_noise_var.extend_from_slice(&src.noise_var);
+            offsets.push(all_times.len() as c_int);
+        }
+
+        let gp2d_state_size = 125; // GP2D_STATE_SIZE in CUDA
+
+        // Upload inputs
+        let d_times = DevBuf::upload(&all_times)?;
+        let d_waves = DevBuf::upload(&all_waves)?;
+        let d_mags = DevBuf::upload(&all_mags)?;
+        let d_noise_var = DevBuf::upload(&all_noise_var)?;
+        let d_offsets = DevBuf::upload(&offsets)?;
+        let d_query_t = DevBuf::upload(query_times)?;
+        let d_query_w = DevBuf::upload(query_waves)?;
+        let d_amps = DevBuf::upload(amp_candidates)?;
+        let d_lst = DevBuf::upload(lst_candidates)?;
+        let d_lsw = DevBuf::upload(lsw_candidates)?;
+
+        // Allocate outputs
+        let d_gp_state = DevBuf::alloc(n_sources * gp2d_state_size * size_of::<f64>())?;
+        let d_pred_grid = DevBuf::alloc(n_sources * n_pred * size_of::<f64>())?;
+        let d_std_grid = DevBuf::alloc(n_sources * n_pred * size_of::<f64>())?;
+
+        let block: c_int = n_hp_total as c_int;
+
+        unsafe {
+            launch_batch_gp2d_fit_predict(
+                d_times.ptr as _, d_waves.ptr as _,
+                d_mags.ptr as _, d_noise_var.ptr as _,
+                d_offsets.ptr as _,
+                d_query_t.ptr as _, d_query_w.ptr as _,
+                d_amps.ptr as _, d_lst.ptr as _, d_lsw.ptr as _,
+                d_gp_state.ptr as _, d_pred_grid.ptr as _, d_std_grid.ptr as _,
+                n_sources as c_int, n_pred as c_int,
+                amp_candidates.len() as c_int,
+                lst_candidates.len() as c_int,
+                lsw_candidates.len() as c_int,
+                max_subsample as c_int,
+                n_sources as c_int, block,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        // Download results
+        let mut h_gp_state = vec![0.0f64; n_sources * gp2d_state_size];
+        let mut h_pred_grid = vec![0.0f64; n_sources * n_pred];
+        let mut h_std_grid = vec![0.0f64; n_sources * n_pred];
+
+        d_gp_state.download_into(&mut h_gp_state)?;
+        d_pred_grid.download_into(&mut h_pred_grid)?;
+        d_std_grid.download_into(&mut h_std_grid)?;
+
+        // Build output structs
+        let mut results = Vec::with_capacity(n_sources);
+        for s in 0..n_sources {
+            let state_off = s * gp2d_state_size;
+            let state = &h_gp_state[state_off..state_off + gp2d_state_size];
+            let m = state[124] as usize;
+
+            let pred = h_pred_grid[s * n_pred..(s + 1) * n_pred].to_vec();
+            let std_dev = h_std_grid[s * n_pred..(s + 1) * n_pred].to_vec();
+
+            if m >= 3 {
+                let amp = state[120];
+                let inv_2lst2 = state[121];
+                let inv_2lsw2 = state[122];
+                let ls_time = (0.5 / inv_2lst2).sqrt();
+                let ls_wave = (0.5 / inv_2lsw2).sqrt();
+
+                // Compute train RMS from predictions vs training data
+                let n_train = sources[s].times.len();
+                let train_rms = {
+                    // Re-predict at training points using the fitted state
+                    let alpha = &state[0..m];
+                    let x_t = &state[40..40 + m];
+                    let x_w = &state[80..80 + m];
+                    let y_mean = state[123];
+                    let mut rms = 0.0;
+                    let n_eval = n_train.min(100); // don't evaluate all if huge
+                    let step = if n_eval < n_train { n_train as f64 / n_eval as f64 } else { 1.0 };
+                    for i in 0..n_eval {
+                        let idx = (i as f64 * step) as usize;
+                        let t = sources[s].times[idx];
+                        let w = sources[s].waves[idx];
+                        let mut pred_val = y_mean;
+                        for j in 0..m {
+                            let dt = t - x_t[j];
+                            let dw = w - x_w[j];
+                            pred_val += amp * (-dt * dt * inv_2lst2 - dw * dw * inv_2lsw2).exp() * alpha[j];
+                        }
+                        let diff = pred_val - sources[s].mags[idx];
+                        rms += diff * diff;
+                    }
+                    (rms / n_eval as f64).sqrt()
+                };
+
+                results.push(Gp2dOutput {
+                    pred_grid: pred,
+                    std_grid: std_dev,
+                    amp,
+                    ls_time,
+                    ls_wave,
+                    train_rms,
+                    n_train,
+                    success: true,
+                });
+            } else {
+                results.push(Gp2dOutput {
+                    pred_grid: pred,
+                    std_grid: std_dev,
+                    amp: 0.0,
+                    ls_time: 0.0,
+                    ls_wave: 0.0,
+                    train_rms: f64::NAN,
+                    n_train: sources[s].times.len(),
+                    success: false,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Run SVI optimization on GPU for many sources simultaneously.
+    ///
+    /// Each source has its own model, PSO-initialized parameters, and prior.
+    /// Uses finite-difference model gradients with Adam optimizer.
+    ///
+    /// Returns (mu, log_sigma, elbo) per source. The log_sigma already includes
+    /// the sigma inflation factor.
+    pub fn batch_svi_fit(
+        &self,
+        data: &GpuBatchData,
+        inputs: &[SviBatchInput],
+        n_steps: usize,
+        n_samples: usize,
+        lr: f64,
+    ) -> Result<Vec<SviBatchOutput>, String> {
+        let n_sources = inputs.len();
+        if n_sources == 0 {
+            return Ok(Vec::new());
+        }
+        assert_eq!(n_sources, data.n_sources, "SVI inputs must match batch data size");
+
+        let max_params: usize = 7; // max across all models (Villar/TDE)
+
+        // Build flat arrays for GPU upload
+        let mut h_pso_params = vec![0.0f64; n_sources * max_params];
+        let mut h_model_ids = vec![0i32; n_sources];
+        let mut h_n_params = vec![0i32; n_sources];
+        let mut h_se_idx = vec![0i32; n_sources];
+        let mut h_prior_centers = vec![0.0f64; n_sources * max_params];
+        let mut h_prior_widths = vec![0.0f64; n_sources * max_params];
+
+        for (i, inp) in inputs.iter().enumerate() {
+            let np = inp.pso_params.len().min(max_params);
+            let base = i * max_params;
+            for j in 0..np {
+                h_pso_params[base + j] = inp.pso_params[j];
+                h_prior_centers[base + j] = inp.prior_centers[j];
+                h_prior_widths[base + j] = inp.prior_widths[j];
+            }
+            h_model_ids[i] = inp.model_id as i32;
+            h_n_params[i] = np as i32;
+            h_se_idx[i] = inp.se_idx as i32;
+        }
+
+        // Upload to GPU
+        let d_pso = DevBuf::upload(&h_pso_params)?;
+        let d_model_ids = DevBuf::upload(&h_model_ids)?;
+        let d_n_params = DevBuf::upload(&h_n_params)?;
+        let d_se_idx = DevBuf::upload(&h_se_idx)?;
+        let d_prior_centers = DevBuf::upload(&h_prior_centers)?;
+        let d_prior_widths = DevBuf::upload(&h_prior_widths)?;
+
+        // Output buffers
+        let d_out_mu = DevBuf::alloc(n_sources * max_params * size_of::<f64>())?;
+        let d_out_ls = DevBuf::alloc(n_sources * max_params * size_of::<f64>())?;
+        let d_out_elbo = DevBuf::alloc(n_sources * size_of::<f64>())?;
+
+        // One warp (32 threads) per source; block=128 = 4 warps per block
+        let block: c_int = 128;
+        let total_threads = (n_sources as c_int) * 32;
+        let grid: c_int = (total_threads + block - 1) / block;
+
+        unsafe {
+            launch_batch_svi_fit(
+                data.d_times.ptr as _,
+                data.d_flux.ptr as _,
+                data.d_obs_var.ptr as _,
+                data.d_is_upper.ptr as _,
+                data.d_upper_flux.ptr as _,
+                data.d_offsets.ptr as _,
+                d_pso.ptr as _,
+                d_model_ids.ptr as _,
+                d_n_params.ptr as _,
+                d_se_idx.ptr as _,
+                d_prior_centers.ptr as _,
+                d_prior_widths.ptr as _,
+                d_out_mu.ptr as _,
+                d_out_ls.ptr as _,
+                d_out_elbo.ptr as _,
+                n_sources as c_int,
+                max_params as c_int,
+                n_steps as c_int,
+                n_samples as c_int,
+                lr,
+                grid,
+                block,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        // Download results
+        let mut h_mu = vec![0.0f64; n_sources * max_params];
+        let mut h_ls = vec![0.0f64; n_sources * max_params];
+        let mut h_elbo = vec![0.0f64; n_sources];
+        d_out_mu.download_into(&mut h_mu)?;
+        d_out_ls.download_into(&mut h_ls)?;
+        d_out_elbo.download_into(&mut h_elbo)?;
+
+        let results: Vec<SviBatchOutput> = (0..n_sources)
+            .map(|i| {
+                let np = inputs[i].pso_params.len().min(max_params);
+                let base = i * max_params;
+                let mu = h_mu[base..base + np].to_vec();
+                let log_sigma = h_ls[base..base + np].to_vec();
+                SviBatchOutput {
+                    mu,
+                    log_sigma,
+                    elbo: h_elbo[i],
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+}
+
+/// Input for GPU SVI fit for one source.
+pub struct SviBatchInput {
+    pub model_id: usize,
+    pub pso_params: Vec<f64>,
+    pub se_idx: usize,
+    pub prior_centers: Vec<f64>,
+    pub prior_widths: Vec<f64>,
+}
+
+/// Output from GPU SVI fit for one source.
+#[derive(Clone, Debug)]
+pub struct SviBatchOutput {
+    pub mu: Vec<f64>,
+    pub log_sigma: Vec<f64>,
+    pub elbo: f64,
+}
+
+/// Input data for one source's 2D GP fit.
+pub struct Gp2dInput {
+    pub times: Vec<f64>,
+    pub waves: Vec<f64>,  // log10(wavelength_angstrom) for each obs
+    pub mags: Vec<f64>,
+    pub noise_var: Vec<f64>,
+}
+
+/// Output from batch 2D GP fitting for one source.
+pub struct Gp2dOutput {
+    pub pred_grid: Vec<f64>,
+    pub std_grid: Vec<f64>,
+    pub amp: f64,
+    pub ls_time: f64,
+    pub ls_wave: f64,
+    pub train_rms: f64,
+    pub n_train: usize,
+    pub success: bool,
 }
 
 // ---------------------------------------------------------------------------

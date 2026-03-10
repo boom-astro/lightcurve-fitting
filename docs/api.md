@@ -159,6 +159,7 @@ Fit parametric lightcurve models (Bazin, Villar, TDE, etc.) to all bands.
 | `per_model_chi2` | dict[str, float or null] | Chi-squared for each model attempted |
 | `per_model_params` | dict[str, list[float]] | PSO params for each model (only when `fit_all_models=True`) |
 | `uncertainty_method` | str | Which uncertainty method was used (`"Svi"` or `"Laplace"`) |
+| `multi_bazin` | dict or null | MultiBazin greedy fit result (first band only). Keys: `best_k` (int), `params` (list), `cost` (float), `bic` (float), `per_k_cost` (list), `per_k_bic` (list). `best_k > 1` indicates multi-peaked or recurrent behavior. |
 
 ### `fit_thermal(bands) -> dict or None`
 

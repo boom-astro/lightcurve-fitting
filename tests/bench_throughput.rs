@@ -264,6 +264,13 @@ fn parametric_point_scaling() {
                 });
                 print_row("GPU", FIXED_SOURCES, n_pts, wall);
                 csv.add_row("parametric", "GPU", FIXED_SOURCES, n_pts, wall);
+
+                // MultiBazin GPU (greedy K=1..4)
+                let wall = bench_best_of(N_WARMUP, N_REPEAT, || {
+                    let _ = ctx.batch_pso_multi_bazin(&data, &batch_sources, 30, 60, 12, 42).unwrap();
+                });
+                print_row("GPU-MB", FIXED_SOURCES, n_pts, wall);
+                csv.add_row("multi_bazin", "GPU", FIXED_SOURCES, n_pts, wall);
             }
         }
     }
@@ -314,6 +321,13 @@ fn parametric_source_scaling() {
                 });
                 print_row("GPU", n_src, FIXED_POINTS, wall);
                 csv.add_row("parametric", "GPU", n_src, FIXED_POINTS, wall);
+
+                // MultiBazin GPU (greedy K=1..4)
+                let wall = bench_best_of(N_WARMUP, N_REPEAT, || {
+                    let _ = ctx.batch_pso_multi_bazin(&data, &batch_sources, 30, 60, 12, 42).unwrap();
+                });
+                print_row("GPU-MB", n_src, FIXED_POINTS, wall);
+                csv.add_row("multi_bazin", "GPU", n_src, FIXED_POINTS, wall);
             }
         }
     }

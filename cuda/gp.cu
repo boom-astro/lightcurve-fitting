@@ -88,17 +88,15 @@ __device__ double gp_try_hyperparams(
     gp_solve_l(K, y_c, tmp, m);
     gp_solve_lt(K, tmp, alpha, m);
 
-    double rms = 0.0;
-    for (int i = 0; i < m; i++) {
-        double pred = 0.0;
-        for (int j = 0; j < m; j++)
-            pred += gp_rbf(sub_t[i], sub_t[j], amp, inv_2ls2) * alpha[j];
-        pred += y_mean;
-        double diff = pred - sub_v[i];
-        rms += diff * diff;
-    }
-    rms = sqrt(rms / (double)m);
-    return isfinite(rms) ? rms : 1e99;
+    // Negative log marginal likelihood (NLML):
+    // 0.5 * y' * alpha + sum(log(diag(L))) + 0.5 * m * log(2*pi)
+    // K now holds L from Cholesky; alpha = K^{-1} * y_c
+    double data_fit = 0.0;
+    for (int i = 0; i < m; i++) data_fit += y_c[i] * alpha[i];
+    double log_det = 0.0;
+    for (int i = 0; i < m; i++) log_det += log(K[i * m + i]);
+    double nlml = 0.5 * data_fit + log_det + 0.5 * (double)m * log(2.0 * M_PI);
+    return isfinite(nlml) ? nlml : 1e99;
 }
 
 // =========================================================================

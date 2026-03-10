@@ -23,6 +23,7 @@ DOCS_DIR = os.path.join(SCRIPT_DIR, "..", "docs")
 LINES = [
     ("parametric",    "GPU",     "#1f77b4", "-",  "o", 2.5),
     ("nonparametric", "GPU",     "#ff7f0e", "-",  "s", 2.5),
+    ("multi_bazin",   "GPU",     "#2ca02c", "-",  "D", 2.5),
     ("parametric",    "CPU-par", "#1f77b4", ":",  "o", 2),
     ("parametric",    "CPU",     "#1f77b4", "--", "o", 2),
     ("nonparametric", "CPU",     "#ff7f0e", "--", "s", 2),
@@ -80,13 +81,14 @@ def main():
     fitter_handles = [
         Line2D([0], [0], color="#1f77b4", marker="o", linestyle="-", linewidth=2, markersize=7),
         Line2D([0], [0], color="#ff7f0e", marker="s", linestyle="-", linewidth=2, markersize=7),
+        Line2D([0], [0], color="#2ca02c", marker="D", linestyle="-", linewidth=2, markersize=7),
     ]
     backend_handles = [
         Line2D([0], [0], color="black", linestyle="-", linewidth=2.5),
         Line2D([0], [0], color="black", linestyle=":", linewidth=2),
         Line2D([0], [0], color="black", linestyle="--", linewidth=2),
     ]
-    leg1 = ax.legend(fitter_handles, ["parametric", "nonparametric"],
+    leg1 = ax.legend(fitter_handles, ["parametric", "nonparametric", "multi_bazin"],
                      fontsize=10, loc="upper left", title="Fitter", title_fontsize=10)
     ax.add_artist(leg1)
     ax.legend(backend_handles, ["GPU", "CPU-par (32t)", "CPU"],

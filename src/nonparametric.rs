@@ -746,8 +746,8 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
     let times_pred: Vec<f64> = (0..n_pred)
         .map(|i| t_min + (i as f64) * duration / (n_pred - 1) as f64)
         .collect();
-    let amp_candidates: Vec<f64> = vec![0.1, 0.3];
-    let ls_factors: &[f64] = &[6.0, 12.0, 24.0];
+    let amp_candidates: Vec<f64> = vec![0.3, 1.0, 3.0, 10.0];
+    let ls_factors: &[f64] = &[3.0, 6.0, 12.0, 24.0, 48.0];
     let ls_candidates: Vec<f64> = ls_factors.iter().map(|f| (duration / f).max(0.1)).collect();
 
     // Flatten all bands from all sources into a single batch
@@ -1016,8 +1016,8 @@ pub fn fit_nonparametric_with_opts(
     let times_pred: Vec<f64> = (0..n_pred)
         .map(|i| t_min + (i as f64) * duration / (n_pred - 1) as f64)
         .collect();
-    let amp_candidates: &[f64] = &[0.1, 0.3];
-    let ls_factors: &[f64] = &[6.0, 12.0, 24.0];
+    let amp_candidates: &[f64] = &[0.3, 1.0, 3.0, 10.0];
+    let ls_factors: &[f64] = &[3.0, 6.0, 12.0, 24.0, 48.0];
 
     // Process bands in parallel
     let band_outputs: Vec<_> = bands.par_iter()
