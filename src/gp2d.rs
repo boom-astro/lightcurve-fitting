@@ -79,12 +79,21 @@ fn solve_lt(l: &[f64], b: &[f64], x: &mut [f64], n: usize) {
 
 fn band_wavelength(band: &str) -> Option<f64> {
     match band {
-        "u" | "lsstu" => Some(3671.0),
+        "u" | "lsstu" | "U" => Some(3671.0),
+        "B" => Some(4361.0),
         "g" | "ztfg" | "lsstg" => Some(4770.0),
+        "c" => Some(5330.0),   // ATLAS cyan
+        "V" => Some(5448.0),
         "r" | "ztfr" | "lsstr" => Some(6231.0),
+        "R" => Some(6555.0),
+        "o" => Some(6790.0),   // ATLAS orange
         "i" | "ztfi" | "lssti" => Some(7625.0),
+        "I" => Some(8060.0),
         "z" | "lsstz" => Some(8691.0),
         "y" | "lssty" => Some(9712.0),
+        "J" => Some(12350.0),
+        "H" => Some(16620.0),
+        "K" | "Ks" => Some(21590.0),
         _ => None,
     }
 }

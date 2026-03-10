@@ -42,12 +42,21 @@ fn find_band_name<'a>(bands: &'a HashMap<String, BandData>, aliases: &[&str]) ->
 /// and short names ("u", "g", "r", "i", "z", "y").
 fn band_wavelength(band: &str) -> Option<f64> {
     match band {
-        "u" | "lsstu" => Some(LAMBDA_U),
+        "u" | "lsstu" | "U" => Some(LAMBDA_U),
+        "B" => Some(4361.0),
         "g" | "ztfg" | "lsstg" => Some(LAMBDA_G),
+        "c" => Some(5330.0),   // ATLAS cyan
+        "V" => Some(5448.0),
         "r" | "ztfr" | "lsstr" => Some(LAMBDA_R),
+        "R" => Some(6555.0),
+        "o" => Some(6790.0),   // ATLAS orange
         "i" | "ztfi" | "lssti" => Some(LAMBDA_I),
+        "I" => Some(8060.0),
         "z" | "lsstz" => Some(LAMBDA_Z),
         "y" | "lssty" => Some(LAMBDA_Y),
+        "J" => Some(12350.0),
+        "H" => Some(16620.0),
+        "K" | "Ks" => Some(21590.0),
         _ => None,
     }
 }

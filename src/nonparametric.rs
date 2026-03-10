@@ -872,7 +872,10 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
             .map(|(i, _)| i)
             .unwrap_or(0);
         let t0 = times_pred[peak_idx];
-        let peak_mag = pred[peak_idx];
+        // Clamp peak_mag: GP can extrapolate wildly, so don't let the peak
+        // be brighter than the brightest observation minus a 2-mag margin.
+        let obs_min_mag = det_data.values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let peak_mag = pred[peak_idx].max(obs_min_mag - 2.0);
 
         let t_last = band_data.times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let t_min = *times_pred.first().unwrap_or(&t0);
@@ -1319,7 +1322,8 @@ fn process_band(
         .map(|(i, _)| i)
         .unwrap_or(0);
     let t0 = times_pred[peak_idx];
-    let peak_mag = pred[peak_idx];
+    let obs_min_mag = det_data.values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let peak_mag = pred[peak_idx].max(obs_min_mag - 2.0);
 
     let t_last = band_data
         .times

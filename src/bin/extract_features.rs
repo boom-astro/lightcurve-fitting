@@ -132,38 +132,33 @@ fn read_photometry_npz(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec
 // Datacube CSV reader (GOPREAUX format)
 // ---------------------------------------------------------------------------
 
-fn read_photometry_datacube(dir: &Path, obj_id: &str) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
-    // Find the datacube_mangled.csv file
-    let csv_name = format!("{}_datacube_mangled.csv", obj_id);
-    let csv_path = dir.join(&csv_name);
-
-    if !csv_path.exists() {
-        // Search subdirectories
-        return find_datacube_recursive(dir, obj_id);
-    }
-
-    parse_datacube_csv(&csv_path)
-}
-
-fn find_datacube_recursive(dir: &Path, obj_id: &str) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
-    let csv_name = format!("{}_datacube_mangled.csv", obj_id);
-
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        if path.is_dir() {
-            // Check if this dir contains the object
-            let candidate = path.join(&csv_name);
-            if candidate.exists() {
-                return parse_datacube_csv(&candidate);
-            }
-            // Check one level deeper (Type/Subtype/Name/)
-            if let Some(result) = find_datacube_recursive(&path, obj_id) {
-                return Some(result);
+/// Build an index of all datacube files in a directory tree (walk once).
+fn build_datacube_index(dir: &Path) -> HashMap<String, PathBuf> {
+    let mut index = HashMap::new();
+    fn walk(dir: &Path, index: &mut HashMap<String, PathBuf>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, index);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with("_datacube_mangled.csv") {
+                    let obj_id = name.trim_end_matches("_datacube_mangled.csv").to_string();
+                    index.insert(obj_id, path);
+                }
             }
         }
     }
-    None
+    walk(dir, &mut index);
+    index
+}
+
+fn read_photometry_datacube(index: &HashMap<String, PathBuf>, obj_id: &str) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+    let path = index.get(obj_id)?;
+    parse_datacube_csv(path)
 }
 
 fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
@@ -334,6 +329,16 @@ fn main() {
         return;
     }
 
+    // Build datacube file index (walk directory tree once)
+    let datacube_index = if cli.format == "datacube" {
+        eprintln!("Indexing datacube files...");
+        let idx = build_datacube_index(&cli.input_dir);
+        eprintln!("Found {} datacube files.", idx.len());
+        idx
+    } else {
+        HashMap::new()
+    };
+
     // Initialize GPU
     eprintln!("Initializing GPU device {}...", cli.gpu_device);
     let gpu = GpuContext::new(cli.gpu_device).expect("Failed to initialize GPU");
@@ -373,7 +378,7 @@ fn main() {
                     let npz_path = cli.input_dir.join(&entry.split).join(format!("{}.npz", entry.id));
                     read_photometry_npz(&npz_path)
                 }
-                "datacube" => read_photometry_datacube(&cli.input_dir, &entry.id),
+                "datacube" => read_photometry_datacube(&datacube_index, &entry.id),
                 _ => None,
             };
 
