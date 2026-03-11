@@ -148,6 +148,15 @@ pub struct NonparametricBandResult {
     pub gp_fit_amp: Option<f64>,
     /// Best-fit GP kernel lengthscale (ρ in RBF kernel), in days.
     pub gp_fit_lengthscale: Option<f64>,
+    /// Stetson K: robust kurtosis measure for variability.
+    /// ~0.798 for Gaussian noise, >1 for peaked/bursty, <0.798 for flat/sinusoidal.
+    pub stetson_k: Option<f64>,
+    /// Excess variance: intrinsic variance above measurement noise.
+    /// σ²_rms = [Σ((m_i - mean)² - σ_i²)] / (N · mean²). Negative → noise-dominated.
+    pub excess_variance: Option<f64>,
+    /// CUSUM range: max(S) - min(S) of cumulative sum of deviations from mean.
+    /// Normalized by N · σ. Large for trending sources, small for stationary.
+    pub cusum_range: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +605,79 @@ fn compute_von_neumann_ratio(times: &[f64], mags: &[f64]) -> f64 {
     delta_sq / ((n - 1.0) * variance)
 }
 
+/// Stetson K: robust kurtosis statistic.
+/// K = (1/N) Σ|δ_i| / sqrt((1/N) Σδ_i²), where δ_i = (m_i - mean) / σ_i.
+/// Returns ~0.798 for Gaussian noise, >1 for peaked/bursty distributions.
+fn compute_stetson_k(mags: &[f64], errors: &[f64]) -> f64 {
+    let n = mags.len();
+    if n < 5 {
+        return f64::NAN;
+    }
+    // Weighted mean
+    let weights: Vec<f64> = errors.iter().map(|&e| 1.0 / (e * e).max(1e-30)).collect();
+    let w_sum: f64 = weights.iter().sum();
+    let mean = mags.iter().zip(&weights).map(|(&m, &w)| m * w).sum::<f64>() / w_sum;
+
+    // Residuals normalized by errors
+    let deltas: Vec<f64> = mags.iter().zip(errors.iter()).map(|(&m, &e)| (m - mean) / e.max(1e-15)).collect();
+
+    let sum_abs: f64 = deltas.iter().map(|d| d.abs()).sum();
+    let sum_sq: f64 = deltas.iter().map(|d| d * d).sum();
+
+    let nf = n as f64;
+    let mean_abs = sum_abs / nf;
+    let rms = (sum_sq / nf).sqrt();
+
+    if rms < 1e-20 {
+        return f64::NAN;
+    }
+    mean_abs / rms
+}
+
+/// Excess variance: intrinsic variance above measurement noise.
+/// σ²_NXS = [Σ((m_i - mean)² - σ_i²)] / (N · mean²).
+fn compute_excess_variance(mags: &[f64], errors: &[f64]) -> f64 {
+    let n = mags.len();
+    if n < 5 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let mean = mags.iter().sum::<f64>() / nf;
+    if mean.abs() < 1e-20 {
+        return f64::NAN;
+    }
+    let excess: f64 = mags.iter().zip(errors.iter())
+        .map(|(&m, &e)| (m - mean).powi(2) - e * e)
+        .sum();
+    excess / (nf * mean * mean)
+}
+
+/// CUSUM range: normalized range of cumulative sum of deviations.
+/// S_i = Σ_{j=1..i} (m_j - mean) / (N · σ). Returns max(S) - min(S).
+fn compute_cusum_range(mags: &[f64]) -> f64 {
+    let n = mags.len();
+    if n < 5 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let mean = mags.iter().sum::<f64>() / nf;
+    let std = (mags.iter().map(|&m| (m - mean).powi(2)).sum::<f64>() / (nf - 1.0)).sqrt();
+    if std < 1e-20 {
+        return f64::NAN;
+    }
+    let norm = nf * std;
+    let mut cumsum = 0.0;
+    let mut s_min = f64::INFINITY;
+    let mut s_max = f64::NEG_INFINITY;
+    for &m in mags {
+        cumsum += m - mean;
+        let s = cumsum / norm;
+        s_min = s_min.min(s);
+        s_max = s_max.max(s);
+    }
+    s_max - s_min
+}
+
 /// Pre-peak baseline features from raw data.
 /// Returns (pre_peak_rms, rise_amplitude_over_noise).
 fn compute_pre_peak_features(
@@ -926,6 +1008,9 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
         );
         let monotonicity = compute_post_peak_monotonicity(pred, peak_idx);
         let n_local_maxima = count_local_maxima(pred, 0.1);
+        let stetson_k = compute_stetson_k(&band_data.values, &band_data.errors);
+        let excess_var = compute_excess_variance(&band_data.values, &band_data.errors);
+        let cusum = compute_cusum_range(&band_data.values);
 
         let result = NonparametricBandResult {
             band: band_name.to_string(),
@@ -980,6 +1065,9 @@ pub fn fit_nonparametric_batch_gpu_with_opts(
             gp_fit_lengthscale: if let Some(ref gp) = gpu_out.dense_gp {
                 finite_or_none(gp.kernel_lengthscale())
             } else { None },
+            stetson_k: finite_or_none(stetson_k),
+            excess_variance: finite_or_none(excess_var),
+            cusum_range: finite_or_none(cusum),
         };
 
         let (ref mut src_results, ref mut src_gps) = results[meta.source_idx];
@@ -1375,6 +1463,9 @@ fn process_band(
     );
     let monotonicity = compute_post_peak_monotonicity(&pred, peak_idx);
     let n_local_maxima = count_local_maxima(&pred, 0.1);
+    let stetson_k = compute_stetson_k(&band_data.values, &band_data.errors);
+    let excess_var = compute_excess_variance(&band_data.values, &band_data.errors);
+    let cusum = compute_cusum_range(&band_data.values);
 
     let result = NonparametricBandResult {
         band: band_name.to_string(),
@@ -1425,6 +1516,9 @@ fn process_band(
         n_upper_limits,
         gp_fit_amp: finite_or_none(fit_amp),
         gp_fit_lengthscale: finite_or_none(fit_lengthscale),
+        stetson_k: finite_or_none(stetson_k),
+        excess_variance: finite_or_none(excess_var),
+        cusum_range: finite_or_none(cusum),
     };
 
     Some((result, thermal_gp))
