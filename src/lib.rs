@@ -17,7 +17,7 @@ pub use nonparametric::{fit_nonparametric, fit_nonparametric_with_opts, Nonparam
 pub use nonparametric::{fit_nonparametric_batch_gpu, fit_nonparametric_batch_gpu_with_opts};
 #[cfg(feature = "cuda")]
 pub use gpu::{GpBandInput, GpBandOutput};
-pub use parametric::{eval_model_flux, metzger_kn_mags, fit_parametric, finalize_parametric_from_gpu, finalize_parametric_with_gpu_svi, svi_prior_for_model, svi_model_meta, GpuPsoBandResult, MultiBazinResult, ParametricBandResult, SviModelName, UncertaintyMethod};
+pub use parametric::{eval_model_flux, metzger_kn_mags, fit_parametric, finalize_parametric_from_gpu, finalize_parametric_with_gpu_svi, finalize_all_models_with_gpu_svi, svi_prior_for_model, svi_model_meta, GpuPsoBandResult, MultiBazinResult, ParametricBandResult, SviModelName, UncertaintyMethod};
 pub use thermal::{fit_thermal, ThermalResult};
 pub use gp::fit_gp_predict;
 pub use gp2d::{fit_gp_2d, fit_gp_2d_with_thermal, get_band_wavelength, DenseGP2D, Gp2dResult, Gp2dThermalResult};

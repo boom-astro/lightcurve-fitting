@@ -2875,6 +2875,137 @@ pub fn finalize_parametric_with_gpu_svi(
     results
 }
 
+/// Finalize parametric results for ALL models (not just the best).
+///
+/// `gpu_results` and `svi_outputs` are parallel arrays, one entry per (band, model)
+/// pair. `band_names` gives the band name for each entry (matching the ordering).
+///
+/// Returns one `ParametricBandResult` per (band, model) pair.
+pub fn finalize_all_models_with_gpu_svi(
+    flux_bands: &HashMap<String, BandData>,
+    gpu_results: &[GpuPsoBandResult],
+    svi_outputs: &[(Vec<f64>, Vec<f64>, f64)],
+    band_names: &[String],
+) -> Vec<ParametricBandResult> {
+    if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
+        return Vec::new();
+    }
+
+    let zp = 23.9;
+    let snr_threshold = 3.0;
+
+    // Build BandFitData for each unique band
+    let mut band_data_map: HashMap<String, (BandFitData, Vec<f64>)> = HashMap::new();
+
+    for (band_name, band_data) in flux_bands {
+        let fluxes = &band_data.values;
+        let flux_errs = &band_data.errors;
+        let times = &band_data.times;
+
+        if fluxes.is_empty() { continue; }
+        let peak_flux = fluxes.iter().cloned().fold(f64::MIN, f64::max);
+        if peak_flux <= 0.0 { continue; }
+
+        let normalized_flux: Vec<f64> = fluxes.iter().map(|f| f / peak_flux).collect();
+        let normalized_err: Vec<f64> = flux_errs.iter().map(|e| e / peak_flux).collect();
+
+        let is_upper: Vec<bool> = fluxes.iter().zip(flux_errs.iter())
+            .map(|(f, e)| *e > 0.0 && (*f / *e) < snr_threshold).collect();
+        let upper_flux: Vec<f64> = flux_errs.iter()
+            .map(|e| snr_threshold * e / peak_flux).collect();
+
+        let mut frac_noises: Vec<f64> = normalized_flux.iter().zip(normalized_err.iter())
+            .filter_map(|(f, e)| if *f > 0.0 { Some(e / f) } else { None })
+            .collect();
+        let noise_frac_median = median_f64(&mut frac_noises).unwrap_or(0.0);
+
+        let mags_obs: Vec<f64> = fluxes.iter().map(|f| flux_to_mag(*f, zp)).collect();
+        let obs_var: Vec<f64> = normalized_err.iter().map(|e| e * e + 1e-10).collect();
+
+        let fit_data = BandFitData {
+            times: times.clone(),
+            flux: normalized_flux,
+            flux_err: normalized_err,
+            obs_var,
+            is_upper,
+            upper_flux,
+            noise_frac_median,
+            peak_flux_obs: peak_flux,
+        };
+
+        band_data_map.insert(band_name.clone(), (fit_data, mags_obs));
+    }
+
+    let mut results: Vec<ParametricBandResult> = Vec::new();
+
+    for (idx, gpu) in gpu_results.iter().enumerate() {
+        if idx >= svi_outputs.len() || idx >= band_names.len() { break; }
+        let band_name = &band_names[idx];
+        let (ref svi_mu, ref svi_log_sigma, svi_elbo) = svi_outputs[idx];
+
+        let (data, mags_obs) = match band_data_map.get(band_name) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if gpu.pso_params.is_empty() || svi_mu.is_empty() { continue; }
+
+        let pso_model = SviModel::from_name(&gpu.model);
+
+        let mut svi_result = SviFitResult {
+            model: pso_model,
+            mu: svi_mu.clone(),
+            log_sigma: svi_log_sigma.clone(),
+            elbo: svi_elbo,
+        };
+        profile_t0_refine(&mut svi_result, data);
+
+        // Mag-space chi2
+        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
+        let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
+        let mag_preds = if use_pso_for_mag {
+            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
+        } else {
+            svi_preds
+        };
+        let mut mag_chi2_sum = 0.0;
+        let mut mag_chi2_n = 0usize;
+        for i in 0..data.times.len() {
+            let pred_flux = mag_preds[i] * data.peak_flux_obs;
+            if pred_flux > 0.0 && data.flux[i] * data.peak_flux_obs > 0.0 {
+                let mag_pred = flux_to_mag(pred_flux, zp);
+                let mag_obs = mags_obs[i];
+                let mag_err = 1.0857 * data.flux_err[i] / data.flux[i];
+                if mag_err > 0.0 {
+                    let residual = mag_obs - mag_pred;
+                    mag_chi2_sum += residual * residual / (mag_err * mag_err);
+                    mag_chi2_n += 1;
+                }
+            }
+        }
+        let mag_chi2 = if mag_chi2_n > 0 { mag_chi2_sum / mag_chi2_n as f64 } else { f64::NAN };
+
+        results.push(ParametricBandResult {
+            band: band_name.clone(),
+            model: gpu.model.clone(),
+            pso_params: gpu.pso_params.clone(),
+            pso_chi2: finite_or_none(gpu.pso_cost),
+            svi_mu: svi_result.mu,
+            svi_log_sigma: svi_result.log_sigma,
+            svi_elbo: finite_or_none(svi_result.elbo),
+            n_obs: data.times.len(),
+            mag_chi2: finite_or_none(mag_chi2),
+            per_model_chi2: gpu.per_model_chi2.clone(),
+            per_model_params: HashMap::new(), // Not needed — each model has its own entry
+            uncertainty_method: UncertaintyMethod::Svi,
+            multi_bazin: gpu.multi_bazin.clone(),
+        });
+    }
+
+    results
+}
+
 /// Fit parametric lightcurve models to all bands.
 ///
 /// `bands` maps band names to `BandData` containing flux values.

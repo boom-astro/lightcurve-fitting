@@ -687,6 +687,23 @@ impl GpuContext {
         Ok(best_model.into_iter().zip(best_result).collect())
     }
 
+    /// Run PSO for **every** model on all sources, returning all results.
+    /// Returns a Vec (per model) of Vec (per source) of (GpuModelName, BatchPsoResult).
+    pub fn batch_all_models(
+        &self,
+        data: &GpuBatchData,
+        n_particles: usize,
+        max_iters: usize,
+        stall_iters: usize,
+    ) -> Result<Vec<(GpuModelName, Vec<BatchPsoResult>)>, String> {
+        let mut all = Vec::with_capacity(ALL_GPU_MODELS.len());
+        for &model in ALL_GPU_MODELS {
+            let results = self.batch_pso(model, data, n_particles, max_iters, stall_iters, 42)?;
+            all.push((model, results));
+        }
+        Ok(all)
+    }
+
     // -----------------------------------------------------------------------
     // Batch MultiBazin PSO
     // -----------------------------------------------------------------------

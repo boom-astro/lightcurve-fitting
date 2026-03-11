@@ -22,10 +22,10 @@ use ndarray_npy::NpzReader;
 use lightcurve_fitting::{
     BandData, build_flux_bands, build_mag_bands,
     fit_nonparametric_batch_gpu, fit_gp_2d_batch_gpu,
-    finalize_parametric_with_gpu_svi, svi_prior_for_model, svi_model_meta,
-    GpuPsoBandResult, SviBatchInput,
+    finalize_all_models_with_gpu_svi, svi_prior_for_model, svi_model_meta,
+    GpuPsoBandResult, SviBatchInput, SviModelName,
     features::extract_features_from_results,
-    gpu::{GpuContext, BatchSource, GpuBatchData},
+    gpu::{GpuContext, GpuModelName, BatchSource, GpuBatchData},
     thermal::fit_thermal,
 };
 
@@ -40,10 +40,11 @@ struct Cli {
     /// Source list CSV file.
     /// For NPZ format: obj_id,split columns.
     /// For datacube format: Name,Type,Subtype,... (GOPREAUX caat.csv).
+    /// For ZTF format: not required (sources discovered from directories).
     #[arg(long)]
-    source_list: PathBuf,
+    source_list: Option<PathBuf>,
 
-    /// Input format: "npz" (AppleCider) or "datacube" (GOPREAUX).
+    /// Input format: "npz" (AppleCider), "datacube" (GOPREAUX), or "ztf" (ZTF alerts).
     #[arg(long, default_value = "npz")]
     format: String,
 
@@ -237,6 +238,109 @@ fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
 }
 
 // ---------------------------------------------------------------------------
+// ZTF photometry reader (per-source directory with photometry.csv)
+// ---------------------------------------------------------------------------
+
+/// Read ZTF photometry.csv from a source directory.
+/// Columns: jd, fid (1=g, 2=r, 3=i), magpsf, sigmapsf, diffmaglim.
+/// Rows without magpsf are non-detections (upper limits via diffmaglim).
+fn read_photometry_ztf(dir: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+    let csv_path = dir.join("photometry.csv");
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(&csv_path).ok()?;
+
+    let headers = rdr.headers().ok()?.clone();
+    let jd_idx = headers.iter().position(|h| h == "jd")?;
+    let fid_idx = headers.iter().position(|h| h == "fid")?;
+    let mag_idx = headers.iter().position(|h| h == "magpsf")?;
+    let err_idx = headers.iter().position(|h| h == "sigmapsf")?;
+    let lim_idx = headers.iter().position(|h| h == "diffmaglim");
+
+    let mut times = Vec::new();
+    let mut mags = Vec::new();
+    let mut mag_errs = Vec::new();
+    let mut bands = Vec::new();
+
+    for result in rdr.records() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let jd: f64 = match record.get(jd_idx).and_then(|s| s.parse().ok()) {
+            Some(v) if v > 0.0 => v,
+            _ => continue,
+        };
+
+        let fid: i32 = match record.get(fid_idx).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            _ => continue,
+        };
+
+        let band = match fid {
+            1 => "g",
+            2 => "r",
+            3 => "i",
+            _ => continue,
+        };
+
+        // Detection: magpsf is present and valid
+        let mag_str = record.get(mag_idx).unwrap_or("").trim().to_string();
+        if let Ok(mag) = mag_str.parse::<f64>() {
+            if !mag.is_finite() { continue; }
+            let err: f64 = match record.get(err_idx).and_then(|s| s.parse::<f64>().ok()) {
+                Some(v) if v > 0.0 && v.is_finite() => v,
+                _ => continue,
+            };
+            times.push(jd);
+            mags.push(mag);
+            mag_errs.push(err);
+            bands.push(band.to_string());
+        } else if let Some(li) = lim_idx {
+            // Non-detection: use diffmaglim as upper limit magnitude with large error
+            if let Some(lim) = record.get(li).and_then(|s| s.parse::<f64>().ok()) {
+                if lim.is_finite() && lim > 0.0 {
+                    times.push(jd);
+                    mags.push(lim);
+                    mag_errs.push(1.0); // Large error → SNR < 3 → treated as upper limit
+                    bands.push(band.to_string());
+                }
+            }
+        }
+    }
+
+    if times.is_empty() { return None; }
+    Some((times, mags, mag_errs, bands))
+}
+
+/// Discover ZTF source directories (each contains photometry.csv).
+/// Uses DirEntry::file_type() to avoid extra stat calls on network filesystems.
+fn discover_ztf_sources(dir: &Path) -> Vec<SourceEntry> {
+    let mut entries = Vec::new();
+    let Ok(read_dir) = fs::read_dir(dir) else { return entries; };
+
+    for entry in read_dir.flatten() {
+        // Use cached file_type; follow symlinks if needed
+        let is_dir = entry.file_type()
+            .map(|ft| ft.is_dir() || (ft.is_symlink() && entry.path().is_dir()))
+            .unwrap_or(false);
+        if !is_dir { continue; }
+        let id = entry.file_name().to_string_lossy().to_string();
+        if !id.is_empty() && !id.starts_with('.') {
+            entries.push(SourceEntry {
+                id,
+                split: String::new(),
+                subtype: String::new(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries
+}
+
+// ---------------------------------------------------------------------------
 // Source list readers
 // ---------------------------------------------------------------------------
 
@@ -303,10 +407,17 @@ fn main() {
 
     // Read source list
     let sources = match cli.format.as_str() {
-        "npz" => read_npz_source_list(&cli.source_list),
-        "datacube" => read_datacube_source_list(&cli.source_list),
+        "npz" => {
+            let sl = cli.source_list.as_ref().expect("--source-list required for npz format");
+            read_npz_source_list(sl)
+        }
+        "datacube" => {
+            let sl = cli.source_list.as_ref().expect("--source-list required for datacube format");
+            read_datacube_source_list(sl)
+        }
+        "ztf" => discover_ztf_sources(&cli.input_dir),
         other => {
-            eprintln!("Unknown format '{}'. Use 'npz' or 'datacube'.", other);
+            eprintln!("Unknown format '{}'. Use 'npz', 'datacube', or 'ztf'.", other);
             std::process::exit(1);
         }
     };
@@ -379,6 +490,7 @@ fn main() {
                     read_photometry_npz(&npz_path)
                 }
                 "datacube" => read_photometry_datacube(&datacube_index, &entry.id),
+                "ztf" => read_photometry_ztf(&cli.input_dir.join(&entry.id)),
                 _ => None,
             };
 
@@ -463,7 +575,7 @@ fn main() {
             }
         }
 
-        // GPU PSO: run batch_model_select for all bands at once
+        // GPU PSO: run ALL 8 models for every band
         let t_step = Instant::now();
         let gpu_data = match GpuBatchData::new(&all_batch_sources) {
             Ok(d) => d,
@@ -474,10 +586,10 @@ fn main() {
             }
         };
 
-        let model_select_results = gpu.batch_model_select(
-            &gpu_data, 30, 60, 12, -5.0, // n_particles, max_iters, stall_iters, bazin_good_enough (run all)
+        let all_model_results = gpu.batch_all_models(
+            &gpu_data, 30, 60, 12,
         ).unwrap_or_default();
-        eprintln!("  Step 3a (PSO model select): {:.2}s", t_step.elapsed().as_secs_f64());
+        eprintln!("  Step 3a (PSO all models): {:.2}s", t_step.elapsed().as_secs_f64());
 
         // GPU MultiBazin for the first (most-populated) band of each source
         let t_step = Instant::now();
@@ -489,7 +601,6 @@ fn main() {
             }
         }
 
-        // Build BatchSources for just the first bands
         let mb_sources: Vec<BatchSource> = first_band_indices.iter()
             .map(|&bi| all_batch_sources[bi].clone())
             .collect();
@@ -498,18 +609,37 @@ fn main() {
             gpu.batch_pso_multi_bazin(data, &mb_sources, 30, 60, 12, 42).ok()
         });
 
-        // Assemble per-source GpuPsoBandResult arrays
+        // Assemble per-source, per-band, per-model GpuPsoBandResult arrays
+        // per_source_gpu_results[vi] has one entry per (band, model) pair
         let n_valid = valid_indices.len();
+        let n_bands_total = all_batch_sources.len();
+
+        // Collect all per-model chi2 and params per band
+        let mut per_band_model_chi2: Vec<HashMap<SviModelName, Option<f64>>> = vec![HashMap::new(); n_bands_total];
+        let mut per_band_model_params: Vec<HashMap<SviModelName, Vec<f64>>> = vec![HashMap::new(); n_bands_total];
+        let mut per_band_best_model: Vec<(GpuModelName, f64)> = vec![(GpuModelName::Bazin, f64::INFINITY); n_bands_total];
+
+        for (model_name, ref results) in &all_model_results {
+            let svi_name = model_name.to_svi_name();
+            for (bi, r) in results.iter().enumerate() {
+                per_band_model_chi2[bi].insert(svi_name.clone(), Some(r.cost * 2.0));
+                per_band_model_params[bi].insert(svi_name.clone(), r.params.clone());
+                if r.cost < per_band_best_model[bi].1 {
+                    per_band_best_model[bi] = (*model_name, r.cost);
+                }
+            }
+        }
+
+        // Build per-source GpuPsoBandResult arrays — one entry per (band, model)
+        // Also build a flat list + observation-data mapping for SVI
+        let n_models = all_model_results.len();
         let mut per_source_gpu_results: Vec<Vec<GpuPsoBandResult>> = vec![Vec::new(); n_valid];
+        let mut per_source_band_names: Vec<Vec<String>> = vec![Vec::new(); n_valid]; // band name for each entry
+        let mut svi_inputs: Vec<SviBatchInput> = Vec::new();
+        let mut svi_obs_sources: Vec<BatchSource> = Vec::new(); // obs data for each SVI entry
+        let mut svi_result_map: Vec<(usize, usize)> = Vec::new(); // (vi, idx in per_source_gpu_results[vi])
 
         for (bi, (vi, _band_name)) in band_map.iter().enumerate() {
-            if bi >= model_select_results.len() { break; }
-            let (gpu_model, ref pso_result) = model_select_results[bi];
-
-            // per_model_chi2: we only have the best from batch_model_select
-            let mut per_model_chi2 = HashMap::new();
-            per_model_chi2.insert(gpu_model.to_svi_name(), Some(pso_result.cost * 2.0));
-
             // MultiBazin: only for the first band of this source
             let mb = if Some(bi) == first_band_indices.iter().find(|&&fbi| band_map[fbi].0 == *vi).copied() {
                 let mb_idx = first_band_indices.iter().position(|&fbi| fbi == bi);
@@ -520,77 +650,69 @@ fn main() {
                 None
             };
 
-            per_source_gpu_results[*vi].push(GpuPsoBandResult {
-                model: gpu_model.to_svi_name(),
-                pso_params: pso_result.params.clone(),
-                pso_cost: pso_result.cost,
-                per_model_chi2,
-                per_model_params: HashMap::new(),
-                multi_bazin: mb,
-            });
-        }
-        eprintln!("  Step 3b (MultiBazin + assemble): {:.2}s", t_step.elapsed().as_secs_f64());
+            for (model_name, ref model_results) in &all_model_results {
+                if bi >= model_results.len() { continue; }
+                let ref pso_result = model_results[bi];
+                let svi_name = model_name.to_svi_name();
 
-        // ---- Step 4: GPU SVI + thermal + feature extraction ----
-        let t_step = Instant::now();
+                let (best_model, _) = per_band_best_model[bi];
+                let gpu_res_idx = per_source_gpu_results[*vi].len();
 
-        // Build SVI batch inputs from PSO results (all bands across all sources)
-        let mut svi_inputs: Vec<SviBatchInput> = Vec::new();
-        let mut svi_band_map: Vec<(usize, usize)> = Vec::new(); // (source_vi, band_idx_in_source)
-        for vi in 0..n_valid {
-            for (bi, gpu_res) in per_source_gpu_results[vi].iter().enumerate() {
-                if gpu_res.pso_params.is_empty() { continue; }
-                let (model_id, _np, se_idx) = svi_model_meta(&gpu_res.model);
-                let (centers, widths) = svi_prior_for_model(&gpu_res.model, &gpu_res.pso_params);
-                svi_inputs.push(SviBatchInput {
-                    model_id,
-                    pso_params: gpu_res.pso_params.clone(),
-                    se_idx,
-                    prior_centers: centers,
-                    prior_widths: widths,
+                per_source_gpu_results[*vi].push(GpuPsoBandResult {
+                    model: svi_name.clone(),
+                    pso_params: pso_result.params.clone(),
+                    pso_cost: pso_result.cost,
+                    per_model_chi2: per_band_model_chi2[bi].clone(),
+                    per_model_params: HashMap::new(),
+                    // MultiBazin only on best model of first band
+                    multi_bazin: if *model_name == best_model { mb.clone() } else { None },
                 });
-                svi_band_map.push((vi, bi));
+                per_source_band_names[*vi].push(band_map[bi].1.clone());
+
+                // Prepare SVI input for this (band, model) pair
+                if !pso_result.params.is_empty() {
+                    let (model_id, _np, se_idx) = svi_model_meta(&svi_name);
+                    let (centers, widths) = svi_prior_for_model(&svi_name, &pso_result.params);
+                    svi_inputs.push(SviBatchInput {
+                        model_id,
+                        pso_params: pso_result.params.clone(),
+                        se_idx,
+                        prior_centers: centers,
+                        prior_widths: widths,
+                    });
+                    svi_obs_sources.push(all_batch_sources[bi].clone());
+                    svi_result_map.push((*vi, gpu_res_idx));
+                }
             }
         }
+        eprintln!("  Step 3b (MultiBazin + assemble): {:.2}s ({} bands × {} models = {} SVI jobs)",
+            t_step.elapsed().as_secs_f64(), n_bands_total, n_models, svi_inputs.len());
 
-        // Run GPU SVI for all bands at once
+        // ---- Step 4: GPU SVI for all (band, model) pairs ----
+        let t_step = Instant::now();
+
         let svi_outputs = if !svi_inputs.is_empty() {
-            // We need a GpuBatchData with the same observation data layout as PSO
-            // Reuse all_batch_sources which is still in scope
-            let svi_gpu_data = GpuBatchData::new(&all_batch_sources).ok();
-            match svi_gpu_data {
-                Some(ref svi_data) if svi_inputs.len() == all_batch_sources.len() => {
-                    gpu.batch_svi_fit(svi_data, &svi_inputs, 150, 2, 0.01)
+            match GpuBatchData::new(&svi_obs_sources) {
+                Ok(svi_data) => {
+                    gpu.batch_svi_fit(&svi_data, &svi_inputs, 150, 2, 0.01)
                         .unwrap_or_default()
                 }
-                _ => {
-                    // Fallback: build SVI-specific batch data matching svi_inputs ordering
-                    // This happens if some bands were filtered. Build matching BatchSources.
-                    let svi_sources: Vec<BatchSource> = svi_band_map.iter().enumerate().map(|(si, _)| {
-                        // svi_inputs parallels band_map order since we iterate same order
-                        // Find corresponding all_batch_sources entry
-                        // The band_map entries are 1:1 with all_batch_sources
-                        all_batch_sources[si.min(all_batch_sources.len() - 1)].clone()
-                    }).collect();
-                    match GpuBatchData::new(&svi_sources) {
-                        Ok(svi_data) => {
-                            gpu.batch_svi_fit(&svi_data, &svi_inputs, 1000, 4, 0.01)
-                                .unwrap_or_default()
-                        }
-                        Err(_) => Vec::new(),
-                    }
-                }
+                Err(_) => Vec::new(),
             }
         } else {
             Vec::new()
         };
 
-        // Distribute GPU SVI outputs back to per-source arrays
+        // Distribute SVI outputs back to per-source arrays
         let mut per_source_svi: Vec<Vec<(Vec<f64>, Vec<f64>, f64)>> = vec![Vec::new(); n_valid];
+        // Initialize with empty entries matching per_source_gpu_results
+        for vi in 0..n_valid {
+            per_source_svi[vi] = vec![(Vec::new(), Vec::new(), f64::NAN); per_source_gpu_results[vi].len()];
+        }
         for (si, out) in svi_outputs.iter().enumerate() {
-            if si < svi_band_map.len() {
-                let (vi, _bi) = svi_band_map[si];
-                per_source_svi[vi].push((out.mu.clone(), out.log_sigma.clone(), out.elbo));
+            if si < svi_result_map.len() {
+                let (vi, idx) = svi_result_map[si];
+                per_source_svi[vi][idx] = (out.mu.clone(), out.log_sigma.clone(), out.elbo);
             }
         }
 
@@ -604,8 +726,9 @@ fn main() {
             let flux = flux_bands_vec[orig_idx].as_ref().unwrap();
             let mag = mag_bands_vec[orig_idx].as_ref().unwrap();
 
-            let param = finalize_parametric_with_gpu_svi(
+            let param = finalize_all_models_with_gpu_svi(
                 flux, &per_source_gpu_results[vi], &per_source_svi[vi],
+                &per_source_band_names[vi],
             );
 
             // Thermal using trained GPs from nonparametric
