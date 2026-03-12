@@ -495,7 +495,7 @@ fn main() {
             };
 
             match photo {
-                Some((times, mags, mag_errs, bands)) if times.len() >= 5 => {
+                Some((times, mags, mag_errs, bands)) if times.len() >= 2 => {
                     let mb = build_mag_bands(&times, &mags, &mag_errs, &bands);
                     let fb = build_flux_bands(&times, &mags, &mag_errs, &bands);
                     mag_bands_vec.push(Some(mb));
