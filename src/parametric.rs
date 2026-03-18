@@ -545,13 +545,56 @@ fn eval_model_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64]) {
 // ---------------------------------------------------------------------------
 
 // cache the ODE so we don't re-solve it when only t0 changes
-fn quantize(x: f64) -> i64 { (x * 1e5).round() as i64 }
+// Coarse quantization: PSO neighbors with similar physics share ODE solutions.
+fn quantize(x: f64) -> i64 { (x * 1e2).round() as i64 }
 
 type KnCacheKey = (i64, i64, i64, i64);
 type KnCacheVal = (Vec<f64>, Vec<f64>); // (grid_t_day, grid_norm)
 
+/// Simple ring-buffer LRU cache to avoid clearing all entries when full.
+struct KnRingCache {
+    keys: Vec<KnCacheKey>,
+    vals: Vec<KnCacheVal>,
+    map: HashMap<KnCacheKey, usize>, // key → slot index
+    next: usize,
+    capacity: usize,
+}
+
+impl KnRingCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            keys: Vec::with_capacity(capacity),
+            vals: Vec::with_capacity(capacity),
+            map: HashMap::with_capacity(capacity),
+            next: 0,
+            capacity,
+        }
+    }
+
+    fn get(&self, key: &KnCacheKey) -> Option<&KnCacheVal> {
+        self.map.get(key).map(|&idx| &self.vals[idx])
+    }
+
+    fn insert(&mut self, key: KnCacheKey, val: KnCacheVal) {
+        if self.keys.len() < self.capacity {
+            let idx = self.keys.len();
+            self.keys.push(key);
+            self.vals.push(val);
+            self.map.insert(key, idx);
+        } else {
+            // Evict oldest entry
+            let idx = self.next;
+            self.map.remove(&self.keys[idx]);
+            self.keys[idx] = key;
+            self.vals[idx] = val;
+            self.map.insert(key, idx);
+            self.next = (self.next + 1) % self.capacity;
+        }
+    }
+}
+
 thread_local! {
-    static KN_CACHE: RefCell<HashMap<KnCacheKey, KnCacheVal>> = RefCell::new(HashMap::new());
+    static KN_CACHE: RefCell<KnRingCache> = RefCell::new(KnRingCache::new(MAX_CACHE));
 }
 
 // the actual ODE solve, factored out so we can cache it
@@ -655,11 +698,7 @@ fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
         match metzger_kn_solve_ode(m_ej, v_ej, kappa_r, phase_bin) {
             Some(val) => {
                 KN_CACHE.with(|c| {
-                    let mut cache = c.borrow_mut();
-                    if cache.len() > MAX_CACHE {
-                        cache.clear();
-                    }
-                    cache.insert(key, val.clone());
+                    c.borrow_mut().insert(key, val.clone());
                 });
                 val
             }
@@ -1145,12 +1184,12 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         };
 
         // First run: standard PSO
-        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42);
+        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42, None);
 
         // If we have a seed, run a second PSO restart with the seed injected
         if let Some(ref seed) = init {
-            let (params2, cost2) = pso_minimize_seeded(
-                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, seed,
+            let (params2, cost2) = pso_minimize(
+                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, Some(seed),
             );
             if cost2 < cost1 {
                 params1 = params2;
@@ -1159,7 +1198,7 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         }
 
         // Third restart
-        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271);
+        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271, None);
         if cost3 < cost1 {
             params1 = params3;
             cost1 = cost3;
@@ -1197,115 +1236,6 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         per_k_cost,
         per_k_bic,
     }
-}
-
-/// PSO variant that injects a seed particle into the initial swarm.
-fn pso_minimize_seeded(
-    mut cost_fn: impl FnMut(&[f64]) -> f64,
-    lower: &[f64],
-    upper: &[f64],
-    n_particles: usize,
-    max_iters: usize,
-    stall_iters: usize,
-    seed_rng: u64,
-    seed_particle: &[f64],
-) -> (Vec<f64>, f64) {
-    let dim = lower.len();
-    let mut rng = SmallRng::seed_from_u64(seed_rng);
-
-    let w_max = 0.9;
-    let w_min = 0.4;
-    let c1 = 1.5;
-    let c2 = 1.5;
-
-    let v_max: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
-
-    let total = n_particles * dim;
-    let mut positions = vec![0.0; total];
-    let mut velocities = vec![0.0; total];
-    let mut pbest_pos = vec![0.0; total];
-    let mut pbest_cost = vec![f64::INFINITY; n_particles];
-
-    let mut gbest_pos = vec![0.0; dim];
-    let mut gbest_cost = f64::INFINITY;
-
-    for p in 0..n_particles {
-        let base = p * dim;
-        if p == 0 {
-            // First particle is the seed
-            positions[base..base + dim].copy_from_slice(seed_particle);
-        } else {
-            for d in 0..dim {
-                positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-            }
-        }
-        for d in 0..dim {
-            velocities[base + d] =
-                v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
-        }
-        let cost = cost_fn(&positions[base..base + dim]);
-        pbest_cost[p] = cost;
-        pbest_pos[base..base + dim].copy_from_slice(&positions[base..base + dim]);
-        if cost < gbest_cost {
-            gbest_cost = cost;
-            gbest_pos.copy_from_slice(&positions[base..base + dim]);
-        }
-    }
-
-    let mut iters_without_improvement = 0usize;
-    let mut prev_gbest = gbest_cost;
-    let inv_max_iters = 1.0 / max_iters as f64;
-
-    for iter in 0..max_iters {
-        let w = w_max - (w_max - w_min) * (iter as f64) * inv_max_iters;
-
-        for p in 0..n_particles {
-            let base = p * dim;
-            for d in 0..dim {
-                let r1: f64 = rng.random();
-                let r2: f64 = rng.random();
-                let mut v = w * velocities[base + d]
-                    + c1 * r1 * (pbest_pos[base + d] - positions[base + d])
-                    + c2 * r2 * (gbest_pos[d] - positions[base + d]);
-
-                v = v.clamp(-v_max[d], v_max[d]);
-
-                let new_pos = positions[base + d] + v;
-                if new_pos <= lower[d] {
-                    positions[base + d] = lower[d];
-                    velocities[base + d] = 0.0;
-                } else if new_pos >= upper[d] {
-                    positions[base + d] = upper[d];
-                    velocities[base + d] = 0.0;
-                } else {
-                    positions[base + d] = new_pos;
-                    velocities[base + d] = v;
-                }
-            }
-            let cost = cost_fn(&positions[base..base + dim]);
-            if cost < pbest_cost[p] {
-                pbest_cost[p] = cost;
-                pbest_pos[base..base + dim]
-                    .copy_from_slice(&positions[base..base + dim]);
-                if cost < gbest_cost {
-                    gbest_cost = cost;
-                    gbest_pos.copy_from_slice(&positions[base..base + dim]);
-                }
-            }
-        }
-        let improved = prev_gbest - gbest_cost > 0.01 * prev_gbest.abs().max(1e-10);
-        if improved {
-            iters_without_improvement = 0;
-            prev_gbest = gbest_cost;
-        } else {
-            iters_without_improvement += 1;
-            if iters_without_improvement >= stall_iters {
-                break;
-            }
-        }
-    }
-
-    (gbest_pos, gbest_cost)
 }
 
 /// Result of MultiBazin greedy fit for a single band.
@@ -1667,6 +1597,7 @@ fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
 /// - Velocity clamping to V_max = fraction of domain width per dimension;
 /// - Wall absorption: velocity zeroed on dimensions that hit bounds;
 /// - Stall-based early stopping (relative improvement threshold).
+/// - Optional seed particle injected as particle 0.
 fn pso_minimize(
     mut cost_fn: impl FnMut(&[f64]) -> f64,
     lower: &[f64],
@@ -1675,6 +1606,7 @@ fn pso_minimize(
     max_iters: usize,
     stall_iters: usize,
     seed: u64,
+    seed_particle: Option<&[f64]>,
 ) -> (Vec<f64>, f64) {
     let dim = lower.len();
     let mut rng = SmallRng::seed_from_u64(seed);
@@ -1698,11 +1630,23 @@ fn pso_minimize(
     let mut gbest_pos = vec![0.0; dim];
     let mut gbest_cost = f64::INFINITY;
 
-    // Initialise particles uniformly in bounds
+    // Initialise particles uniformly in bounds (seed particle at index 0 if provided)
     for p in 0..n_particles {
         let base = p * dim;
+        if p == 0 {
+            if let Some(sp) = seed_particle {
+                positions[base..base + dim].copy_from_slice(sp);
+            } else {
+                for d in 0..dim {
+                    positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                }
+            }
+        } else {
+            for d in 0..dim {
+                positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+            }
+        }
         for d in 0..dim {
-            positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
             velocities[base + d] =
                 v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
         }
@@ -1831,7 +1775,7 @@ fn profile_t0_search(
             problem.cost_from_slice(&full, &mut pred_buf)
         };
         let (best_reduced, cost) = pso_minimize(
-            cost_fn, &lower, &upper, 30, 60, 12, 42,
+            cost_fn, &lower, &upper, 30, 60, 12, 42, None,
         );
         let mut full = Vec::with_capacity(best_reduced.len() + 1);
         for (i, &val) in best_reduced.iter().enumerate() {
@@ -1850,7 +1794,7 @@ fn profile_t0_search(
     let mut best_cost = pilot_cost;
     let mut best_t0 = pilot_t0;
 
-    for &t0 in &linspace(t0_min, t0_max, 5) {
+    for &t0 in &linspace(t0_min, t0_max, 3) {
         let (params, cost) = run_at_t0(t0);
         if cost < best_cost && !params.is_empty() {
             best_cost = cost;
@@ -1861,7 +1805,7 @@ fn profile_t0_search(
 
     let fine_min = (best_t0 - 0.5).max(t0_min);
     let fine_max = (best_t0 + 0.5).min(t0_max);
-    for &t0 in &linspace(fine_min, fine_max, 3) {
+    for &t0 in &linspace(fine_min, fine_max, 2) {
         let (params, cost) = run_at_t0(t0);
         if cost < best_cost && !params.is_empty() {
             best_cost = cost;
@@ -1916,8 +1860,6 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
         }
 
         let t_first = data.times.iter().cloned().fold(f64::INFINITY, f64::min);
-        let t_last = data.times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let dt = t_last - t_first;
 
         // t0 should be near or before the peak. For the Villar model,
         // t0 is roughly the time of peak brightness.
@@ -1945,11 +1887,9 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
     // --- Multi-restart PSO with data-informed seeding ---
     // Restart 0: standard random init
     // Restart 1: seed one particle at estimated t0 = peak_time - small_offset
-    // Restart 2: only runs if first two disagree significantly
-    let seeds: &[u64] = &[42, 137, 271];
+    let seeds: &[u64] = &[42, 137];
     let mut best_params = Vec::new();
     let mut best_chi2 = f64::INFINITY;
-    let mut first_chi2 = f64::INFINITY;
 
     // Build seed particles with informed initial guesses
     let pop_prior = population_priors(model);
@@ -1980,22 +1920,9 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
         None
     };
 
-    // Seed B: t0 before first observation (for cases where rise was missed)
-    let seed_early_t0: Option<Vec<f64>> = if n_obs > 0 {
-        let t_first = data.times.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mut seed = vec![0.0; dim];
-        for d in 0..dim {
-            seed[d] = if d < pop_prior.len() {
-                pop_prior[d].0.clamp(lower[d], upper[d])
-            } else {
-                0.5 * (lower[d] + upper[d])
-            };
-        }
-        seed[t0_idx] = (t_first - 15.0).clamp(lower[t0_idx], upper[t0_idx]);
-        Some(seed)
-    } else {
-        None
-    };
+    // MetzgerKN uses numerical ODE so keep more particles; analytic models use fewer
+    let n_particles = if matches!(model, SviModel::MetzgerKN) { 30 } else { 20 };
+    let stall = if matches!(model, SviModel::MetzgerKN) { 12 } else { 8 };
 
     for (i, &seed) in seeds.iter().enumerate() {
         let mut pred_buf = vec![0.0; data.times.len()];
@@ -2005,23 +1932,14 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
             1 => {
                 // Second restart: seed at peak
                 if let Some(ref sp) = seed_at_peak {
-                    pso_minimize_seeded(cost_fn, &lower, &upper, 30, 60, 12, seed, sp)
+                    pso_minimize(cost_fn, &lower, &upper, n_particles, 60, stall, seed, Some(sp))
                 } else {
-                    pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed)
+                    pso_minimize(cost_fn, &lower, &upper, n_particles, 60, stall, seed, None)
                 }
             }
-            2 => {
-                // Third restart: seed with early t0
-                if let Some(ref sp) = seed_early_t0 {
-                    pso_minimize_seeded(cost_fn, &lower, &upper, 30, 60, 12, seed, sp)
-                } else {
-                    pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed)
-                }
-            }
-            _ => pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed),
+            _ => pso_minimize(cost_fn, &lower, &upper, n_particles, 60, stall, seed, None),
         };
 
-        if i == 0 { first_chi2 = chi2; }
         if chi2 < best_chi2 {
             best_chi2 = chi2;
             best_params = params;
@@ -2317,7 +2235,7 @@ fn svi_fit(
 
     // Early stopping: track smoothed ELBO and stop when it stalls.
     let svi_stall_iters = 30;
-    let svi_min_iters = 100; // always run at least this many
+    let svi_min_iters = 60; // always run at least this many
     let ema_alpha = 0.2;
     let mut ema_elbo = f64::NEG_INFINITY;
     let mut best_ema_elbo = f64::NEG_INFINITY;
@@ -2703,22 +2621,9 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
     let shape_idxs: Vec<usize> = (0..n_full).filter(|&i| i != se_idx).collect();
     let n_shape = shape_idxs.len();
 
-    // Hessian via Richardson extrapolation (two step sizes for better accuracy)
+    // Hessian via central finite differences (single step size)
     let mut hessian = vec![0.0; n_shape * n_shape];
     let mut buf = map_params.to_vec();
-
-    // central difference helper
-    let hess_elem = |i: usize, j: usize, hi: f64, hj: f64, buf: &mut Vec<f64>| -> f64 {
-        buf.copy_from_slice(map_params); buf[i] += hi; buf[j] += hj;
-        let fpp = neg_log_posterior(model, data, buf);
-        buf.copy_from_slice(map_params); buf[i] += hi; buf[j] -= hj;
-        let fpm = neg_log_posterior(model, data, buf);
-        buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] += hj;
-        let fmp = neg_log_posterior(model, data, buf);
-        buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] -= hj;
-        let fmm = neg_log_posterior(model, data, buf);
-        (fpp - fpm - fmp + fmm) / (4.0 * hi * hj)
-    };
 
     for si in 0..n_shape {
         let i = shape_idxs[si];
@@ -2727,12 +2632,18 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let j = shape_idxs[sj];
             let hj = 1e-4 * map_params[j].abs().max(1.0);
 
-            let h_coarse = hess_elem(i, j, hi, hj, &mut buf);
-            let h_fine = hess_elem(i, j, hi * 0.5, hj * 0.5, &mut buf);
+            // Central difference: (f(+h,+h) - f(+h,-h) - f(-h,+h) + f(-h,-h)) / (4*hi*hj)
+            buf.copy_from_slice(map_params); buf[i] += hi; buf[j] += hj;
+            let fpp = neg_log_posterior(model, data, &buf);
+            buf.copy_from_slice(map_params); buf[i] += hi; buf[j] -= hj;
+            let fpm = neg_log_posterior(model, data, &buf);
+            buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] += hj;
+            let fmp = neg_log_posterior(model, data, &buf);
+            buf.copy_from_slice(map_params); buf[i] -= hi; buf[j] -= hj;
+            let fmm = neg_log_posterior(model, data, &buf);
 
-            // Richardson: cancels O(h^2) error -> O(h^4)
-            let h_rich = (4.0 * h_fine - h_coarse) / 3.0;
-            let h_ij = if h_rich.is_finite() { h_rich } else { h_coarse };
+            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            let h_ij = if h_ij.is_finite() { h_ij } else { 0.0 };
             hessian[si * n_shape + sj] = h_ij;
             hessian[sj * n_shape + si] = h_ij;
         }
@@ -2811,7 +2722,7 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
         let scan_hi = upper[j];
         if scan_hi - scan_lo < 1e-10 { continue; }
 
-        let n_grid = 15usize;
+        let n_grid = 9usize;
         let mut lo_1sig = mu_j;
         let mut hi_1sig = mu_j;
 
@@ -2878,7 +2789,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         return;
     }
 
-    let n_grid: usize = 25;
+    let n_grid: usize = 15;
     let obs_var = &data.obs_var;
     let sigma_extra = result.mu[se_idx].exp();
     let sigma_extra_sq = sigma_extra * sigma_extra;
@@ -2899,7 +2810,8 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         }
         params[t0_idx] = t0;
 
-        // Analytically re-fit amplitude
+        // Analytically re-fit amplitude; keep shapes for reuse below
+        let shapes;
         {
             let saved_log_a = params[log_a_idx];
             params[log_a_idx] = 0.0;
@@ -2911,7 +2823,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
                 0.0
             };
 
-            let shapes = eval_model_batch(model, &params, &data.times);
+            shapes = eval_model_batch(model, &params, &data.times);
 
             if has_baseline {
                 let mut sw = 0.0;
@@ -2964,7 +2876,11 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
             }
         }
 
-        let mut preds = eval_model_batch(model, &params, &data.times);
+        // Reuse shapes from the amplitude fitting above instead of
+        // re-evaluating the model. preds = A * shapes + B (or just A * shapes).
+        let fitted_a = params[log_a_idx].exp();
+        let fitted_b = if has_baseline { params[1] } else { 0.0 };
+        let mut preds: Vec<f64> = shapes.iter().map(|&s| fitted_a * s + fitted_b).collect();
 
         if model == SviModel::MetzgerKN {
             let max_pred = preds
@@ -3204,7 +3120,7 @@ pub fn finalize_parametric_from_gpu(
 
     let snr_threshold = 3.0;
     let svi_lr = 0.01;
-    let svi_n_steps = 1000;
+    let svi_n_steps = 500;
     let svi_n_samples = 4;
     let zp = 23.9;
 
@@ -3642,7 +3558,7 @@ pub fn fit_parametric_model(
 
     let snr_threshold = 3.0;
     let svi_lr = 0.01;
-    let svi_n_steps = 1000;
+    let svi_n_steps = 500;
     let svi_n_samples = 4;
     let zp = 23.9;
 
@@ -3917,7 +3833,7 @@ pub fn fit_parametric_multiband(
     let mut joint_upper = ref_upper.clone();
 
     for _ in 1..n_bands {
-        for (j, &(_mean, sigma, _is_add)) in rel_priors.iter().enumerate() {
+        for &(_mean, sigma, _is_add) in rel_priors.iter() {
             // Offset bounds: ±3σ from prior
             joint_lower.push(-3.0 * sigma);
             joint_upper.push(3.0 * sigma);
@@ -4064,13 +3980,11 @@ pub fn fit_parametric_multiband(
         }
 
         for (i, &seed) in seeds.iter().enumerate() {
-            let (params, cost) = if i == 1 {
-                pso_minimize_seeded(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    40, 80, 15, seed, &seed_particle)
-            } else {
-                pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    40, 80, 15, seed)
-            };
+            let seed_ref: Option<&[f64]> = if i == 1 { Some(&seed_particle) } else { None };
+            let (params, cost) = pso_minimize(
+                |p| joint_cost(p), &joint_lower, &joint_upper,
+                40, 80, 15, seed, seed_ref,
+            );
             if cost < best_c {
                 best_c = cost;
                 best = params;
@@ -4086,7 +4000,7 @@ pub fn fit_parametric_multiband(
     // Extract per-band results
     let ref_params = &best_params[..n_model_params];
     let svi_lr = 0.01;
-    let svi_n_steps = 1000;
+    let svi_n_steps = 500;
     let svi_n_samples = 4;
 
     let mut results = Vec::new();

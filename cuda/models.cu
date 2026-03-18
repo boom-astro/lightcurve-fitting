@@ -575,8 +575,7 @@ extern "C" __global__ void batch_pso_cost(
             // 200-point forward Euler ODE (same as metzger_kn_eval)
             double log_t_min = log(0.01);
 
-            double phase_bin = ceil(phase_max / 10.0) * 10.0;
-            double log_t_max = log(phase_bin * 1.05);
+            double log_t_max = log(phase_max * 1.05);
 
             double ye = 0.1;
             double xn0 = 1.0 - 2.0 * ye;

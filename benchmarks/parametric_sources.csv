@@ -1,9 +1,9 @@
 fitter,backend,n_sources,n_points_per_band,total_obs,wall_sec,throughput_src_per_sec,throughput_pts_per_sec
-parametric,CPU,10,30,900,0.0889,113,10129
-parametric,CPU-par,10,30,900,0.0116,863,77696
-parametric,CPU,100,30,9000,0.8784,114,10246
-parametric,CPU-par,100,30,9000,0.0326,3065,275820
-parametric,CPU,500,30,45000,4.3417,115,10365
-parametric,CPU-par,500,30,45000,0.1437,3479,313094
-parametric,CPU,1000,30,90000,8.5928,116,10474
-parametric,CPU-par,1000,30,90000,0.2758,3626,326322
+parametric,CPU,10,30,900,0.1546,65,5822
+parametric,CPU-par,10,30,900,0.0362,276,24883
+parametric,CPU,100,30,9000,1.4088,71,6389
+parametric,CPU-par,100,30,9000,0.1835,545,49047
+parametric,CPU,500,30,45000,7.2766,69,6184
+parametric,CPU-par,500,30,45000,0.8790,569,51194
+parametric,CPU,1000,30,90000,14.8972,67,6041
+parametric,CPU-par,1000,30,90000,1.7891,559,50304
