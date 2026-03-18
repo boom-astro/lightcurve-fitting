@@ -551,11 +551,11 @@ fn quantize(x: f64) -> i64 { (x * 1e2).round() as i64 }
 type KnCacheKey = (i64, i64, i64, i64);
 type KnCacheVal = (Vec<f64>, Vec<f64>); // (grid_t_day, grid_norm)
 
-/// Simple ring-buffer LRU cache to avoid clearing all entries when full.
+/// LRU cache 
 struct KnRingCache {
     keys: Vec<KnCacheKey>,
     vals: Vec<KnCacheVal>,
-    map: HashMap<KnCacheKey, usize>, // key → slot index
+    map: HashMap<KnCacheKey, usize>,
     next: usize,
     capacity: usize,
 }
