@@ -9,6 +9,7 @@ fn build_cuda() {
         .flag("-gencode=arch=compute_89,code=sm_89")  // Ada (L40, RTX 4090)
         .flag("-gencode=arch=compute_90,code=sm_90")  // Hopper (H100)
         .flag("-Wno-deprecated-gpu-targets")
+        .flag("--use_fast_math")
         .file("cuda/models.cu")
         .file("cuda/gp.cu")
         .file("cuda/gp2d.cu")

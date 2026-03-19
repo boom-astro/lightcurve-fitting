@@ -218,6 +218,8 @@ extern "C" {
         source_offsets: *const c_int,
         positions: *const f64,
         costs: *mut f64,
+        prior_centers: *const f64,
+        prior_widths: *const f64,
         n_sources: c_int,
         n_particles: c_int,
         n_params: c_int,
@@ -241,6 +243,28 @@ extern "C" {
         n_params: c_int,
         grid: c_int,
         block: c_int,
+    );
+
+    fn launch_batch_pso_full(
+        all_times: *const f64,
+        all_flux: *const f64,
+        all_obs_var: *const f64,
+        all_is_upper: *const c_int,
+        all_upper_flux: *const f64,
+        source_offsets: *const c_int,
+        bounds_lower: *const f64,
+        bounds_upper: *const f64,
+        prior_centers: *const f64,
+        prior_widths: *const f64,
+        out_gbest_pos: *mut f64,
+        out_gbest_cost: *mut f64,
+        n_sources: c_int,
+        n_particles: c_int,
+        n_params: c_int,
+        model_id: c_int,
+        max_iters: c_int,
+        stall_iters: c_int,
+        base_seed: u64,
     );
 }
 
@@ -487,11 +511,94 @@ impl GpuContext {
 
     /// Run PSO for a single model across many sources simultaneously.
     ///
-    /// The cost evaluation (model eval + likelihood) runs on GPU.
-    /// The swarm update logic runs on CPU.
+    /// The entire PSO optimization runs on the GPU — one thread block per
+    /// source, one thread per particle. No per-iteration host↔device
+    /// transfers.
     ///
     /// Returns one `BatchPsoResult` per source.
     pub fn batch_pso(
+        &self,
+        model: GpuModelName,
+        data: &GpuBatchData,
+        n_particles: usize,
+        max_iters: usize,
+        stall_iters: usize,
+        seed: u64,
+    ) -> Result<Vec<BatchPsoResult>, String> {
+        let n_sources = data.n_sources;
+        let n_params = model.n_params();
+        let (lower, upper) = model.pso_bounds();
+
+        // Upload bounds
+        let d_lower = DevBuf::upload(&lower)?;
+        let d_upper = DevBuf::upload(&upper)?;
+
+        // Upload population priors
+        let pop_priors = crate::parametric::population_priors_for_gpu(model);
+        let (d_prior_centers, d_prior_widths) = if !pop_priors.is_empty() {
+            let centers: Vec<f64> = pop_priors.iter().map(|&(c, _)| c).collect();
+            let widths: Vec<f64> = pop_priors.iter().map(|&(_, w)| w).collect();
+            (Some(DevBuf::upload(&centers)?), Some(DevBuf::upload(&widths)?))
+        } else {
+            (None, None)
+        };
+
+        // Allocate output buffers
+        let d_gbest_pos = DevBuf::alloc(n_sources * n_params * size_of::<f64>())?;
+        let d_gbest_cost = DevBuf::alloc(n_sources * size_of::<f64>())?;
+
+        let pc_ptr = d_prior_centers.as_ref().map_or(ptr::null(), |b| b.ptr as *const f64);
+        let pw_ptr = d_prior_widths.as_ref().map_or(ptr::null(), |b| b.ptr as *const f64);
+
+        unsafe {
+            launch_batch_pso_full(
+                data.d_times.ptr as _,
+                data.d_flux.ptr as _,
+                data.d_obs_var.ptr as _,
+                data.d_is_upper.ptr as _,
+                data.d_upper_flux.ptr as _,
+                data.d_offsets.ptr as _,
+                d_lower.ptr as _,
+                d_upper.ptr as _,
+                pc_ptr,
+                pw_ptr,
+                d_gbest_pos.ptr as _,
+                d_gbest_cost.ptr as _,
+                n_sources as c_int,
+                n_particles as c_int,
+                n_params as c_int,
+                model.model_id(),
+                max_iters as c_int,
+                stall_iters as c_int,
+                seed,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        // Download results
+        let mut h_gbest_pos = vec![0.0f64; n_sources * n_params];
+        let mut h_gbest_cost = vec![0.0f64; n_sources];
+        d_gbest_pos.download_into(&mut h_gbest_pos)?;
+        d_gbest_cost.download_into(&mut h_gbest_cost)?;
+
+        let results: Vec<BatchPsoResult> = (0..n_sources)
+            .map(|s| {
+                let gb = s * n_params;
+                BatchPsoResult {
+                    params: h_gbest_pos[gb..gb + n_params].to_vec(),
+                    cost: h_gbest_cost[s],
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Unused — replaced by GPU-resident batch_pso_full kernel.
+    /// Kept for reference / fallback.
+    #[allow(dead_code)]
+    fn _batch_pso_cpu_loop(
         &self,
         model: GpuModelName,
         data: &GpuBatchData,
@@ -570,6 +677,8 @@ impl GpuContext {
                     data.d_offsets.ptr as _,
                     d_positions.ptr as _,
                     d_costs.ptr as _,
+                    ptr::null(),
+                    ptr::null(),
                     n_sources as c_int,
                     n_particles as c_int,
                     n_params as c_int,

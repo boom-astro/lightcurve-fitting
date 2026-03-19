@@ -1,10 +1,12 @@
 // CUDA kernels for parametric lightcurve model evaluation and batch PSO cost.
 //
-// Two kernel families:
+// Three kernel families:
 //   1. *_eval: forward model evaluation (draw × time → flux)
 //   2. batch_pso_cost: fused model eval + likelihood for batch PSO fitting
 //      Thread grid: n_sources × n_particles. Each thread loops over its
 //      source's observations.
+//   3. batch_pso_full: GPU-resident PSO — entire optimization on GPU,
+//      one block per source, one thread per particle.
 
 #include <math.h>
 
@@ -139,6 +141,100 @@ __device__ inline double afterglow_at(const double* p, double t) {
 #define C_CGS_VAL 2.998e10
 #define SECS_DAY  86400.0
 #define METZGER_NGRID 200
+#define METZGER_PSO_NGRID 100
+
+// Solve MetzgerKN ODE once and store normalized luminosity grid.
+// Returns l_peak for normalization check. grid_t[] and grid_lrad[] are
+// populated with METZGER_PSO_NGRID entries (normalized by l_peak if > 0).
+__device__ double metzger_kn_solve_grid(
+    const double* p, double phase_max,
+    double* grid_t, double* grid_lrad)
+{
+    double m_ej    = pow(10.0, p[0]) * MSUN_CGS;
+    double v_ej    = pow(10.0, p[1]) * C_CGS_VAL;
+    double kappa_r = pow(10.0, p[2]);
+
+    if (phase_max < 0.02) phase_max = 0.02;
+    double log_t_min = log(0.01);
+    double log_t_max = log(phase_max);
+
+    double ye = 0.1;
+    double xn0 = 1.0 - 2.0 * ye;
+    double scale = 1e40;
+    double e0 = 0.5 * m_ej * v_ej * v_ej;
+    double e_th = e0 / scale;
+    double e_kin = e0 / scale;
+    double v = v_ej;
+
+    double grid_t_0 = exp(log_t_min);
+    double r = grid_t_0 * SECS_DAY * v;
+    double l_peak = 0.0;
+
+    for (int i = 0; i < METZGER_PSO_NGRID; i++) {
+        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(METZGER_PSO_NGRID - 1));
+        double t_sec = t_day * SECS_DAY;
+        grid_t[i] = t_day;
+
+        double eth_factor = 0.34 * pow(t_day, 0.74);
+        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
+        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
+
+        double xn = xn0 * exp(-t_sec / 900.0);
+        double eps_neutron = 3.2e14 * xn;
+        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
+        if (time_term < 1e-30) time_term = 1e-30;
+        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
+        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
+
+        double xr = 1.0 - xn0;
+        double xn_decayed = xn0 - xn;
+        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
+        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
+
+        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
+        grid_lrad[i] = l_rad;
+        if (l_rad > l_peak) l_peak = l_rad;
+
+        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
+        if (i < METZGER_PSO_NGRID - 1) {
+            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(METZGER_PSO_NGRID - 1));
+            double dt_sec = (t_next - t_day) * SECS_DAY;
+            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
+            if (e_th < 0.0) e_th = 0.0;
+            e_kin += l_pdv * dt_sec;
+            v = sqrt(2.0 * e_kin * scale / m_ej);
+            if (v > C_CGS_VAL) v = C_CGS_VAL;
+            r += v * dt_sec;
+        }
+    }
+
+    // Normalize grid
+    if (l_peak > 0.0 && isfinite(l_peak)) {
+        for (int i = 0; i < METZGER_PSO_NGRID; i++)
+            grid_lrad[i] /= l_peak;
+    }
+
+    return l_peak;
+}
+
+// Interpolate a phase value from the pre-solved ODE grid.
+__device__ inline double metzger_kn_interp(
+    const double* grid_t, const double* grid_lrad, double phase)
+{
+    if (phase <= 0.0) return 0.0;
+    if (phase <= grid_t[0]) return grid_lrad[0];
+    if (phase >= grid_t[METZGER_PSO_NGRID - 1]) return grid_lrad[METZGER_PSO_NGRID - 1];
+
+    // Binary search
+    int lo = 0, hi = METZGER_PSO_NGRID - 1;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (grid_t[mid] < phase) lo = mid;
+        else hi = mid;
+    }
+    double frac = (phase - grid_t[lo]) / (grid_t[hi] - grid_t[lo]);
+    return grid_lrad[lo] + frac * (grid_lrad[hi] - grid_lrad[lo]);
+}
 
 // Metzger kernel: one thread per draw, loops over all times.
 // params layout per draw: [log10_mej, log10_vej, log10_kappa, t0, sigma_extra]
@@ -153,9 +249,6 @@ extern "C" __global__ void metzger_kn_eval(
     if (draw >= n_draws) return;
 
     const double* p = params + draw * n_params;
-    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
-    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
-    double kappa_r = pow(10.0, p[2]);
     double t0     = p[3];
 
     // Find max phase needed
@@ -172,6 +265,13 @@ extern "C" __global__ void metzger_kn_eval(
     }
 
     // Build log-spaced time grid
+    double grid_t[METZGER_NGRID];
+    double grid_lrad[METZGER_NGRID];
+
+    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
+    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
+    double kappa_r = pow(10.0, p[2]);
+
     double log_t_min = log(0.01);
     double log_t_max = log(phase_max * 1.05);
 
@@ -186,10 +286,6 @@ extern "C" __global__ void metzger_kn_eval(
 
     double grid_t_prev = exp(log_t_min);
     double r = grid_t_prev * SECS_DAY * v;
-
-    // Store grid values in local arrays (stack-allocated, 200 entries)
-    double grid_t[METZGER_NGRID];
-    double grid_lrad[METZGER_NGRID];
 
     for (int i = 0; i < METZGER_NGRID; i++) {
         double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(METZGER_NGRID - 1));
@@ -407,111 +503,8 @@ DEFINE_EVAL_KERNEL(shock_cooling_eval,  shock_cooling_at)
 DEFINE_EVAL_KERNEL(afterglow_eval,      afterglow_at)
 
 // ===========================================================================
-// Batch PSO cost kernel
+// Batch PSO cost kernel (used by MultiBazin CPU-loop PSO)
 // ===========================================================================
-//
-// One thread per (source, particle) pair.  Each thread loops over its
-// source's observations and computes the negative log-likelihood (divided
-// by n_obs) — matching PsoCost::cost on the CPU side.
-//
-// Data layout:
-//   all_times, all_flux, all_obs_var, all_upper_flux: concatenated across
-//       sources.  source_offsets[src] .. source_offsets[src+1] gives the
-//       range for source `src`.
-//   all_is_upper: int (0/1) array, same layout.
-//   positions: [n_sources × n_particles × n_params], row-major.
-//   costs (output): [n_sources × n_particles].
-
-// Device function: solve MetzgerKN ODE and evaluate at a single time.
-// This is used by batch_pso_cost for model_id=7.
-// It solves the full ODE each time (inefficient but correct for PSO where
-// each particle has different params).
-__device__ double metzger_kn_at_single(const double* p, double obs_time) {
-    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
-    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
-    double kappa_r = pow(10.0, p[2]);
-    double t0     = p[3];
-    double phase  = obs_time - t0;
-
-    if (phase <= 0.0) return 0.0;
-
-    // Build grid up to this phase
-    double phase_max = phase * 1.05;
-    if (phase_max < 0.02) phase_max = 0.02;
-    double log_t_min = log(0.01);
-    double log_t_max = log(phase_max);
-    int ngrid = 100; // Reduced grid for PSO (speed vs accuracy tradeoff)
-
-    double ye = 0.1;
-    double xn0 = 1.0 - 2.0 * ye;
-    double scale = 1e40;
-    double e0 = 0.5 * m_ej * v_ej * v_ej;
-    double e_th = e0 / scale;
-    double e_kin = e0 / scale;
-    double v = v_ej;
-
-    double grid_t_0 = exp(log_t_min);
-    double r = grid_t_0 * SECS_DAY * v;
-
-    double l_peak = 0.0;
-    double l_at_phase = 0.0;
-    double prev_t = grid_t_0;
-    double prev_lrad = 0.0;
-
-    for (int i = 0; i < ngrid; i++) {
-        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(ngrid - 1));
-        double t_sec = t_day * SECS_DAY;
-
-        double eth_factor = 0.34 * pow(t_day, 0.74);
-        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
-        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
-
-        double xn = xn0 * exp(-t_sec / 900.0);
-        double eps_neutron = 3.2e14 * xn;
-        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
-        if (time_term < 1e-30) time_term = 1e-30;
-        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
-        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
-
-        double xr = 1.0 - xn0;
-        double xn_decayed = xn0 - xn;
-        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
-        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
-
-        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
-        if (l_rad > l_peak) l_peak = l_rad;
-
-        // Interpolate if phase falls in this interval
-        if (i > 0 && phase >= prev_t && phase <= t_day) {
-            double frac = (phase - prev_t) / (t_day - prev_t);
-            l_at_phase = prev_lrad + frac * (l_rad - prev_lrad);
-        }
-        if (i == ngrid - 1 && phase >= t_day) {
-            l_at_phase = l_rad;
-        }
-        if (i == 0 && phase <= t_day) {
-            l_at_phase = l_rad;
-        }
-
-        prev_t = t_day;
-        prev_lrad = l_rad;
-
-        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
-        if (i < ngrid - 1) {
-            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(ngrid - 1));
-            double dt_sec = (t_next - t_day) * SECS_DAY;
-            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
-            if (e_th < 0.0) e_th = 0.0;
-            e_kin += l_pdv * dt_sec;
-            v = sqrt(2.0 * e_kin * scale / m_ej);
-            if (v > C_CGS_VAL) v = C_CGS_VAL;
-            r += v * dt_sec;
-        }
-    }
-
-    if (l_peak <= 0.0 || !isfinite(l_peak)) return 0.0;
-    return l_at_phase / l_peak;
-}
 
 extern "C" __global__ void batch_pso_cost(
     const double* __restrict__ all_times,
@@ -522,6 +515,8 @@ extern "C" __global__ void batch_pso_cost(
     const int*    __restrict__ source_offsets,
     const double* __restrict__ positions,
     double* __restrict__ costs,
+    const double* __restrict__ prior_centers,
+    const double* __restrict__ prior_widths,
     int n_sources,
     int n_particles,
     int n_params,
@@ -539,22 +534,30 @@ extern "C" __global__ void batch_pso_cost(
     if (n_obs <= 0) { costs[idx] = 1e99; return; }
 
     const double* p = positions + (long long)(src * n_particles + pid) * n_params;
-    int se_idx = n_params - 1;  // sigma_extra is always the last parameter
+    int se_idx = n_params - 1;
     double sigma_extra = exp(p[se_idx]);
     double sigma_extra_sq = sigma_extra * sigma_extra;
 
     double neg_ll = 0.0;
 
     if (model_id == 7) {
-        // MetzgerKN: solve ODE once, evaluate at all observation times
-        // For PSO cost, we solve per-observation (less efficient but avoids
-        // large stack allocation). Each observation gets its own ODE solve.
+        // MetzgerKN: solve ODE once, then interpolate for all observations
+        double t0 = p[3];
+        double phase_max = 0.01;
         for (int i = obs_start; i < obs_end; i++) {
-            double pred = metzger_kn_at_single(p, all_times[i]);
+            double ph = all_times[i] - t0;
+            if (ph > phase_max) phase_max = ph;
+        }
+        double grid_t[METZGER_PSO_NGRID];
+        double grid_lrad[METZGER_PSO_NGRID];
+        double l_peak = metzger_kn_solve_grid(p, phase_max * 1.05, grid_t, grid_lrad);
+        if (l_peak <= 0.0 || !isfinite(l_peak)) { costs[idx] = 1e99; return; }
+
+        for (int i = obs_start; i < obs_end; i++) {
+            double phase = all_times[i] - t0;
+            double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
             if (!isfinite(pred)) { costs[idx] = 1e99; return; }
-
             double total_var = all_obs_var[i] + sigma_extra_sq;
-
             if (all_is_upper[i]) {
                 double z = (all_upper_flux[i] - pred) / sqrt(total_var);
                 neg_ll -= log_normal_cdf_d(z);
@@ -567,9 +570,7 @@ extern "C" __global__ void batch_pso_cost(
         for (int i = obs_start; i < obs_end; i++) {
             double pred = eval_model_at(model_id, p, all_times[i]);
             if (!isfinite(pred)) { costs[idx] = 1e99; return; }
-
             double total_var = all_obs_var[i] + sigma_extra_sq;
-
             if (all_is_upper[i]) {
                 double z = (all_upper_flux[i] - pred) / sqrt(total_var);
                 neg_ll -= log_normal_cdf_d(z);
@@ -580,7 +581,262 @@ extern "C" __global__ void batch_pso_cost(
         }
     }
 
+    // Add population prior penalty (fused, avoids CPU round-trip)
+    if (prior_centers != nullptr && prior_widths != nullptr) {
+        double neg_lp = 0.0;
+        for (int j = 0; j < n_params; j++) {
+            double w = prior_widths[j];
+            if (w > 0.0) {
+                double z = (p[j] - prior_centers[j]) / w;
+                neg_lp += 0.5 * z * z;
+            }
+        }
+        neg_ll += neg_lp / ((double)n_obs * (double)n_obs);
+    }
+
     costs[idx] = neg_ll / (double)n_obs;
+}
+
+// ===========================================================================
+// GPU-resident PSO kernel: entire optimization runs on GPU
+// ===========================================================================
+//
+// One thread block per source. blockDim.x = n_particles.
+// Each thread owns one particle and loops over all PSO iterations.
+// Eliminates per-iteration host-device transfers.
+
+#define PSO_MAX_PARAMS 7
+
+// xorshift64 PRNG for velocity updates
+__device__ inline unsigned long long pso_xorshift64(unsigned long long* state) {
+    unsigned long long x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
+
+__device__ inline double pso_rand_uniform(unsigned long long* rng) {
+    return (double)(pso_xorshift64(rng) & 0x1FFFFFFFFFFFFF) / (double)0x1FFFFFFFFFFFFF;
+}
+
+extern "C" __global__ void batch_pso_full(
+    const double* __restrict__ all_times,
+    const double* __restrict__ all_flux,
+    const double* __restrict__ all_obs_var,
+    const int*    __restrict__ all_is_upper,
+    const double* __restrict__ all_upper_flux,
+    const int*    __restrict__ source_offsets,
+    const double* __restrict__ bounds_lower,
+    const double* __restrict__ bounds_upper,
+    const double* __restrict__ prior_centers,
+    const double* __restrict__ prior_widths,
+    double* __restrict__ out_gbest_pos,
+    double* __restrict__ out_gbest_cost,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed)
+{
+    int src = blockIdx.x;
+    int pid = threadIdx.x;
+    if (pid >= n_particles) return;
+
+    int obs_start = source_offsets[src];
+    int obs_end   = source_offsets[src + 1];
+    int n_obs     = obs_end - obs_start;
+    if (n_obs <= 0) {
+        if (pid == 0) out_gbest_cost[src] = 1e99;
+        return;
+    }
+
+    // Load bounds into registers
+    double lower[PSO_MAX_PARAMS], upper[PSO_MAX_PARAMS], v_max[PSO_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        lower[d] = bounds_lower[d];
+        upper[d] = bounds_upper[d];
+        v_max[d] = 0.5 * (upper[d] - lower[d]);
+    }
+
+    // Per-thread RNG
+    unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL + (unsigned long long)pid * 137ULL + 1ULL;
+    pso_xorshift64(&rng);
+    pso_xorshift64(&rng);
+
+    // Initialize position and velocity
+    double pos[PSO_MAX_PARAMS], vel[PSO_MAX_PARAMS], pbest_p[PSO_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        pos[d] = lower[d] + pso_rand_uniform(&rng) * (upper[d] - lower[d]);
+        vel[d] = v_max[d] * 0.2 * (2.0 * pso_rand_uniform(&rng) - 1.0);
+        pbest_p[d] = pos[d];
+    }
+    double pbest_cost = 1e99;
+
+    // Shared memory layout
+    extern __shared__ char smem[];
+    double* s_gbest_pos  = (double*)smem;
+    double* s_gbest_cost = s_gbest_pos + n_params;
+    double* s_costs      = s_gbest_cost + 1;
+    double* s_positions  = s_costs + n_particles;
+    int*    s_stall      = (int*)(s_positions + n_particles * n_params);
+    int*    s_done       = s_stall + 1;
+
+    if (pid == 0) {
+        *s_gbest_cost = 1e99;
+        *s_stall = 0;
+        *s_done = 0;
+    }
+    __syncthreads();
+
+    double w_max_pso = 0.9, w_min_pso = 0.4, c1 = 1.5, c2 = 1.5;
+    double inv_max_iters = 1.0 / (double)max_iters;
+    double prev_gbest_val = 1e99;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        // All threads must reach __syncthreads() together, so check
+        // s_done uniformly after a barrier rather than breaking early.
+        __syncthreads();
+        if (*s_done) break;
+
+        double w = w_max_pso - (w_max_pso - w_min_pso) * (double)iter * inv_max_iters;
+
+        // === Evaluate cost for this particle ===
+        double neg_ll = 0.0;
+
+        if (model_id == 7) {
+            double t0 = pos[3];
+            double phase_max = 0.01;
+            for (int i = obs_start; i < obs_end; i++) {
+                double ph = all_times[i] - t0;
+                if (ph > phase_max) phase_max = ph;
+            }
+            double grid_t[METZGER_PSO_NGRID], grid_lrad[METZGER_PSO_NGRID];
+            double l_peak = metzger_kn_solve_grid(pos, phase_max * 1.05, grid_t, grid_lrad);
+            if (l_peak <= 0.0 || !isfinite(l_peak)) {
+                neg_ll = 1e99;
+            } else {
+                double se = exp(pos[n_params - 1]);
+                double se_sq = se * se;
+                for (int i = obs_start; i < obs_end; i++) {
+                    double phase = all_times[i] - t0;
+                    double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
+                    if (!isfinite(pred)) { neg_ll = 1e99; break; }
+                    double total_var = all_obs_var[i] + se_sq;
+                    if (all_is_upper[i]) {
+                        double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                        neg_ll -= log_normal_cdf_d(z);
+                    } else {
+                        double diff = pred - all_flux[i];
+                        neg_ll += diff * diff / total_var + log(total_var);
+                    }
+                }
+            }
+        } else {
+            double se = exp(pos[n_params - 1]);
+            double se_sq = se * se;
+            for (int i = obs_start; i < obs_end; i++) {
+                double pred = eval_model_at(model_id, pos, all_times[i]);
+                if (!isfinite(pred)) { neg_ll = 1e99; break; }
+                double total_var = all_obs_var[i] + se_sq;
+                if (all_is_upper[i]) {
+                    double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = pred - all_flux[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
+                }
+            }
+        }
+
+        double cost = neg_ll / (double)n_obs;
+
+        // Add population prior penalty
+        if (prior_centers != nullptr && prior_widths != nullptr) {
+            double neg_lp = 0.0;
+            for (int j = 0; j < n_params; j++) {
+                double pw = prior_widths[j];
+                if (pw > 0.0) {
+                    double z = (pos[j] - prior_centers[j]) / pw;
+                    neg_lp += 0.5 * z * z;
+                }
+            }
+            cost += neg_lp / ((double)n_obs * (double)n_obs);
+        }
+
+        // Update personal best
+        if (cost < pbest_cost) {
+            pbest_cost = cost;
+            for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
+        }
+
+        // === Block-level gbest reduction via shared memory ===
+        s_costs[pid] = pbest_cost;
+        for (int d = 0; d < n_params; d++)
+            s_positions[pid * n_params + d] = pbest_p[d];
+        __syncthreads();
+
+        // Thread 0 finds global best
+        if (pid == 0) {
+            for (int p = 0; p < n_particles; p++) {
+                if (s_costs[p] < *s_gbest_cost) {
+                    *s_gbest_cost = s_costs[p];
+                    for (int d = 0; d < n_params; d++)
+                        s_gbest_pos[d] = s_positions[p * n_params + d];
+                }
+            }
+
+            // Stall detection
+            double improved_threshold = 0.01 * fmax(fabs(prev_gbest_val), 1e-10);
+            if (prev_gbest_val - *s_gbest_cost > improved_threshold) {
+                *s_stall = 0;
+                prev_gbest_val = *s_gbest_cost;
+            } else {
+                *s_stall = *s_stall + 1;
+                if (*s_stall >= stall_iters) *s_done = 1;
+            }
+        }
+        __syncthreads();
+
+        // Read gbest into registers for velocity update
+        double gbest[PSO_MAX_PARAMS];
+        for (int d = 0; d < n_params; d++) gbest[d] = s_gbest_pos[d];
+
+        // === Update velocity and position ===
+        for (int d = 0; d < n_params; d++) {
+            double r1 = pso_rand_uniform(&rng);
+            double r2 = pso_rand_uniform(&rng);
+            double v_new = w * vel[d]
+                + c1 * r1 * (pbest_p[d] - pos[d])
+                + c2 * r2 * (gbest[d] - pos[d]);
+
+            if (v_new > v_max[d]) v_new = v_max[d];
+            if (v_new < -v_max[d]) v_new = -v_max[d];
+
+            double new_pos = pos[d] + v_new;
+
+            if (new_pos <= lower[d]) {
+                pos[d] = lower[d];
+                vel[d] = 0.0;
+            } else if (new_pos >= upper[d]) {
+                pos[d] = upper[d];
+                vel[d] = 0.0;
+            } else {
+                pos[d] = new_pos;
+                vel[d] = v_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write final gbest (thread 0 only)
+    if (pid == 0) {
+        for (int d = 0; d < n_params; d++)
+            out_gbest_pos[src * n_params + d] = s_gbest_pos[d];
+        out_gbest_cost[src] = *s_gbest_cost;
+    }
 }
 
 // ===========================================================================
@@ -622,6 +878,8 @@ extern "C" void launch_batch_pso_cost(
     const int*    source_offsets,
     const double* positions,
     double* costs,
+    const double* prior_centers,
+    const double* prior_widths,
     int n_sources,
     int n_particles,
     int n_params,
@@ -631,8 +889,37 @@ extern "C" void launch_batch_pso_cost(
 {
     batch_pso_cost<<<grid, block>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
-        source_offsets, positions, costs,
+        source_offsets, positions, costs, prior_centers, prior_widths,
         n_sources, n_particles, n_params, model_id);
+}
+
+extern "C" void launch_batch_pso_full(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed)
+{
+    size_t smem_bytes = (n_params + 1 + n_particles + n_particles * n_params) * sizeof(double) + 2 * sizeof(int);
+    batch_pso_full<<<n_sources, n_particles, smem_bytes>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed);
 }
 
 extern "C" void launch_batch_pso_cost_multi_bazin(
