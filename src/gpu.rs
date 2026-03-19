@@ -218,6 +218,8 @@ extern "C" {
         source_offsets: *const c_int,
         positions: *const f64,
         costs: *mut f64,
+        prior_centers: *const f64,
+        prior_widths: *const f64,
         n_sources: c_int,
         n_particles: c_int,
         n_params: c_int,
@@ -570,6 +572,8 @@ impl GpuContext {
                     data.d_offsets.ptr as _,
                     d_positions.ptr as _,
                     d_costs.ptr as _,
+                    std::ptr::null(),  // prior_centers — applied on CPU below
+                    std::ptr::null(),  // prior_widths
                     n_sources as c_int,
                     n_particles as c_int,
                     n_params as c_int,
