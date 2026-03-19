@@ -1,12 +1,14 @@
 // CUDA kernels for parametric lightcurve model evaluation and batch PSO cost.
 //
-// Three kernel families:
+// Kernel families:
 //   1. *_eval: forward model evaluation (draw × time → flux)
 //   2. batch_pso_cost: fused model eval + likelihood for batch PSO fitting
-//      Thread grid: n_sources × n_particles. Each thread loops over its
-//      source's observations.
 //   3. batch_pso_full: GPU-resident PSO — entire optimization on GPU,
 //      one block per source, one thread per particle.
+//   4. batch_pso_full_std: like batch_pso_full but for non-KN models only
+//      (better register allocation / occupancy).
+//   5. batch_pso_full_kn: like batch_pso_full but for MetzgerKN only.
+//   6. batch_pso_full_multi_bazin: GPU-resident MultiBazin PSO (K=1..4).
 
 #include <math.h>
 
@@ -144,8 +146,6 @@ __device__ inline double afterglow_at(const double* p, double t) {
 #define METZGER_PSO_NGRID 100
 
 // Solve MetzgerKN ODE once and store normalized luminosity grid.
-// Returns l_peak for normalization check. grid_t[] and grid_lrad[] are
-// populated with METZGER_PSO_NGRID entries (normalized by l_peak if > 0).
 __device__ double metzger_kn_solve_grid(
     const double* p, double phase_max,
     double* grid_t, double* grid_lrad)
@@ -208,7 +208,6 @@ __device__ double metzger_kn_solve_grid(
         }
     }
 
-    // Normalize grid
     if (l_peak > 0.0 && isfinite(l_peak)) {
         for (int i = 0; i < METZGER_PSO_NGRID; i++)
             grid_lrad[i] /= l_peak;
@@ -217,7 +216,6 @@ __device__ double metzger_kn_solve_grid(
     return l_peak;
 }
 
-// Interpolate a phase value from the pre-solved ODE grid.
 __device__ inline double metzger_kn_interp(
     const double* grid_t, const double* grid_lrad, double phase)
 {
@@ -225,7 +223,6 @@ __device__ inline double metzger_kn_interp(
     if (phase <= grid_t[0]) return grid_lrad[0];
     if (phase >= grid_t[METZGER_PSO_NGRID - 1]) return grid_lrad[METZGER_PSO_NGRID - 1];
 
-    // Binary search
     int lo = 0, hi = METZGER_PSO_NGRID - 1;
     while (hi - lo > 1) {
         int mid = (lo + hi) / 2;
@@ -237,8 +234,6 @@ __device__ inline double metzger_kn_interp(
 }
 
 // Metzger kernel: one thread per draw, loops over all times.
-// params layout per draw: [log10_mej, log10_vej, log10_kappa, t0, sigma_extra]
-// Output: out[draw * n_times + ti] = normalized flux at times[ti]
 extern "C" __global__ void metzger_kn_eval(
     const double* __restrict__ params,
     const double* __restrict__ times,
@@ -251,7 +246,6 @@ extern "C" __global__ void metzger_kn_eval(
     const double* p = params + draw * n_params;
     double t0     = p[3];
 
-    // Find max phase needed
     double phase_max = 0.01;
     for (int i = 0; i < n_times; i++) {
         double ph = times[i] - t0;
@@ -264,7 +258,6 @@ extern "C" __global__ void metzger_kn_eval(
         return;
     }
 
-    // Build log-spaced time grid
     double grid_t[METZGER_NGRID];
     double grid_lrad[METZGER_NGRID];
 
@@ -275,7 +268,6 @@ extern "C" __global__ void metzger_kn_eval(
     double log_t_min = log(0.01);
     double log_t_max = log(phase_max * 1.05);
 
-    // ODE state
     double ye = 0.1;
     double xn0 = 1.0 - 2.0 * ye;
     double scale = 1e40;
@@ -292,12 +284,10 @@ extern "C" __global__ void metzger_kn_eval(
         grid_t[i] = t_day;
         double t_sec = t_day * SECS_DAY;
 
-        // Thermalization efficiency
         double eth_factor = 0.34 * pow(t_day, 0.74);
         double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
         double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
 
-        // Heating rate
         double xn = xn0 * exp(-t_sec / 900.0);
         double eps_neutron = 3.2e14 * xn;
         double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
@@ -305,22 +295,17 @@ extern "C" __global__ void metzger_kn_eval(
         double eps_rp = 2e18 * eth * pow(time_term, 1.3);
         double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
 
-        // Opacity
         double xr = 1.0 - xn0;
         double xn_decayed = xn0 - xn;
         double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
 
-        // Diffusion time
         double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
 
-        // Radiative luminosity
         double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
         grid_lrad[i] = l_rad;
 
-        // PdV work
         double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
 
-        // Euler step
         if (i < METZGER_NGRID - 1) {
             double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(METZGER_NGRID - 1));
             double dt_sec = (t_next - t_day) * SECS_DAY;
@@ -333,7 +318,6 @@ extern "C" __global__ void metzger_kn_eval(
         }
     }
 
-    // Find peak luminosity for normalization
     double l_peak = -1e300;
     for (int i = 0; i < METZGER_NGRID; i++) {
         if (grid_lrad[i] > l_peak) l_peak = grid_lrad[i];
@@ -345,12 +329,10 @@ extern "C" __global__ void metzger_kn_eval(
         return;
     }
 
-    // Normalize
     for (int i = 0; i < METZGER_NGRID; i++) {
         grid_lrad[i] /= l_peak;
     }
 
-    // Interpolate for each observation time
     for (int ti = 0; ti < n_times; ti++) {
         double phase = times[ti] - t0;
         double val = 0.0;
@@ -362,7 +344,6 @@ extern "C" __global__ void metzger_kn_eval(
         } else if (phase >= grid_t[METZGER_NGRID - 1]) {
             val = grid_lrad[METZGER_NGRID - 1];
         } else {
-            // Binary search for interval
             int lo = 0, hi = METZGER_NGRID - 1;
             while (hi - lo > 1) {
                 int mid = (lo + hi) / 2;
@@ -380,13 +361,6 @@ extern "C" __global__ void metzger_kn_eval(
 // ===========================================================================
 // MultiBazin: sum of K Bazin components + baseline
 // ===========================================================================
-//
-// Params layout for K components:
-//   [log_A_1, t0_1, log_tau_rise_1, log_tau_fall_1,   // component 1
-//    log_A_2, t0_2, log_tau_rise_2, log_tau_fall_2,   // component 2
-//    ...
-//    B, log_sigma_extra]                               // shared (last 2)
-// Total = 4*K + 2 params.
 
 #define MB_COMP_PARAMS 4
 
@@ -408,10 +382,7 @@ __device__ inline double multi_bazin_at(const double* p, int k, double t) {
     return sum + p[b_idx]; // + B
 }
 
-// Batch PSO cost kernel for MultiBazin.
-// Thread grid: n_sources × n_particles.
-// Each source can have a different K, passed via source_k[].
-// n_params must equal 4*max_k + 2 (positions are padded).
+// Batch PSO cost kernel for MultiBazin (used by CPU-loop fallback).
 extern "C" __global__ void batch_pso_cost_multi_bazin(
     const double* __restrict__ all_times,
     const double* __restrict__ all_flux,
@@ -439,7 +410,7 @@ extern "C" __global__ void batch_pso_cost_multi_bazin(
 
     int k = source_k[src];
     const double* p = positions + (long long)(src * n_particles + pid) * n_params;
-    int se_idx = k * MB_COMP_PARAMS + 1;  // sigma_extra is after B
+    int se_idx = k * MB_COMP_PARAMS + 1;
     double sigma_extra = exp(p[se_idx]);
     double sigma_extra_sq = sigma_extra * sigma_extra;
 
@@ -541,7 +512,6 @@ extern "C" __global__ void batch_pso_cost(
     double neg_ll = 0.0;
 
     if (model_id == 7) {
-        // MetzgerKN: solve ODE once, then interpolate for all observations
         double t0 = p[3];
         double phase_max = 0.01;
         for (int i = obs_start; i < obs_end; i++) {
@@ -581,7 +551,6 @@ extern "C" __global__ void batch_pso_cost(
         }
     }
 
-    // Add population prior penalty (fused, avoids CPU round-trip)
     if (prior_centers != nullptr && prior_widths != nullptr) {
         double neg_lp = 0.0;
         for (int j = 0; j < n_params; j++) {
@@ -598,7 +567,7 @@ extern "C" __global__ void batch_pso_cost(
 }
 
 // ===========================================================================
-// GPU-resident PSO kernel: entire optimization runs on GPU
+// GPU-resident PSO kernels
 // ===========================================================================
 //
 // One thread block per source. blockDim.x = n_particles.
@@ -606,6 +575,8 @@ extern "C" __global__ void batch_pso_cost(
 // Eliminates per-iteration host-device transfers.
 
 #define PSO_MAX_PARAMS 7
+#define PSO_MAX_CACHED_OBS 128
+#define PSO_KN_MAX_PARAMS 5
 
 // xorshift64 PRNG for velocity updates
 __device__ inline unsigned long long pso_xorshift64(unsigned long long* state) {
@@ -620,6 +591,10 @@ __device__ inline unsigned long long pso_xorshift64(unsigned long long* state) {
 __device__ inline double pso_rand_uniform(unsigned long long* rng) {
     return (double)(pso_xorshift64(rng) & 0x1FFFFFFFFFFFFF) / (double)0x1FFFFFFFFFFFFF;
 }
+
+// ---------------------------------------------------------------------------
+// batch_pso_full: original GPU-resident PSO (all models, with obs caching)
+// ---------------------------------------------------------------------------
 
 extern "C" __global__ void batch_pso_full(
     const double* __restrict__ all_times,
@@ -639,7 +614,8 @@ extern "C" __global__ void batch_pso_full(
     int model_id,
     int max_iters,
     int stall_iters,
-    unsigned long long base_seed)
+    unsigned long long base_seed,
+    int max_obs)
 {
     int src = blockIdx.x;
     int pid = threadIdx.x;
@@ -675,7 +651,7 @@ extern "C" __global__ void batch_pso_full(
     }
     double pbest_cost = 1e99;
 
-    // Shared memory layout
+    // Shared memory layout: PSO state + optional observation cache
     extern __shared__ char smem[];
     double* s_gbest_pos  = (double*)smem;
     double* s_gbest_cost = s_gbest_pos + n_params;
@@ -684,20 +660,47 @@ extern "C" __global__ void batch_pso_full(
     int*    s_stall      = (int*)(s_positions + n_particles * n_params);
     int*    s_done       = s_stall + 1;
 
+    // Observation cache follows PSO state
+    char*   obs_base     = (char*)(s_done + 1);
+    // Align to 8 bytes
+    obs_base = (char*)(((unsigned long long)obs_base + 7) & ~7ULL);
+    int use_cache = (n_obs <= max_obs && n_obs <= PSO_MAX_CACHED_OBS);
+    double* s_times      = (double*)obs_base;
+    double* s_flux       = s_times + (use_cache ? n_obs : 0);
+    double* s_obs_var    = s_flux + (use_cache ? n_obs : 0);
+    double* s_upper_flux = s_obs_var + (use_cache ? n_obs : 0);
+    int*    s_is_upper   = (int*)(s_upper_flux + (use_cache ? n_obs : 0));
+
     if (pid == 0) {
         *s_gbest_cost = 1e99;
         *s_stall = 0;
         *s_done = 0;
     }
+
+    // Cooperative load of observation data into shared memory
+    if (use_cache) {
+        for (int i = pid; i < n_obs; i += n_particles) {
+            s_times[i]      = all_times[obs_start + i];
+            s_flux[i]       = all_flux[obs_start + i];
+            s_obs_var[i]    = all_obs_var[obs_start + i];
+            s_upper_flux[i] = all_upper_flux[obs_start + i];
+            s_is_upper[i]   = all_is_upper[obs_start + i];
+        }
+    }
     __syncthreads();
+
+    // Observation pointers: shared if cached, global otherwise
+    const double* obs_t  = use_cache ? s_times      : (all_times + obs_start);
+    const double* obs_f  = use_cache ? s_flux       : (all_flux + obs_start);
+    const double* obs_v  = use_cache ? s_obs_var    : (all_obs_var + obs_start);
+    const double* obs_uf = use_cache ? s_upper_flux : (all_upper_flux + obs_start);
+    const int*    obs_u  = use_cache ? s_is_upper   : (all_is_upper + obs_start);
 
     double w_max_pso = 0.9, w_min_pso = 0.4, c1 = 1.5, c2 = 1.5;
     double inv_max_iters = 1.0 / (double)max_iters;
     double prev_gbest_val = 1e99;
 
     for (int iter = 0; iter < max_iters; iter++) {
-        // All threads must reach __syncthreads() together, so check
-        // s_done uniformly after a barrier rather than breaking early.
         __syncthreads();
         if (*s_done) break;
 
@@ -709,8 +712,8 @@ extern "C" __global__ void batch_pso_full(
         if (model_id == 7) {
             double t0 = pos[3];
             double phase_max = 0.01;
-            for (int i = obs_start; i < obs_end; i++) {
-                double ph = all_times[i] - t0;
+            for (int i = 0; i < n_obs; i++) {
+                double ph = obs_t[i] - t0;
                 if (ph > phase_max) phase_max = ph;
             }
             double grid_t[METZGER_PSO_NGRID], grid_lrad[METZGER_PSO_NGRID];
@@ -720,16 +723,16 @@ extern "C" __global__ void batch_pso_full(
             } else {
                 double se = exp(pos[n_params - 1]);
                 double se_sq = se * se;
-                for (int i = obs_start; i < obs_end; i++) {
-                    double phase = all_times[i] - t0;
+                for (int i = 0; i < n_obs; i++) {
+                    double phase = obs_t[i] - t0;
                     double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
                     if (!isfinite(pred)) { neg_ll = 1e99; break; }
-                    double total_var = all_obs_var[i] + se_sq;
-                    if (all_is_upper[i]) {
-                        double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                    double total_var = obs_v[i] + se_sq;
+                    if (obs_u[i]) {
+                        double z = (obs_uf[i] - pred) / sqrt(total_var);
                         neg_ll -= log_normal_cdf_d(z);
                     } else {
-                        double diff = pred - all_flux[i];
+                        double diff = pred - obs_f[i];
                         neg_ll += diff * diff / total_var + log(total_var);
                     }
                 }
@@ -737,15 +740,15 @@ extern "C" __global__ void batch_pso_full(
         } else {
             double se = exp(pos[n_params - 1]);
             double se_sq = se * se;
-            for (int i = obs_start; i < obs_end; i++) {
-                double pred = eval_model_at(model_id, pos, all_times[i]);
+            for (int i = 0; i < n_obs; i++) {
+                double pred = eval_model_at(model_id, pos, obs_t[i]);
                 if (!isfinite(pred)) { neg_ll = 1e99; break; }
-                double total_var = all_obs_var[i] + se_sq;
-                if (all_is_upper[i]) {
-                    double z = (all_upper_flux[i] - pred) / sqrt(total_var);
+                double total_var = obs_v[i] + se_sq;
+                if (obs_u[i]) {
+                    double z = (obs_uf[i] - pred) / sqrt(total_var);
                     neg_ll -= log_normal_cdf_d(z);
                 } else {
-                    double diff = pred - all_flux[i];
+                    double diff = pred - obs_f[i];
                     neg_ll += diff * diff / total_var + log(total_var);
                 }
             }
@@ -753,7 +756,6 @@ extern "C" __global__ void batch_pso_full(
 
         double cost = neg_ll / (double)n_obs;
 
-        // Add population prior penalty
         if (prior_centers != nullptr && prior_widths != nullptr) {
             double neg_lp = 0.0;
             for (int j = 0; j < n_params; j++) {
@@ -766,19 +768,16 @@ extern "C" __global__ void batch_pso_full(
             cost += neg_lp / ((double)n_obs * (double)n_obs);
         }
 
-        // Update personal best
         if (cost < pbest_cost) {
             pbest_cost = cost;
             for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
         }
 
-        // === Block-level gbest reduction via shared memory ===
         s_costs[pid] = pbest_cost;
         for (int d = 0; d < n_params; d++)
             s_positions[pid * n_params + d] = pbest_p[d];
         __syncthreads();
 
-        // Thread 0 finds global best
         if (pid == 0) {
             for (int p = 0; p < n_particles; p++) {
                 if (s_costs[p] < *s_gbest_cost) {
@@ -788,7 +787,6 @@ extern "C" __global__ void batch_pso_full(
                 }
             }
 
-            // Stall detection
             double improved_threshold = 0.01 * fmax(fabs(prev_gbest_val), 1e-10);
             if (prev_gbest_val - *s_gbest_cost > improved_threshold) {
                 *s_stall = 0;
@@ -800,11 +798,9 @@ extern "C" __global__ void batch_pso_full(
         }
         __syncthreads();
 
-        // Read gbest into registers for velocity update
         double gbest[PSO_MAX_PARAMS];
         for (int d = 0; d < n_params; d++) gbest[d] = s_gbest_pos[d];
 
-        // === Update velocity and position ===
         for (int d = 0; d < n_params; d++) {
             double r1 = pso_rand_uniform(&rng);
             double r2 = pso_rand_uniform(&rng);
@@ -831,11 +827,764 @@ extern "C" __global__ void batch_pso_full(
         __syncthreads();
     }
 
-    // Write final gbest (thread 0 only)
     if (pid == 0) {
         for (int d = 0; d < n_params; d++)
             out_gbest_pos[src * n_params + d] = s_gbest_pos[d];
         out_gbest_cost[src] = *s_gbest_cost;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// batch_pso_full_std: non-KN models only
+// ---------------------------------------------------------------------------
+// Eliminates MetzgerKN ODE arrays from register/local memory allocation,
+// improving occupancy for models 0-6.
+
+extern "C" __global__ void batch_pso_full_std(
+    const double* __restrict__ all_times,
+    const double* __restrict__ all_flux,
+    const double* __restrict__ all_obs_var,
+    const int*    __restrict__ all_is_upper,
+    const double* __restrict__ all_upper_flux,
+    const int*    __restrict__ source_offsets,
+    const double* __restrict__ bounds_lower,
+    const double* __restrict__ bounds_upper,
+    const double* __restrict__ prior_centers,
+    const double* __restrict__ prior_widths,
+    double* __restrict__ out_gbest_pos,
+    double* __restrict__ out_gbest_cost,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    int src = blockIdx.x;
+    int pid = threadIdx.x;
+    if (pid >= n_particles) return;
+
+    int obs_start = source_offsets[src];
+    int obs_end   = source_offsets[src + 1];
+    int n_obs     = obs_end - obs_start;
+    if (n_obs <= 0) {
+        if (pid == 0) out_gbest_cost[src] = 1e99;
+        return;
+    }
+
+    double lower[PSO_MAX_PARAMS], upper[PSO_MAX_PARAMS], v_max[PSO_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        lower[d] = bounds_lower[d];
+        upper[d] = bounds_upper[d];
+        v_max[d] = 0.5 * (upper[d] - lower[d]);
+    }
+
+    unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL + (unsigned long long)pid * 137ULL + 1ULL;
+    pso_xorshift64(&rng);
+    pso_xorshift64(&rng);
+
+    double pos[PSO_MAX_PARAMS], vel[PSO_MAX_PARAMS], pbest_p[PSO_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        pos[d] = lower[d] + pso_rand_uniform(&rng) * (upper[d] - lower[d]);
+        vel[d] = v_max[d] * 0.2 * (2.0 * pso_rand_uniform(&rng) - 1.0);
+        pbest_p[d] = pos[d];
+    }
+    double pbest_cost = 1e99;
+
+    extern __shared__ char smem[];
+    double* s_gbest_pos  = (double*)smem;
+    double* s_gbest_cost = s_gbest_pos + n_params;
+    double* s_costs      = s_gbest_cost + 1;
+    double* s_positions  = s_costs + n_particles;
+    int*    s_stall      = (int*)(s_positions + n_particles * n_params);
+    int*    s_done       = s_stall + 1;
+
+    char*   obs_base     = (char*)(s_done + 1);
+    obs_base = (char*)(((unsigned long long)obs_base + 7) & ~7ULL);
+    int use_cache = (n_obs <= max_obs && n_obs <= PSO_MAX_CACHED_OBS);
+    double* s_times      = (double*)obs_base;
+    double* s_flux       = s_times + (use_cache ? n_obs : 0);
+    double* s_obs_var    = s_flux + (use_cache ? n_obs : 0);
+    double* s_upper_flux = s_obs_var + (use_cache ? n_obs : 0);
+    int*    s_is_upper   = (int*)(s_upper_flux + (use_cache ? n_obs : 0));
+
+    if (pid == 0) {
+        *s_gbest_cost = 1e99;
+        *s_stall = 0;
+        *s_done = 0;
+    }
+
+    if (use_cache) {
+        for (int i = pid; i < n_obs; i += n_particles) {
+            s_times[i]      = all_times[obs_start + i];
+            s_flux[i]       = all_flux[obs_start + i];
+            s_obs_var[i]    = all_obs_var[obs_start + i];
+            s_upper_flux[i] = all_upper_flux[obs_start + i];
+            s_is_upper[i]   = all_is_upper[obs_start + i];
+        }
+    }
+    __syncthreads();
+
+    const double* obs_t  = use_cache ? s_times      : (all_times + obs_start);
+    const double* obs_f  = use_cache ? s_flux       : (all_flux + obs_start);
+    const double* obs_v  = use_cache ? s_obs_var    : (all_obs_var + obs_start);
+    const double* obs_uf = use_cache ? s_upper_flux : (all_upper_flux + obs_start);
+    const int*    obs_u  = use_cache ? s_is_upper   : (all_is_upper + obs_start);
+
+    double w_max_pso = 0.9, w_min_pso = 0.4, c1 = 1.5, c2 = 1.5;
+    double inv_max_iters = 1.0 / (double)max_iters;
+    double prev_gbest_val = 1e99;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        __syncthreads();
+        if (*s_done) break;
+
+        double w = w_max_pso - (w_max_pso - w_min_pso) * (double)iter * inv_max_iters;
+
+        // Cost evaluation: standard models only (no KN ODE arrays)
+        double se = exp(pos[n_params - 1]);
+        double se_sq = se * se;
+        double neg_ll = 0.0;
+        for (int i = 0; i < n_obs; i++) {
+            double pred = eval_model_at(model_id, pos, obs_t[i]);
+            if (!isfinite(pred)) { neg_ll = 1e99; break; }
+            double total_var = obs_v[i] + se_sq;
+            if (obs_u[i]) {
+                double z = (obs_uf[i] - pred) / sqrt(total_var);
+                neg_ll -= log_normal_cdf_d(z);
+            } else {
+                double diff = pred - obs_f[i];
+                neg_ll += diff * diff / total_var + log(total_var);
+            }
+        }
+
+        double cost = neg_ll / (double)n_obs;
+
+        if (prior_centers != nullptr && prior_widths != nullptr) {
+            double neg_lp = 0.0;
+            for (int j = 0; j < n_params; j++) {
+                double pw = prior_widths[j];
+                if (pw > 0.0) {
+                    double z = (pos[j] - prior_centers[j]) / pw;
+                    neg_lp += 0.5 * z * z;
+                }
+            }
+            cost += neg_lp / ((double)n_obs * (double)n_obs);
+        }
+
+        if (cost < pbest_cost) {
+            pbest_cost = cost;
+            for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
+        }
+
+        s_costs[pid] = pbest_cost;
+        for (int d = 0; d < n_params; d++)
+            s_positions[pid * n_params + d] = pbest_p[d];
+        __syncthreads();
+
+        if (pid == 0) {
+            for (int p = 0; p < n_particles; p++) {
+                if (s_costs[p] < *s_gbest_cost) {
+                    *s_gbest_cost = s_costs[p];
+                    for (int d = 0; d < n_params; d++)
+                        s_gbest_pos[d] = s_positions[p * n_params + d];
+                }
+            }
+
+            double improved_threshold = 0.01 * fmax(fabs(prev_gbest_val), 1e-10);
+            if (prev_gbest_val - *s_gbest_cost > improved_threshold) {
+                *s_stall = 0;
+                prev_gbest_val = *s_gbest_cost;
+            } else {
+                *s_stall = *s_stall + 1;
+                if (*s_stall >= stall_iters) *s_done = 1;
+            }
+        }
+        __syncthreads();
+
+        double gbest[PSO_MAX_PARAMS];
+        for (int d = 0; d < n_params; d++) gbest[d] = s_gbest_pos[d];
+
+        for (int d = 0; d < n_params; d++) {
+            double r1 = pso_rand_uniform(&rng);
+            double r2 = pso_rand_uniform(&rng);
+            double v_new = w * vel[d]
+                + c1 * r1 * (pbest_p[d] - pos[d])
+                + c2 * r2 * (gbest[d] - pos[d]);
+
+            if (v_new > v_max[d]) v_new = v_max[d];
+            if (v_new < -v_max[d]) v_new = -v_max[d];
+
+            double new_pos = pos[d] + v_new;
+
+            if (new_pos <= lower[d]) {
+                pos[d] = lower[d];
+                vel[d] = 0.0;
+            } else if (new_pos >= upper[d]) {
+                pos[d] = upper[d];
+                vel[d] = 0.0;
+            } else {
+                pos[d] = new_pos;
+                vel[d] = v_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (pid == 0) {
+        for (int d = 0; d < n_params; d++)
+            out_gbest_pos[src * n_params + d] = s_gbest_pos[d];
+        out_gbest_cost[src] = *s_gbest_cost;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// batch_pso_full_kn: MetzgerKN only
+// ---------------------------------------------------------------------------
+// Separated from std to avoid ODE array allocation hurting non-KN occupancy.
+
+extern "C" __global__ void batch_pso_full_kn(
+    const double* __restrict__ all_times,
+    const double* __restrict__ all_flux,
+    const double* __restrict__ all_obs_var,
+    const int*    __restrict__ all_is_upper,
+    const double* __restrict__ all_upper_flux,
+    const int*    __restrict__ source_offsets,
+    const double* __restrict__ bounds_lower,
+    const double* __restrict__ bounds_upper,
+    const double* __restrict__ prior_centers,
+    const double* __restrict__ prior_widths,
+    double* __restrict__ out_gbest_pos,
+    double* __restrict__ out_gbest_cost,
+    int n_particles,
+    int n_params,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    int src = blockIdx.x;
+    int pid = threadIdx.x;
+    if (pid >= n_particles) return;
+
+    int obs_start = source_offsets[src];
+    int obs_end   = source_offsets[src + 1];
+    int n_obs     = obs_end - obs_start;
+    if (n_obs <= 0) {
+        if (pid == 0) out_gbest_cost[src] = 1e99;
+        return;
+    }
+
+    double lower[PSO_KN_MAX_PARAMS], upper[PSO_KN_MAX_PARAMS], v_max_d[PSO_KN_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        lower[d] = bounds_lower[d];
+        upper[d] = bounds_upper[d];
+        v_max_d[d] = 0.5 * (upper[d] - lower[d]);
+    }
+
+    unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL + (unsigned long long)pid * 137ULL + 1ULL;
+    pso_xorshift64(&rng);
+    pso_xorshift64(&rng);
+
+    double pos[PSO_KN_MAX_PARAMS], vel[PSO_KN_MAX_PARAMS], pbest_p[PSO_KN_MAX_PARAMS];
+    for (int d = 0; d < n_params; d++) {
+        pos[d] = lower[d] + pso_rand_uniform(&rng) * (upper[d] - lower[d]);
+        vel[d] = v_max_d[d] * 0.2 * (2.0 * pso_rand_uniform(&rng) - 1.0);
+        pbest_p[d] = pos[d];
+    }
+    double pbest_cost = 1e99;
+
+    extern __shared__ char smem[];
+    double* s_gbest_pos  = (double*)smem;
+    double* s_gbest_cost = s_gbest_pos + n_params;
+    double* s_costs      = s_gbest_cost + 1;
+    double* s_positions  = s_costs + n_particles;
+    int*    s_stall      = (int*)(s_positions + n_particles * n_params);
+    int*    s_done       = s_stall + 1;
+
+    char*   obs_base     = (char*)(s_done + 1);
+    obs_base = (char*)(((unsigned long long)obs_base + 7) & ~7ULL);
+    int use_cache = (n_obs <= max_obs && n_obs <= PSO_MAX_CACHED_OBS);
+    double* s_times      = (double*)obs_base;
+    double* s_flux       = s_times + (use_cache ? n_obs : 0);
+    double* s_obs_var    = s_flux + (use_cache ? n_obs : 0);
+    double* s_upper_flux = s_obs_var + (use_cache ? n_obs : 0);
+    int*    s_is_upper   = (int*)(s_upper_flux + (use_cache ? n_obs : 0));
+
+    if (pid == 0) {
+        *s_gbest_cost = 1e99;
+        *s_stall = 0;
+        *s_done = 0;
+    }
+
+    if (use_cache) {
+        for (int i = pid; i < n_obs; i += n_particles) {
+            s_times[i]      = all_times[obs_start + i];
+            s_flux[i]       = all_flux[obs_start + i];
+            s_obs_var[i]    = all_obs_var[obs_start + i];
+            s_upper_flux[i] = all_upper_flux[obs_start + i];
+            s_is_upper[i]   = all_is_upper[obs_start + i];
+        }
+    }
+    __syncthreads();
+
+    const double* obs_t  = use_cache ? s_times      : (all_times + obs_start);
+    const double* obs_f  = use_cache ? s_flux       : (all_flux + obs_start);
+    const double* obs_v  = use_cache ? s_obs_var    : (all_obs_var + obs_start);
+    const double* obs_uf = use_cache ? s_upper_flux : (all_upper_flux + obs_start);
+    const int*    obs_u  = use_cache ? s_is_upper   : (all_is_upper + obs_start);
+
+    double w_max_pso = 0.9, w_min_pso = 0.4, c1 = 1.5, c2 = 1.5;
+    double inv_max_iters = 1.0 / (double)max_iters;
+    double prev_gbest_val = 1e99;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        __syncthreads();
+        if (*s_done) break;
+
+        double w = w_max_pso - (w_max_pso - w_min_pso) * (double)iter * inv_max_iters;
+
+        // Cost evaluation: MetzgerKN ODE only
+        double t0 = pos[3];
+        double phase_max = 0.01;
+        for (int i = 0; i < n_obs; i++) {
+            double ph = obs_t[i] - t0;
+            if (ph > phase_max) phase_max = ph;
+        }
+        double grid_t[METZGER_PSO_NGRID], grid_lrad[METZGER_PSO_NGRID];
+        double neg_ll = 0.0;
+        double l_peak = metzger_kn_solve_grid(pos, phase_max * 1.05, grid_t, grid_lrad);
+        if (l_peak <= 0.0 || !isfinite(l_peak)) {
+            neg_ll = 1e99;
+        } else {
+            double se = exp(pos[n_params - 1]);
+            double se_sq = se * se;
+            for (int i = 0; i < n_obs; i++) {
+                double phase = obs_t[i] - t0;
+                double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
+                if (!isfinite(pred)) { neg_ll = 1e99; break; }
+                double total_var = obs_v[i] + se_sq;
+                if (obs_u[i]) {
+                    double z = (obs_uf[i] - pred) / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = pred - obs_f[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
+                }
+            }
+        }
+
+        double cost = neg_ll / (double)n_obs;
+
+        if (prior_centers != nullptr && prior_widths != nullptr) {
+            double neg_lp = 0.0;
+            for (int j = 0; j < n_params; j++) {
+                double pw = prior_widths[j];
+                if (pw > 0.0) {
+                    double z = (pos[j] - prior_centers[j]) / pw;
+                    neg_lp += 0.5 * z * z;
+                }
+            }
+            cost += neg_lp / ((double)n_obs * (double)n_obs);
+        }
+
+        if (cost < pbest_cost) {
+            pbest_cost = cost;
+            for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
+        }
+
+        s_costs[pid] = pbest_cost;
+        for (int d = 0; d < n_params; d++)
+            s_positions[pid * n_params + d] = pbest_p[d];
+        __syncthreads();
+
+        if (pid == 0) {
+            for (int p = 0; p < n_particles; p++) {
+                if (s_costs[p] < *s_gbest_cost) {
+                    *s_gbest_cost = s_costs[p];
+                    for (int d = 0; d < n_params; d++)
+                        s_gbest_pos[d] = s_positions[p * n_params + d];
+                }
+            }
+
+            double improved_threshold = 0.01 * fmax(fabs(prev_gbest_val), 1e-10);
+            if (prev_gbest_val - *s_gbest_cost > improved_threshold) {
+                *s_stall = 0;
+                prev_gbest_val = *s_gbest_cost;
+            } else {
+                *s_stall = *s_stall + 1;
+                if (*s_stall >= stall_iters) *s_done = 1;
+            }
+        }
+        __syncthreads();
+
+        double gbest[PSO_KN_MAX_PARAMS];
+        for (int d = 0; d < n_params; d++) gbest[d] = s_gbest_pos[d];
+
+        for (int d = 0; d < n_params; d++) {
+            double r1 = pso_rand_uniform(&rng);
+            double r2 = pso_rand_uniform(&rng);
+            double v_new = w * vel[d]
+                + c1 * r1 * (pbest_p[d] - pos[d])
+                + c2 * r2 * (gbest[d] - pos[d]);
+
+            if (v_new > v_max_d[d]) v_new = v_max_d[d];
+            if (v_new < -v_max_d[d]) v_new = -v_max_d[d];
+
+            double new_pos = pos[d] + v_new;
+
+            if (new_pos <= lower[d]) {
+                pos[d] = lower[d];
+                vel[d] = 0.0;
+            } else if (new_pos >= upper[d]) {
+                pos[d] = upper[d];
+                vel[d] = 0.0;
+            } else {
+                pos[d] = new_pos;
+                vel[d] = v_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (pid == 0) {
+        for (int d = 0; d < n_params; d++)
+            out_gbest_pos[src * n_params + d] = s_gbest_pos[d];
+        out_gbest_cost[src] = *s_gbest_cost;
+    }
+}
+
+// ===========================================================================
+// GPU-resident MultiBazin PSO
+// ===========================================================================
+//
+// One block per source, blockDim.x = n_particles.
+// Outer loop K=1..4 entirely on GPU. For K>1, thread 0 computes
+// residuals from K-1 fit and seeds particle 0. BIC model selection
+// with early-stop.
+
+#define MB_PSO_MAX_PARAMS 18  // K=4: 4*4+2
+#define MB_PSO_MAX_K 4
+
+extern "C" __global__ void batch_pso_full_multi_bazin(
+    const double* __restrict__ all_times,
+    const double* __restrict__ all_flux,
+    const double* __restrict__ all_obs_var,
+    const int*    __restrict__ all_is_upper,
+    const double* __restrict__ all_upper_flux,
+    const int*    __restrict__ source_offsets,
+    double global_t_min,
+    double global_t_max,
+    int*    __restrict__ out_best_k,
+    double* __restrict__ out_best_params,
+    double* __restrict__ out_best_cost,
+    double* __restrict__ out_best_bic,
+    double* __restrict__ out_per_k_cost,
+    double* __restrict__ out_per_k_bic,
+    int n_particles,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    int src = blockIdx.x;
+    int pid = threadIdx.x;
+    if (pid >= n_particles) return;
+
+    int obs_start = source_offsets[src];
+    int obs_end   = source_offsets[src + 1];
+    int n_obs     = obs_end - obs_start;
+    if (n_obs <= 0) {
+        if (pid == 0) {
+            out_best_k[src] = 1;
+            out_best_cost[src] = 1e99;
+            out_best_bic[src] = 1e99;
+        }
+        return;
+    }
+
+    // Shared memory layout:
+    //   s_gbest_pos[MB_PSO_MAX_PARAMS] + s_gbest_cost[1] +
+    //   s_costs[n_particles] + s_positions[n_particles * MB_PSO_MAX_PARAMS] +
+    //   s_bounds_lo[MB_PSO_MAX_PARAMS] + s_bounds_hi[MB_PSO_MAX_PARAMS] +
+    //   s_prev_params[MB_PSO_MAX_PARAMS] +
+    //   s_stall[1] + s_done[1] + s_source_stopped[1] +
+    //   s_best_k[1] + s_best_bic[1] + s_prev_bic[1] +
+    //   [obs cache]
+    extern __shared__ char smem[];
+    double* s_gbest_pos   = (double*)smem;
+    double* s_gbest_cost  = s_gbest_pos + MB_PSO_MAX_PARAMS;
+    double* s_costs       = s_gbest_cost + 1;
+    double* s_positions   = s_costs + n_particles;
+    double* s_bounds_lo   = s_positions + n_particles * MB_PSO_MAX_PARAMS;
+    double* s_bounds_hi   = s_bounds_lo + MB_PSO_MAX_PARAMS;
+    double* s_prev_params = s_bounds_hi + MB_PSO_MAX_PARAMS;
+    double* s_best_bic_sh = s_prev_params + MB_PSO_MAX_PARAMS;
+    double* s_prev_bic    = s_best_bic_sh + 1;
+    int*    s_stall       = (int*)(s_prev_bic + 1);
+    int*    s_done        = s_stall + 1;
+    int*    s_stopped     = s_done + 1;
+    int*    s_best_k      = s_stopped + 1;
+
+    // Observation cache
+    char*   obs_base = (char*)(s_best_k + 1);
+    obs_base = (char*)(((unsigned long long)obs_base + 7) & ~7ULL);
+    int use_cache = (n_obs <= max_obs && n_obs <= PSO_MAX_CACHED_OBS);
+    double* s_times      = (double*)obs_base;
+    double* s_flux       = s_times + (use_cache ? n_obs : 0);
+    double* s_obs_var    = s_flux + (use_cache ? n_obs : 0);
+    double* s_upper_flux = s_obs_var + (use_cache ? n_obs : 0);
+    int*    s_is_upper   = (int*)(s_upper_flux + (use_cache ? n_obs : 0));
+
+    if (pid == 0) {
+        *s_stopped = 0;
+        *s_best_k = 1;
+        *s_best_bic_sh = 1e99;
+        *s_prev_bic = 1e99;
+        for (int d = 0; d < MB_PSO_MAX_PARAMS; d++) s_prev_params[d] = 0.0;
+    }
+
+    if (use_cache) {
+        for (int i = pid; i < n_obs; i += n_particles) {
+            s_times[i]      = all_times[obs_start + i];
+            s_flux[i]       = all_flux[obs_start + i];
+            s_obs_var[i]    = all_obs_var[obs_start + i];
+            s_upper_flux[i] = all_upper_flux[obs_start + i];
+            s_is_upper[i]   = all_is_upper[obs_start + i];
+        }
+    }
+    __syncthreads();
+
+    const double* obs_t  = use_cache ? s_times      : (all_times + obs_start);
+    const double* obs_f  = use_cache ? s_flux       : (all_flux + obs_start);
+    const double* obs_v  = use_cache ? s_obs_var    : (all_obs_var + obs_start);
+    const double* obs_uf = use_cache ? s_upper_flux : (all_upper_flux + obs_start);
+    const int*    obs_u  = use_cache ? s_is_upper   : (all_is_upper + obs_start);
+
+    // === Outer K loop ===
+    for (int k = 1; k <= MB_PSO_MAX_K; k++) {
+        __syncthreads();
+        if (*s_stopped) break;
+
+        int n_params = MB_COMP_PARAMS * k + 2;
+
+        // Thread 0 builds bounds for this K
+        if (pid == 0) {
+            for (int c = 0; c < k; c++) {
+                int off = c * MB_COMP_PARAMS;
+                s_bounds_lo[off + 0] = -3.0;   s_bounds_hi[off + 0] = 3.0;    // log_A
+                s_bounds_lo[off + 1] = global_t_min; s_bounds_hi[off + 1] = global_t_max; // t0
+                s_bounds_lo[off + 2] = -2.0;   s_bounds_hi[off + 2] = 5.0;    // log_tau_rise
+                s_bounds_lo[off + 3] = -2.0;   s_bounds_hi[off + 3] = 6.0;    // log_tau_fall
+            }
+            int tail = k * MB_COMP_PARAMS;
+            s_bounds_lo[tail] = -0.3;  s_bounds_hi[tail] = 0.3;   // B
+            s_bounds_lo[tail + 1] = -5.0; s_bounds_hi[tail + 1] = 0.0; // log_sigma_extra
+
+            *s_gbest_cost = 1e99;
+            *s_stall = 0;
+            *s_done = 0;
+        }
+        __syncthreads();
+
+        // Load bounds into registers
+        double lower[MB_PSO_MAX_PARAMS], upper[MB_PSO_MAX_PARAMS], v_max_d[MB_PSO_MAX_PARAMS];
+        for (int d = 0; d < n_params; d++) {
+            lower[d] = s_bounds_lo[d];
+            upper[d] = s_bounds_hi[d];
+            v_max_d[d] = 0.5 * (upper[d] - lower[d]);
+        }
+
+        // Initialize particle
+        unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL
+            + (unsigned long long)pid * 137ULL + (unsigned long long)k * 50000ULL + 1ULL;
+        pso_xorshift64(&rng);
+        pso_xorshift64(&rng);
+
+        double pos[MB_PSO_MAX_PARAMS], vel[MB_PSO_MAX_PARAMS], pbest_p[MB_PSO_MAX_PARAMS];
+
+        if (pid == 0 && k > 1) {
+            // Seed particle 0 from K-1 solution + residual peak
+            int prev_n_comp = (k - 1) * MB_COMP_PARAMS;
+            for (int d = 0; d < prev_n_comp; d++) pos[d] = s_prev_params[d];
+
+            // Find peak residual
+            double peak_val = -1e300;
+            double peak_t = obs_t[0];
+            for (int i = 0; i < n_obs; i++) {
+                if (obs_u[i]) continue;
+                double pred = multi_bazin_at(s_prev_params, k - 1, obs_t[i]);
+                double resid = obs_f[i] - pred;
+                if (resid > peak_val) {
+                    peak_val = resid;
+                    peak_t = obs_t[i];
+                }
+            }
+
+            // New component seeded at peak residual
+            int new_off = (k - 1) * MB_COMP_PARAMS;
+            pos[new_off + 0] = fmax(peak_val, 1e-10);
+            pos[new_off + 0] = log(pos[new_off + 0]);
+            pos[new_off + 1] = peak_t;
+            pos[new_off + 2] = 1.0;   // log_tau_rise
+            pos[new_off + 3] = 1.0;   // log_tau_fall
+
+            // Copy B and sigma_extra from previous
+            pos[k * MB_COMP_PARAMS] = s_prev_params[prev_n_comp]; // B
+            pos[k * MB_COMP_PARAMS + 1] = s_prev_params[prev_n_comp + 1]; // log_se
+
+            // Clamp
+            for (int d = 0; d < n_params; d++) {
+                if (pos[d] < lower[d]) pos[d] = lower[d];
+                if (pos[d] > upper[d]) pos[d] = upper[d];
+            }
+            for (int d = 0; d < n_params; d++)
+                vel[d] = v_max_d[d] * 0.02 * (2.0 * pso_rand_uniform(&rng) - 1.0);
+        } else {
+            // Random init
+            for (int d = 0; d < n_params; d++) {
+                pos[d] = lower[d] + pso_rand_uniform(&rng) * (upper[d] - lower[d]);
+                vel[d] = v_max_d[d] * 0.2 * (2.0 * pso_rand_uniform(&rng) - 1.0);
+            }
+        }
+
+        for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
+        double pbest_cost_k = 1e99;
+
+        __syncthreads();
+
+        double w_max_pso = 0.9, w_min_pso = 0.4, c1 = 1.5, c2 = 1.5;
+        double inv_max_iters = 1.0 / (double)max_iters;
+        double prev_gbest_val = 1e99;
+
+        // === Inner PSO loop ===
+        for (int iter = 0; iter < max_iters; iter++) {
+            __syncthreads();
+            if (*s_done) break;
+
+            double w = w_max_pso - (w_max_pso - w_min_pso) * (double)iter * inv_max_iters;
+
+            // Evaluate multi_bazin cost
+            int se_idx = k * MB_COMP_PARAMS + 1;
+            double se = exp(pos[se_idx]);
+            double se_sq = se * se;
+            double neg_ll = 0.0;
+            for (int i = 0; i < n_obs; i++) {
+                double pred = multi_bazin_at(pos, k, obs_t[i]);
+                if (!isfinite(pred)) { neg_ll = 1e99; break; }
+                double total_var = obs_v[i] + se_sq;
+                if (obs_u[i]) {
+                    double z = (obs_uf[i] - pred) / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = pred - obs_f[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
+                }
+            }
+            double cost = neg_ll / (double)n_obs;
+
+            if (cost < pbest_cost_k) {
+                pbest_cost_k = cost;
+                for (int d = 0; d < n_params; d++) pbest_p[d] = pos[d];
+            }
+
+            s_costs[pid] = pbest_cost_k;
+            for (int d = 0; d < n_params; d++)
+                s_positions[pid * MB_PSO_MAX_PARAMS + d] = pbest_p[d];
+            __syncthreads();
+
+            if (pid == 0) {
+                for (int p = 0; p < n_particles; p++) {
+                    if (s_costs[p] < *s_gbest_cost) {
+                        *s_gbest_cost = s_costs[p];
+                        for (int d = 0; d < n_params; d++)
+                            s_gbest_pos[d] = s_positions[p * MB_PSO_MAX_PARAMS + d];
+                    }
+                }
+
+                double improved_threshold = 0.01 * fmax(fabs(prev_gbest_val), 1e-10);
+                if (prev_gbest_val - *s_gbest_cost > improved_threshold) {
+                    *s_stall = 0;
+                    prev_gbest_val = *s_gbest_cost;
+                } else {
+                    *s_stall = *s_stall + 1;
+                    if (*s_stall >= stall_iters) *s_done = 1;
+                }
+            }
+            __syncthreads();
+
+            double gbest[MB_PSO_MAX_PARAMS];
+            for (int d = 0; d < n_params; d++) gbest[d] = s_gbest_pos[d];
+
+            for (int d = 0; d < n_params; d++) {
+                double r1 = pso_rand_uniform(&rng);
+                double r2 = pso_rand_uniform(&rng);
+                double v_new = w * vel[d]
+                    + c1 * r1 * (pbest_p[d] - pos[d])
+                    + c2 * r2 * (gbest[d] - pos[d]);
+
+                if (v_new > v_max_d[d]) v_new = v_max_d[d];
+                if (v_new < -v_max_d[d]) v_new = -v_max_d[d];
+
+                double new_pos = pos[d] + v_new;
+
+                if (new_pos <= lower[d]) {
+                    pos[d] = lower[d];
+                    vel[d] = 0.0;
+                } else if (new_pos >= upper[d]) {
+                    pos[d] = upper[d];
+                    vel[d] = 0.0;
+                } else {
+                    pos[d] = new_pos;
+                    vel[d] = v_new;
+                }
+            }
+            __syncthreads();
+        }
+
+        // Thread 0 computes BIC and updates tracking
+        if (pid == 0) {
+            double k_cost = *s_gbest_cost;
+            double n_obs_d = (double)n_obs;
+            double k_bic = 2.0 * k_cost * n_obs_d + (double)n_params * log(n_obs_d);
+
+            out_per_k_cost[src * MB_PSO_MAX_K + (k - 1)] = k_cost;
+            out_per_k_bic[src * MB_PSO_MAX_K + (k - 1)] = k_bic;
+
+            if (k_bic < *s_best_bic_sh) {
+                *s_best_bic_sh = k_bic;
+                *s_best_k = k;
+                // Write best params to output immediately (they'll be
+                // overwritten if a later K improves BIC further)
+                out_best_cost[src] = k_cost;
+                out_best_bic[src] = k_bic;
+                out_best_k[src] = k;
+                // Zero-fill then copy current K's params
+                for (int d = 0; d < MB_PSO_MAX_PARAMS; d++)
+                    out_best_params[src * MB_PSO_MAX_PARAMS + d] = 0.0;
+                for (int d = 0; d < n_params; d++)
+                    out_best_params[src * MB_PSO_MAX_PARAMS + d] = s_gbest_pos[d];
+            }
+
+            // Store params for seeding next K
+            for (int d = 0; d < n_params; d++) s_prev_params[d] = s_gbest_pos[d];
+
+            // Early stop: BIC worsened
+            if (k > 1 && k_bic > *s_prev_bic + 2.0) {
+                *s_stopped = 1;
+            }
+            *s_prev_bic = k_bic;
+        }
+        __syncthreads();
+
+        // Fill remaining per_k slots with NaN if stopped early
+        if (*s_stopped && pid == 0) {
+            for (int kk = k + 1; kk <= MB_PSO_MAX_K; kk++) {
+                out_per_k_cost[src * MB_PSO_MAX_K + (kk - 1)] = nan("");
+                out_per_k_bic[src * MB_PSO_MAX_K + (kk - 1)] = nan("");
+            }
+        }
     }
 }
 
@@ -864,7 +1613,6 @@ extern "C" void launch_metzger_kn(
     const double* params, const double* times, double* out,
     int n_draws, int n_times, int n_params, int /*grid*/, int block)
 {
-    // Recompute grid for n_draws (not n_draws*n_times)
     int g = (n_draws + block - 1) / block;
     metzger_kn_eval<<<g, block>>>(params, times, out, n_draws, n_times, n_params);
 }
@@ -893,6 +1641,18 @@ extern "C" void launch_batch_pso_cost(
         n_sources, n_particles, n_params, model_id);
 }
 
+// Compute shared memory bytes for PSO kernels with obs caching
+static size_t pso_smem_bytes(int n_params, int n_particles, int max_obs) {
+    size_t base = (n_params + 1 + n_particles + n_particles * n_params) * sizeof(double) + 2 * sizeof(int);
+    // Add alignment padding (8 bytes)
+    base = (base + 7) & ~7ULL;
+    int n_cached = max_obs < PSO_MAX_CACHED_OBS ? max_obs : PSO_MAX_CACHED_OBS;
+    if (n_cached > 0) {
+        base += 4 * n_cached * sizeof(double) + n_cached * sizeof(int);
+    }
+    return base;
+}
+
 extern "C" void launch_batch_pso_full(
     const double* all_times,
     const double* all_flux,
@@ -912,14 +1672,220 @@ extern "C" void launch_batch_pso_full(
     int model_id,
     int max_iters,
     int stall_iters,
-    unsigned long long base_seed)
+    unsigned long long base_seed,
+    int max_obs)
 {
-    size_t smem_bytes = (n_params + 1 + n_particles + n_particles * n_params) * sizeof(double) + 2 * sizeof(int);
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
     batch_pso_full<<<n_sources, n_particles, smem_bytes>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
         out_gbest_pos, out_gbest_cost,
-        n_particles, n_params, model_id, max_iters, stall_iters, base_seed);
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+}
+
+// Stream-aware launch wrapper
+extern "C" void launch_batch_pso_full_stream(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs,
+    cudaStream_t stream)
+{
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
+    batch_pso_full<<<n_sources, n_particles, smem_bytes, stream>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+}
+
+// Separate standard (non-KN) launch wrappers
+extern "C" void launch_batch_pso_full_std(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
+    batch_pso_full_std<<<n_sources, n_particles, smem_bytes>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+}
+
+extern "C" void launch_batch_pso_full_std_stream(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int model_id,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs,
+    cudaStream_t stream)
+{
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
+    batch_pso_full_std<<<n_sources, n_particles, smem_bytes, stream>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+}
+
+// Separate KN launch wrappers
+extern "C" void launch_batch_pso_full_kn(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
+    batch_pso_full_kn<<<n_sources, n_particles, smem_bytes>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs);
+}
+
+extern "C" void launch_batch_pso_full_kn_stream(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    const double* bounds_lower,
+    const double* bounds_upper,
+    const double* prior_centers,
+    const double* prior_widths,
+    double* out_gbest_pos,
+    double* out_gbest_cost,
+    int n_sources,
+    int n_particles,
+    int n_params,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs,
+    cudaStream_t stream)
+{
+    size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
+    batch_pso_full_kn<<<n_sources, n_particles, smem_bytes, stream>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
+        out_gbest_pos, out_gbest_cost,
+        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs);
+}
+
+// GPU-resident MultiBazin launch wrapper
+static size_t mb_pso_smem_bytes(int n_particles, int max_obs) {
+    // s_gbest_pos[18] + s_gbest_cost[1] + s_costs[n_particles] +
+    // s_positions[n_particles * 18] + s_bounds_lo[18] + s_bounds_hi[18] +
+    // s_prev_params[18] + s_best_bic[1] + s_prev_bic[1]
+    size_t base = (MB_PSO_MAX_PARAMS + 1 + n_particles + n_particles * MB_PSO_MAX_PARAMS
+                   + MB_PSO_MAX_PARAMS + MB_PSO_MAX_PARAMS + MB_PSO_MAX_PARAMS
+                   + 1 + 1) * sizeof(double);
+    // s_stall[1] + s_done[1] + s_stopped[1] + s_best_k[1]
+    base += 4 * sizeof(int);
+    // Align to 8 bytes
+    base = (base + 7) & ~7ULL;
+    // Obs cache
+    int n_cached = max_obs < PSO_MAX_CACHED_OBS ? max_obs : PSO_MAX_CACHED_OBS;
+    if (n_cached > 0) {
+        base += 4 * n_cached * sizeof(double) + n_cached * sizeof(int);
+    }
+    return base;
+}
+
+extern "C" void launch_batch_pso_full_multi_bazin(
+    const double* all_times,
+    const double* all_flux,
+    const double* all_obs_var,
+    const int*    all_is_upper,
+    const double* all_upper_flux,
+    const int*    source_offsets,
+    double global_t_min,
+    double global_t_max,
+    int*    out_best_k,
+    double* out_best_params,
+    double* out_best_cost,
+    double* out_best_bic,
+    double* out_per_k_cost,
+    double* out_per_k_bic,
+    int n_sources,
+    int n_particles,
+    int max_iters,
+    int stall_iters,
+    unsigned long long base_seed,
+    int max_obs)
+{
+    size_t smem_bytes = mb_pso_smem_bytes(n_particles, max_obs);
+    batch_pso_full_multi_bazin<<<n_sources, n_particles, smem_bytes>>>(
+        all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
+        source_offsets, global_t_min, global_t_max,
+        out_best_k, out_best_params, out_best_cost, out_best_bic,
+        out_per_k_cost, out_per_k_bic,
+        n_particles, max_iters, stall_iters, base_seed, max_obs);
 }
 
 extern "C" void launch_batch_pso_cost_multi_bazin(

@@ -17,6 +17,14 @@ __device__ inline double lc_softplus_grad(double x) {
     return exp(x) / (1.0 + exp(x));
 }
 
+// Fused softplus + sigmoid sharing one exp(x) call.
+// sp = softplus(x), sg = sigmoid(x) = softplus_grad(x).
+__device__ inline void lc_softplus_both(double x, double* sp, double* sg) {
+    double ex = exp(x);
+    *sp = log(1.0 + ex) + 1e-6;
+    *sg = ex / (1.0 + ex);
+}
+
 __device__ inline double lc_sigmoid(double x) {
     return 1.0 / (1.0 + exp(-x));
 }
@@ -223,8 +231,8 @@ __device__ inline void lc_tde_grad(const double* p, double t, double* out) {
     double alpha    = p[5];
     double phase    = t - t0;
     double sig      = lc_sigmoid(phase / tau_rise);
-    double ps       = lc_softplus(phase);
-    double sig_p    = lc_softplus_grad(phase);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
     double w        = 1.0 + ps / tau_fall;
     double decay    = pow(w, -alpha);
     double base     = a * sig * decay;
@@ -247,8 +255,8 @@ __device__ inline void lc_arnett_grad(const double* p, double t, double* out) {
     double tau_m   = exp(p[2]);
     double logit_f = p[3];
     double phase   = t - t0;
-    double ps      = lc_softplus(phase);
-    double sig_p   = lc_softplus_grad(phase);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
     double f       = lc_sigmoid(logit_f);
     double e_ni    = exp(-ps / 8.8);
     double e_co    = exp(-ps / 111.3);
@@ -274,8 +282,8 @@ __device__ inline void lc_magnetar_grad(const double* p, double t, double* out) 
     double tau_sd   = exp(p[2]);
     double tau_diff = exp(p[3]);
     double phase    = t - t0;
-    double ps       = lc_softplus(phase);
-    double sig_p    = lc_softplus_grad(phase);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
     double w        = 1.0 + ps / tau_sd;
     double w3       = w * w * w;
     double spindown = 1.0 / (w * w);
@@ -301,8 +309,8 @@ __device__ inline void lc_shock_cooling_grad(const double* p, double t, double* 
     double tau_tr = exp(p[3]);
     double phase  = t - t0;
     double sig5   = lc_sigmoid(phase * 5.0);
-    double ps     = lc_softplus(phase);
-    double sig_p  = lc_softplus_grad(phase);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
     double cooling = pow(ps, -n);
     double ratio   = ps / tau_tr;
     double cutoff  = exp(-ratio * ratio);
@@ -325,8 +333,8 @@ __device__ inline void lc_afterglow_grad(const double* p, double t, double* out)
     double alpha1 = p[3];
     double alpha2 = p[4];
     double phase  = t - t0;
-    double ps     = lc_softplus(phase);
-    double sig_p  = lc_softplus_grad(phase);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
     double r      = ps / t_b;
     double ln_r   = log(r);
     double u1     = exp(2.0 * alpha1 * ln_r);
@@ -344,6 +352,236 @@ __device__ inline void lc_afterglow_grad(const double* p, double t, double* out)
     out[3] = a * (-0.5) * u15 * 2.0 * ln_r * u1;
     out[4] = a * (-0.5) * u15 * 2.0 * ln_r * u2;
     out[5] = 0.0;
+}
+
+// ===========================================================================
+// Fused eval+grad functions (return flux, write gradient into out[])
+// ===========================================================================
+
+// Bazin: returns flux = a * exp(-dt/tau_fall) * sigmoid(dt/tau_rise) + b
+__device__ inline double lc_bazin_at_and_grad(const double* p, double t, double* out) {
+    double a        = exp(p[0]);
+    double t0       = p[2];
+    double tau_rise = exp(p[3]);
+    double tau_fall = exp(p[4]);
+    double dt       = t - t0;
+    double e_fall   = exp(-dt / tau_fall);
+    double sig      = lc_sigmoid(dt / tau_rise);
+    double base     = a * e_fall * sig;
+    out[0] = base;                                         // d/d(log_a)
+    out[1] = 1.0;                                          // d/d(b)
+    out[2] = base * (1.0/tau_fall - (1.0-sig)/tau_rise);   // d/d(t0)
+    out[3] = -base * (1.0 - sig) * dt / tau_rise;         // d/d(log_tau_rise)
+    out[4] = base * dt / tau_fall;                         // d/d(log_tau_fall)
+    out[5] = 0.0;                                          // d/d(log_sigma_extra)
+    return base + p[1];
+}
+
+// Villar: returns flux = a * sig_rise * piece
+__device__ inline double lc_villar_at_and_grad(const double* p, double t, double* out) {
+    double a        = exp(p[0]);
+    double beta     = p[1];
+    double gamma    = exp(p[2]);
+    double t0       = p[3];
+    double tau_rise = exp(p[4]);
+    double tau_fall = exp(p[5]);
+    double phase    = t - t0;
+    double k        = 10.0;
+    double sig_rise = lc_sigmoid(phase / tau_rise);
+    double w        = lc_sigmoid(k * (phase - gamma));
+    double piece_left  = 1.0 - beta * phase;
+    double e_decay     = exp((gamma - phase) / tau_fall);
+    double piece_right = (1.0 - beta * gamma) * e_decay;
+    double piece       = (1.0 - w) * piece_left + w * piece_right;
+    double flux        = a * sig_rise * piece;
+
+    out[0] = flux;
+
+    double d_pl_dbeta = -phase;
+    double d_pr_dbeta = -gamma * e_decay;
+    out[1] = a * sig_rise * ((1.0 - w) * d_pl_dbeta + w * d_pr_dbeta);
+
+    double dw_dgamma = -k * w * (1.0 - w);
+    double dw_dloggamma = dw_dgamma * gamma;
+    double dpr_dgamma = e_decay * (-beta + (1.0 - beta * gamma) / tau_fall);
+    double dpr_dloggamma = dpr_dgamma * gamma;
+    double d_piece_dloggamma = dw_dloggamma * (piece_right - piece_left) + w * dpr_dloggamma;
+    out[2] = a * sig_rise * d_piece_dloggamma;
+
+    double dsig_dphase = sig_rise * (1.0 - sig_rise) / tau_rise;
+    double dsig_dt0    = -dsig_dphase;
+    double dw_dphase   = k * w * (1.0 - w);
+    double dw_dt0      = -dw_dphase;
+    double dpl_dt0     = beta;
+    double dpr_dt0     = (1.0 - beta * gamma) * e_decay / tau_fall;
+    double d_piece_dt0 = dw_dt0 * (piece_right - piece_left) + (1.0 - w) * dpl_dt0 + w * dpr_dt0;
+    out[3] = a * (dsig_dt0 * piece + sig_rise * d_piece_dt0);
+
+    out[4] = a * piece * sig_rise * (1.0 - sig_rise) * (-phase / tau_rise);
+
+    double d_pr_dlogtf = piece_right * (phase - gamma) / tau_fall;
+    out[5] = a * sig_rise * w * d_pr_dlogtf;
+
+    out[6] = 0.0;
+    return flux;
+}
+
+// TDE: returns flux = a * sig * decay + b
+__device__ inline double lc_tde_at_and_grad(const double* p, double t, double* out) {
+    double a        = exp(p[0]);
+    double t0       = p[2];
+    double tau_rise = exp(p[3]);
+    double tau_fall = exp(p[4]);
+    double alpha    = p[5];
+    double phase    = t - t0;
+    double sig      = lc_sigmoid(phase / tau_rise);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
+    double w        = 1.0 + ps / tau_fall;
+    double decay    = pow(w, -alpha);
+    double base     = a * sig * decay;
+
+    out[0] = base;
+    out[1] = 1.0;
+    double dsig_dt0   = -sig * (1.0 - sig) / tau_rise;
+    double ddecay_dt0 = alpha * pow(w, -alpha - 1.0) * sig_p / tau_fall;
+    out[2] = a * (dsig_dt0 * decay + sig * ddecay_dt0);
+    out[3] = a * decay * (-sig * (1.0 - sig) * phase / tau_rise);
+    out[4] = a * sig * alpha * pow(w, -alpha - 1.0) * ps / tau_fall;
+    out[5] = a * sig * (-log(w)) * decay;
+    out[6] = 0.0;
+    return base + p[1];
+}
+
+// Arnett: returns flux = a * heat * trap
+__device__ inline double lc_arnett_at_and_grad(const double* p, double t, double* out) {
+    double a       = exp(p[0]);
+    double t0      = p[1];
+    double tau_m   = exp(p[2]);
+    double logit_f = p[3];
+    double phase   = t - t0;
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
+    double f       = lc_sigmoid(logit_f);
+    double e_ni    = exp(-ps / 8.8);
+    double e_co    = exp(-ps / 111.3);
+    double heat    = f * e_ni + (1.0 - f) * e_co;
+    double x       = ps / tau_m;
+    double exp_x2  = exp(-x * x);
+    double trap    = 1.0 - exp_x2;
+    double flux    = a * heat * trap;
+
+    out[0] = flux;
+    double dheat_dps = -f * e_ni / 8.8 - (1.0 - f) * e_co / 111.3;
+    double dtrap_dps = 2.0 * ps * exp_x2 / (tau_m * tau_m);
+    out[1] = a * (-sig_p) * (dheat_dps * trap + heat * dtrap_dps);
+    out[2] = -2.0 * a * heat * exp_x2 * x * x;
+    out[3] = a * trap * (e_ni - e_co) * f * (1.0 - f);
+    out[4] = 0.0;
+    return flux;
+}
+
+// Magnetar: returns flux = a * spindown * trap
+__device__ inline double lc_magnetar_at_and_grad(const double* p, double t, double* out) {
+    double a        = exp(p[0]);
+    double t0       = p[1];
+    double tau_sd   = exp(p[2]);
+    double tau_diff = exp(p[3]);
+    double phase    = t - t0;
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
+    double w        = 1.0 + ps / tau_sd;
+    double w3       = w * w * w;
+    double spindown = 1.0 / (w * w);
+    double x        = ps / tau_diff;
+    double exp_x2   = exp(-x * x);
+    double trap     = 1.0 - exp_x2;
+    double flux     = a * spindown * trap;
+
+    out[0] = flux;
+    double dspindown_dps = -2.0 / (w3 * tau_sd);
+    double dtrap_dps     = 2.0 * ps * exp_x2 / (tau_diff * tau_diff);
+    out[1] = a * (-sig_p) * (dspindown_dps * trap + spindown * dtrap_dps);
+    out[2] = a * trap * 2.0 * ps / (w3 * tau_sd);
+    out[3] = -2.0 * a * spindown * exp_x2 * x * x;
+    out[4] = 0.0;
+    return flux;
+}
+
+// ShockCooling: returns flux = a * sig5 * base
+__device__ inline double lc_shock_cooling_at_and_grad(const double* p, double t, double* out) {
+    double a      = exp(p[0]);
+    double t0     = p[1];
+    double n      = p[2];
+    double tau_tr = exp(p[3]);
+    double phase  = t - t0;
+    double sig5   = lc_sigmoid(phase * 5.0);
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
+    double cooling = pow(ps, -n);
+    double ratio   = ps / tau_tr;
+    double cutoff  = exp(-ratio * ratio);
+    double base    = cooling * cutoff;
+    double flux    = a * sig5 * base;
+
+    out[0] = flux;
+    out[1] = a * base * (-5.0 * sig5 * (1.0 - sig5)
+             + sig5 * sig_p * (n / ps + 2.0 * ps / (tau_tr * tau_tr)));
+    out[2] = -flux * log(ps);
+    out[3] = flux * 2.0 * ratio * ratio;
+    out[4] = 0.0;
+    return flux;
+}
+
+// Afterglow: returns flux = a * pow(u1+u2, -0.5)
+__device__ inline double lc_afterglow_at_and_grad(const double* p, double t, double* out) {
+    double a      = exp(p[0]);
+    double t0     = p[1];
+    double t_b    = exp(p[2]);
+    double alpha1 = p[3];
+    double alpha2 = p[4];
+    double phase  = t - t0;
+    double ps, sig_p;
+    lc_softplus_both(phase, &ps, &sig_p);
+    double r      = ps / t_b;
+    double ln_r   = log(r);
+    double u1     = exp(2.0 * alpha1 * ln_r);
+    double u2     = exp(2.0 * alpha2 * ln_r);
+    double u      = u1 + u2;
+    double flux   = a * pow(u, -0.5);
+    double u15    = pow(u, -1.5);
+
+    out[0] = flux;
+    double du_dps   = (2.0 * alpha1 * u1 + 2.0 * alpha2 * u2) / ps;
+    double dflux_dps = a * (-0.5) * u15 * du_dps;
+    out[1] = dflux_dps * (-sig_p);
+    double du_dlog_tb = -(2.0 * alpha1 * u1 + 2.0 * alpha2 * u2);
+    out[2] = a * (-0.5) * u15 * du_dlog_tb;
+    out[3] = a * (-0.5) * u15 * 2.0 * ln_r * u1;
+    out[4] = a * (-0.5) * u15 * 2.0 * ln_r * u2;
+    out[5] = 0.0;
+    return flux;
+}
+
+// ===========================================================================
+// Fused eval+grad dispatch
+// ===========================================================================
+
+// Returns predicted flux and writes gradient into grad[0..n_params-1].
+// For MetzgerKN (model 7), sets *ok = false; caller should use finite-diff.
+__device__ inline double lc_eval_model_at_and_grad(
+    int model_id, const double* p, double t, double* grad, bool* ok) {
+    *ok = true;
+    switch (model_id) {
+        case 0: return lc_bazin_at_and_grad(p, t, grad);
+        case 1: return lc_villar_at_and_grad(p, t, grad);
+        case 2: return lc_tde_at_and_grad(p, t, grad);
+        case 3: return lc_arnett_at_and_grad(p, t, grad);
+        case 4: return lc_magnetar_at_and_grad(p, t, grad);
+        case 5: return lc_shock_cooling_at_and_grad(p, t, grad);
+        case 6: return lc_afterglow_at_and_grad(p, t, grad);
+        default: *ok = false; return 0.0;
+    }
 }
 
 // ===========================================================================
