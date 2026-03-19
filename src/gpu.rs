@@ -9,8 +9,6 @@
 use std::ffi::c_int;
 use std::ptr;
 
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
 
 /// Which model to evaluate on the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -51,6 +49,20 @@ impl GpuModelName {
             GpuModelName::ShockCooling => crate::parametric::SviModelName::ShockCooling,
             GpuModelName::Afterglow => crate::parametric::SviModelName::Afterglow,
             GpuModelName::MetzgerKN => crate::parametric::SviModelName::MetzgerKN,
+        }
+    }
+
+    /// Index of the t0 parameter in the parameter vector (matches SviModel::t0_idx).
+    pub fn t0_idx(self) -> usize {
+        match self {
+            GpuModelName::Bazin => 2,
+            GpuModelName::Villar => 3,
+            GpuModelName::Tde => 2,
+            GpuModelName::Arnett => 1,
+            GpuModelName::Magnetar => 1,
+            GpuModelName::ShockCooling => 1,
+            GpuModelName::Afterglow => 1,
+            GpuModelName::MetzgerKN => 3,
         }
     }
 
@@ -218,6 +230,7 @@ extern "C" {
 }
 
 // Batch PSO cost launcher
+#[allow(dead_code)]
 extern "C" {
     fn launch_batch_pso_cost(
         all_times: *const f64,
@@ -260,6 +273,9 @@ extern "C" {
         stall_iters: c_int,
         base_seed: u64,
         max_obs: c_int,
+        per_source_t0_lower: *const f64,
+        per_source_t0_upper: *const f64,
+        t0_idx: c_int,
     );
 
     // Separate KN kernel (no model_id param)
@@ -283,6 +299,9 @@ extern "C" {
         stall_iters: c_int,
         base_seed: u64,
         max_obs: c_int,
+        per_source_t0_lower: *const f64,
+        per_source_t0_upper: *const f64,
+        t0_idx: c_int,
     );
 
     // Stream-aware launch wrappers
@@ -308,6 +327,9 @@ extern "C" {
         base_seed: u64,
         max_obs: c_int,
         stream: CudaStream,
+        per_source_t0_lower: *const f64,
+        per_source_t0_upper: *const f64,
+        t0_idx: c_int,
     );
 
     fn launch_batch_pso_full_kn_stream(
@@ -331,6 +353,9 @@ extern "C" {
         base_seed: u64,
         max_obs: c_int,
         stream: CudaStream,
+        per_source_t0_lower: *const f64,
+        per_source_t0_upper: *const f64,
+        t0_idx: c_int,
     );
 
     // GPU-resident MultiBazin
@@ -436,6 +461,7 @@ impl DevBuf {
         })
     }
 
+    #[allow(dead_code)]
     fn upload_from<T>(&self, data: &[T]) -> Result<(), String> {
         let bytes = data.len() * size_of::<T>();
         cuda_check(unsafe {
@@ -627,10 +653,14 @@ impl GpuContext {
     }
 
     /// Run PSO for a single model across many sources simultaneously.
+    ///
+    /// `sources` provides the raw observation data used to compute per-source
+    /// data-informed t0 bounds (matching the CPU path logic).
     pub fn batch_pso(
         &self,
         model: GpuModelName,
         data: &GpuBatchData,
+        sources: &[BatchSource],
         n_particles: usize,
         max_iters: usize,
         stall_iters: usize,
@@ -640,9 +670,42 @@ impl GpuContext {
         let n_params = model.n_params();
         let (lower, upper) = model.pso_bounds();
         let max_obs = data.max_obs();
+        let t0_idx = model.t0_idx();
+
+        // Compute per-source t0 bounds matching CPU pso_fit_single_model_t0 logic
+        let mut t0_lo_vec = Vec::with_capacity(n_sources);
+        let mut t0_hi_vec = Vec::with_capacity(n_sources);
+        for src in sources {
+            let n_obs = src.times.len();
+            if n_obs > 0 {
+                let t_first = src.times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut peak_time = src.times[0];
+                let mut peak_flux = f64::NEG_INFINITY;
+                for i in 0..n_obs {
+                    if !src.is_upper[i] && src.flux[i] > peak_flux {
+                        peak_flux = src.flux[i];
+                        peak_time = src.times[i];
+                    }
+                }
+                let t0_lo = (t_first - 30.0).max(lower[t0_idx]);
+                let t0_hi = (peak_time + 10.0).min(upper[t0_idx]);
+                if t0_lo < t0_hi {
+                    t0_lo_vec.push(t0_lo);
+                    t0_hi_vec.push(t0_hi);
+                } else {
+                    t0_lo_vec.push(lower[t0_idx]);
+                    t0_hi_vec.push(upper[t0_idx]);
+                }
+            } else {
+                t0_lo_vec.push(lower[t0_idx]);
+                t0_hi_vec.push(upper[t0_idx]);
+            }
+        }
 
         let d_lower = DevBuf::upload(&lower)?;
         let d_upper = DevBuf::upload(&upper)?;
+        let d_t0_lo = DevBuf::upload(&t0_lo_vec)?;
+        let d_t0_hi = DevBuf::upload(&t0_hi_vec)?;
 
         let pop_priors = crate::parametric::population_priors_for_gpu(model);
         let (d_prior_centers, d_prior_widths) = if !pop_priors.is_empty() {
@@ -661,7 +724,6 @@ impl GpuContext {
 
         unsafe {
             if model == GpuModelName::MetzgerKN {
-                // Use KN-specific kernel
                 launch_batch_pso_full_kn(
                     data.d_times.ptr as _,
                     data.d_flux.ptr as _,
@@ -682,9 +744,11 @@ impl GpuContext {
                     stall_iters as c_int,
                     seed,
                     max_obs as c_int,
+                    d_t0_lo.ptr as _,
+                    d_t0_hi.ptr as _,
+                    t0_idx as c_int,
                 );
             } else {
-                // Use standard kernel (higher occupancy, no KN arrays)
                 launch_batch_pso_full_std(
                     data.d_times.ptr as _,
                     data.d_flux.ptr as _,
@@ -706,6 +770,9 @@ impl GpuContext {
                     stall_iters as c_int,
                     seed,
                     max_obs as c_int,
+                    d_t0_lo.ptr as _,
+                    d_t0_hi.ptr as _,
+                    t0_idx as c_int,
                 );
             }
             cuda_check(cudaGetLastError())?;
@@ -742,6 +809,9 @@ impl GpuContext {
         stall_iters: usize,
         seed: u64,
         stream: &GpuStream,
+        d_t0_lo: &DevBuf,
+        d_t0_hi: &DevBuf,
+        t0_idx: usize,
     ) -> Result<(DevBuf, DevBuf, Vec<f64>, Vec<f64>), String> {
         let n_sources = data.n_sources;
         let n_params = model.n_params();
@@ -778,6 +848,8 @@ impl GpuContext {
                     n_sources as c_int, n_particles as c_int, n_params as c_int,
                     max_iters as c_int, stall_iters as c_int, seed,
                     max_obs as c_int, stream.raw,
+                    d_t0_lo.ptr as _, d_t0_hi.ptr as _,
+                    t0_idx as c_int,
                 );
             } else {
                 launch_batch_pso_full_std_stream(
@@ -790,6 +862,8 @@ impl GpuContext {
                     n_sources as c_int, n_particles as c_int, n_params as c_int,
                     model.model_id(), max_iters as c_int, stall_iters as c_int, seed,
                     max_obs as c_int, stream.raw,
+                    d_t0_lo.ptr as _, d_t0_hi.ptr as _,
+                    t0_idx as c_int,
                 );
             }
             cuda_check(cudaGetLastError())?;
@@ -829,6 +903,7 @@ impl GpuContext {
     pub fn batch_model_select(
         &self,
         data: &GpuBatchData,
+        sources: &[BatchSource],
         n_particles: usize,
         max_iters: usize,
         stall_iters: usize,
@@ -843,7 +918,7 @@ impl GpuContext {
 
         // Run Bazin first (early-stop gate)
         let bazin_results = self.batch_pso(
-            GpuModelName::Bazin, data, n_particles, max_iters, stall_iters, 42,
+            GpuModelName::Bazin, data, sources, n_particles, max_iters, stall_iters, 42,
         )?;
         let mut needs_more = vec![false; n_sources];
         for (s, r) in bazin_results.into_iter().enumerate() {
@@ -862,6 +937,7 @@ impl GpuContext {
 
         let remaining_models = &ALL_GPU_MODELS[1..];
 
+        // Pre-compute per-source t0 bounds (shared across models, recomputed per-model t0_idx)
         if n_sources <= STREAM_THRESHOLD {
             // Small batch —> launch remaining models on separate streams
             let mut stream_data: Vec<(
@@ -873,8 +949,10 @@ impl GpuContext {
 
             for &model in remaining_models {
                 let stream = GpuStream::new()?;
+                let (d_t0_lo, d_t0_hi) = Self::compute_t0_bounds_bufs(model, sources)?;
                 let (d_pos, d_cost, _lower, _upper) = self.batch_pso_on_stream(
                     model, data, n_particles, max_iters, stall_iters, 42, &stream,
+                    &d_t0_lo, &d_t0_hi, model.t0_idx(),
                 )?;
                 stream_data.push((model, stream, d_pos, d_cost));
             }
@@ -892,10 +970,10 @@ impl GpuContext {
                 }
             }
         } else {
-            // Large batch, sequential dispatch 
+            // Large batch, sequential dispatch
             for &model in remaining_models {
                 let results = self.batch_pso(
-                    model, data, n_particles, max_iters, stall_iters, 42,
+                    model, data, sources, n_particles, max_iters, stall_iters, 42,
                 )?;
                 for (s, r) in results.into_iter().enumerate() {
                     if needs_more[s] && r.cost < best_result[s].cost {
@@ -909,12 +987,13 @@ impl GpuContext {
         Ok(best_model.into_iter().zip(best_result).collect())
     }
 
-    /// Run PSO forevery model on all sources, returning all results.
+    /// Run PSO for every model on all sources, returning all results.
     ///
     /// Uses CUDA streams for small batches.
     pub fn batch_all_models(
         &self,
         data: &GpuBatchData,
+        sources: &[BatchSource],
         n_particles: usize,
         max_iters: usize,
         stall_iters: usize,
@@ -932,8 +1011,10 @@ impl GpuContext {
 
             for &model in ALL_GPU_MODELS {
                 let stream = GpuStream::new()?;
+                let (d_t0_lo, d_t0_hi) = Self::compute_t0_bounds_bufs(model, sources)?;
                 let (d_pos, d_cost, _lower, _upper) = self.batch_pso_on_stream(
                     model, data, n_particles, max_iters, stall_iters, 42, &stream,
+                    &d_t0_lo, &d_t0_hi, model.t0_idx(),
                 )?;
                 stream_data.push((model, stream, d_pos, d_cost));
             }
@@ -950,11 +1031,49 @@ impl GpuContext {
             // Large batch, sequential
             let mut all = Vec::with_capacity(ALL_GPU_MODELS.len());
             for &model in ALL_GPU_MODELS {
-                let results = self.batch_pso(model, data, n_particles, max_iters, stall_iters, 42)?;
+                let results = self.batch_pso(model, data, sources, n_particles, max_iters, stall_iters, 42)?;
                 all.push((model, results));
             }
             Ok(all)
         }
+    }
+
+    /// Compute per-source t0 bounds and upload them to GPU device buffers.
+    fn compute_t0_bounds_bufs(
+        model: GpuModelName,
+        sources: &[BatchSource],
+    ) -> Result<(DevBuf, DevBuf), String> {
+        let t0_idx = model.t0_idx();
+        let (lower, upper) = model.pso_bounds();
+        let mut t0_lo_vec = Vec::with_capacity(sources.len());
+        let mut t0_hi_vec = Vec::with_capacity(sources.len());
+        for src in sources {
+            let n_obs = src.times.len();
+            if n_obs > 0 {
+                let t_first = src.times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut peak_time = src.times[0];
+                let mut peak_flux = f64::NEG_INFINITY;
+                for i in 0..n_obs {
+                    if !src.is_upper[i] && src.flux[i] > peak_flux {
+                        peak_flux = src.flux[i];
+                        peak_time = src.times[i];
+                    }
+                }
+                let t0_lo = (t_first - 30.0).max(lower[t0_idx]);
+                let t0_hi = (peak_time + 10.0).min(upper[t0_idx]);
+                if t0_lo < t0_hi {
+                    t0_lo_vec.push(t0_lo);
+                    t0_hi_vec.push(t0_hi);
+                } else {
+                    t0_lo_vec.push(lower[t0_idx]);
+                    t0_hi_vec.push(upper[t0_idx]);
+                }
+            } else {
+                t0_lo_vec.push(lower[t0_idx]);
+                t0_hi_vec.push(upper[t0_idx]);
+            }
+        }
+        Ok((DevBuf::upload(&t0_lo_vec)?, DevBuf::upload(&t0_hi_vec)?))
     }
 
     // -----------------------------------------------------------------------

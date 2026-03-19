@@ -859,7 +859,10 @@ extern "C" __global__ void batch_pso_full_std(
     int max_iters,
     int stall_iters,
     unsigned long long base_seed,
-    int max_obs)
+    int max_obs,
+    const double* __restrict__ per_source_t0_lower,
+    const double* __restrict__ per_source_t0_upper,
+    int t0_idx)
 {
     int src = blockIdx.x;
     int pid = threadIdx.x;
@@ -878,6 +881,13 @@ extern "C" __global__ void batch_pso_full_std(
         lower[d] = bounds_lower[d];
         upper[d] = bounds_upper[d];
         v_max[d] = 0.5 * (upper[d] - lower[d]);
+    }
+
+    // Per-source t0 bounds override
+    if (per_source_t0_lower != nullptr && t0_idx >= 0 && t0_idx < n_params) {
+        lower[t0_idx] = per_source_t0_lower[src];
+        upper[t0_idx] = per_source_t0_upper[src];
+        v_max[t0_idx] = 0.5 * (upper[t0_idx] - lower[t0_idx]);
     }
 
     unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL + (unsigned long long)pid * 137ULL + 1ULL;
@@ -1062,7 +1072,10 @@ extern "C" __global__ void batch_pso_full_kn(
     int max_iters,
     int stall_iters,
     unsigned long long base_seed,
-    int max_obs)
+    int max_obs,
+    const double* __restrict__ per_source_t0_lower,
+    const double* __restrict__ per_source_t0_upper,
+    int t0_idx)
 {
     int src = blockIdx.x;
     int pid = threadIdx.x;
@@ -1081,6 +1094,13 @@ extern "C" __global__ void batch_pso_full_kn(
         lower[d] = bounds_lower[d];
         upper[d] = bounds_upper[d];
         v_max_d[d] = 0.5 * (upper[d] - lower[d]);
+    }
+
+    // Per-source t0 bounds override
+    if (per_source_t0_lower != nullptr && t0_idx >= 0 && t0_idx < n_params) {
+        lower[t0_idx] = per_source_t0_lower[src];
+        upper[t0_idx] = per_source_t0_upper[src];
+        v_max_d[t0_idx] = 0.5 * (upper[t0_idx] - lower[t0_idx]);
     }
 
     unsigned long long rng = base_seed + (unsigned long long)src * 10000ULL + (unsigned long long)pid * 137ULL + 1ULL;
@@ -1736,14 +1756,18 @@ extern "C" void launch_batch_pso_full_std(
     int max_iters,
     int stall_iters,
     unsigned long long base_seed,
-    int max_obs)
+    int max_obs,
+    const double* per_source_t0_lower,
+    const double* per_source_t0_upper,
+    int t0_idx)
 {
     size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
     batch_pso_full_std<<<n_sources, n_particles, smem_bytes>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
         out_gbest_pos, out_gbest_cost,
-        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs,
+        per_source_t0_lower, per_source_t0_upper, t0_idx);
 }
 
 extern "C" void launch_batch_pso_full_std_stream(
@@ -1767,14 +1791,18 @@ extern "C" void launch_batch_pso_full_std_stream(
     int stall_iters,
     unsigned long long base_seed,
     int max_obs,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const double* per_source_t0_lower,
+    const double* per_source_t0_upper,
+    int t0_idx)
 {
     size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
     batch_pso_full_std<<<n_sources, n_particles, smem_bytes, stream>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
         out_gbest_pos, out_gbest_cost,
-        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs);
+        n_particles, n_params, model_id, max_iters, stall_iters, base_seed, max_obs,
+        per_source_t0_lower, per_source_t0_upper, t0_idx);
 }
 
 // Separate KN launch wrappers
@@ -1797,14 +1825,18 @@ extern "C" void launch_batch_pso_full_kn(
     int max_iters,
     int stall_iters,
     unsigned long long base_seed,
-    int max_obs)
+    int max_obs,
+    const double* per_source_t0_lower,
+    const double* per_source_t0_upper,
+    int t0_idx)
 {
     size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
     batch_pso_full_kn<<<n_sources, n_particles, smem_bytes>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
         out_gbest_pos, out_gbest_cost,
-        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs);
+        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs,
+        per_source_t0_lower, per_source_t0_upper, t0_idx);
 }
 
 extern "C" void launch_batch_pso_full_kn_stream(
@@ -1827,14 +1859,18 @@ extern "C" void launch_batch_pso_full_kn_stream(
     int stall_iters,
     unsigned long long base_seed,
     int max_obs,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const double* per_source_t0_lower,
+    const double* per_source_t0_upper,
+    int t0_idx)
 {
     size_t smem_bytes = pso_smem_bytes(n_params, n_particles, max_obs);
     batch_pso_full_kn<<<n_sources, n_particles, smem_bytes, stream>>>(
         all_times, all_flux, all_obs_var, all_is_upper, all_upper_flux,
         source_offsets, bounds_lower, bounds_upper, prior_centers, prior_widths,
         out_gbest_pos, out_gbest_cost,
-        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs);
+        n_particles, n_params, max_iters, stall_iters, base_seed, max_obs,
+        per_source_t0_lower, per_source_t0_upper, t0_idx);
 }
 
 // GPU-resident MultiBazin launch wrapper

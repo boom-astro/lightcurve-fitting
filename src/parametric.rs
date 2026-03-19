@@ -231,6 +231,25 @@ fn bazin_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
 }
 
 #[inline]
+fn bazin_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[2];
+    let tau_rise = params[3].exp();
+    let tau_fall = params[4].exp();
+    let dt = t - t0;
+    let e_fall = (-dt / tau_fall).exp();
+    let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
+    let base = a * e_fall * sig;
+    out[0] = base;
+    out[1] = 1.0;
+    out[2] = base * (1.0 / tau_fall - (1.0 - sig) / tau_rise);
+    out[3] = -base * (1.0 - sig) * dt / tau_rise;
+    out[4] = base * dt / tau_fall;
+    out[5] = 0.0;
+    base + params[1]
+}
+
+#[inline]
 fn villar_flux_eval(params: &[f64], t: f64) -> f64 {
     let a = params[0].exp();
     let beta = params[1];
@@ -297,6 +316,55 @@ fn villar_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
 }
 
 #[inline]
+fn villar_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let beta = params[1];
+    let gamma = params[2].exp();
+    let t0 = params[3];
+    let tau_rise = params[4].exp();
+    let tau_fall = params[5].exp();
+    let phase = t - t0;
+    let k = 10.0;
+    let sig_rise = 1.0 / (1.0 + (-phase / tau_rise).exp());
+    let w = 1.0 / (1.0 + (-k * (phase - gamma)).exp());
+    let piece_left = 1.0 - beta * phase;
+    let e_decay = ((gamma - phase) / tau_fall).exp();
+    let piece_right = (1.0 - beta * gamma) * e_decay;
+    let piece = (1.0 - w) * piece_left + w * piece_right;
+    let flux = a * sig_rise * piece;
+
+    out[0] = flux;
+
+    let d_pl_dbeta = -phase;
+    let d_pr_dbeta = -gamma * e_decay;
+    out[1] = a * sig_rise * ((1.0 - w) * d_pl_dbeta + w * d_pr_dbeta);
+
+    let dw_dgamma = -k * w * (1.0 - w);
+    let dw_dloggamma = dw_dgamma * gamma;
+    let dpr_dgamma = e_decay * (-beta + (1.0 - beta * gamma) / tau_fall);
+    let dpr_dloggamma = dpr_dgamma * gamma;
+    let d_piece_dloggamma = dw_dloggamma * (piece_right - piece_left) + w * dpr_dloggamma;
+    out[2] = a * sig_rise * d_piece_dloggamma;
+
+    let dsig_dphase = sig_rise * (1.0 - sig_rise) / tau_rise;
+    let dsig_dt0 = -dsig_dphase;
+    let dw_dphase = k * w * (1.0 - w);
+    let dw_dt0 = -dw_dphase;
+    let dpl_dt0 = beta;
+    let dpr_dt0 = (1.0 - beta * gamma) * e_decay / tau_fall;
+    let d_piece_dt0 = dw_dt0 * (piece_right - piece_left) + (1.0 - w) * dpl_dt0 + w * dpr_dt0;
+    out[3] = a * (dsig_dt0 * piece + sig_rise * d_piece_dt0);
+
+    out[4] = a * piece * sig_rise * (1.0 - sig_rise) * (-phase / tau_rise);
+
+    let d_pr_dlogtf = piece_right * (phase - gamma) / tau_fall;
+    out[5] = a * sig_rise * w * d_pr_dlogtf;
+
+    out[6] = 0.0;
+    flux
+}
+
+#[inline]
 fn tde_flux_eval(params: &[f64], t: f64) -> f64 {
     let a = params[0].exp();
     let b = params[1];
@@ -336,6 +404,33 @@ fn tde_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
     out[4] = a * sig * alpha * w.powf(-alpha - 1.0) * phase_soft / tau_fall;
     out[5] = a * sig * (-w.ln()) * decay;
     out[6] = 0.0;
+}
+
+#[inline]
+fn tde_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[2];
+    let tau_rise = params[3].exp();
+    let tau_fall = params[4].exp();
+    let alpha = params[5];
+    let phase = t - t0;
+    let sig = 1.0 / (1.0 + (-phase / tau_rise).exp());
+    let phase_soft = (1.0 + phase.exp()).ln() + 1e-6;
+    let sig_phase = phase.exp() / (1.0 + phase.exp());
+    let w = 1.0 + phase_soft / tau_fall;
+    let decay = w.powf(-alpha);
+    let base = a * sig * decay;
+
+    out[0] = base;
+    out[1] = 1.0;
+    let dsig_dt0 = -sig * (1.0 - sig) / tau_rise;
+    let ddecay_dt0 = alpha * w.powf(-alpha - 1.0) * sig_phase / tau_fall;
+    out[2] = a * (dsig_dt0 * decay + sig * ddecay_dt0);
+    out[3] = a * decay * (-sig * (1.0 - sig) * phase / tau_rise);
+    out[4] = a * sig * alpha * w.powf(-alpha - 1.0) * phase_soft / tau_fall;
+    out[5] = a * sig * (-w.ln()) * decay;
+    out[6] = 0.0;
+    base + params[1]
 }
 
 #[inline]
@@ -387,6 +482,36 @@ fn arnett_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
 }
 
 #[inline]
+fn arnett_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[1];
+    let tau_m = params[2].exp();
+    let logit_f = params[3];
+    let phase = t - t0;
+    let phase_soft = (1.0 + phase.exp()).ln() + 1e-6;
+    let sig_p = phase.exp() / (1.0 + phase.exp());
+    let f = 1.0 / (1.0 + (-logit_f).exp());
+    const TAU_NI: f64 = 8.8;
+    const TAU_CO: f64 = 111.3;
+    let e_ni = (-phase_soft / TAU_NI).exp();
+    let e_co = (-phase_soft / TAU_CO).exp();
+    let heat = f * e_ni + (1.0 - f) * e_co;
+    let x = phase_soft / tau_m;
+    let exp_x2 = (-x * x).exp();
+    let trap = 1.0 - exp_x2;
+    let flux = a * heat * trap;
+
+    out[0] = flux;
+    let dheat_dps = -f * e_ni / TAU_NI - (1.0 - f) * e_co / TAU_CO;
+    let dtrap_dps = 2.0 * phase_soft * exp_x2 / (tau_m * tau_m);
+    out[1] = a * (-sig_p) * (dheat_dps * trap + heat * dtrap_dps);
+    out[2] = -2.0 * a * heat * exp_x2 * x * x;
+    out[3] = a * trap * (e_ni - e_co) * f * (1.0 - f);
+    out[4] = 0.0;
+    flux
+}
+
+#[inline]
 fn magnetar_flux_eval(params: &[f64], t: f64) -> f64 {
     let a = params[0].exp();
     let t0 = params[1];
@@ -424,6 +549,32 @@ fn magnetar_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
     out[2] = a * trap * 2.0 * phase_soft * w.powi(-3) / tau_sd;
     out[3] = -2.0 * a * spindown * exp_x2 * x * x;
     out[4] = 0.0;
+}
+
+#[inline]
+fn magnetar_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[1];
+    let tau_sd = params[2].exp();
+    let tau_diff = params[3].exp();
+    let phase = t - t0;
+    let phase_soft = (1.0 + phase.exp()).ln() + 1e-6;
+    let sig_p = phase.exp() / (1.0 + phase.exp());
+    let w = 1.0 + phase_soft / tau_sd;
+    let spindown = w.powi(-2);
+    let x = phase_soft / tau_diff;
+    let exp_x2 = (-x * x).exp();
+    let trap = 1.0 - exp_x2;
+    let flux = a * spindown * trap;
+
+    out[0] = flux;
+    let dspindown_dps = -2.0 * w.powi(-3) / tau_sd;
+    let dtrap_dps = 2.0 * phase_soft * exp_x2 / (tau_diff * tau_diff);
+    out[1] = a * (-sig_p) * (dspindown_dps * trap + spindown * dtrap_dps);
+    out[2] = a * trap * 2.0 * phase_soft * w.powi(-3) / tau_sd;
+    out[3] = -2.0 * a * spindown * exp_x2 * x * x;
+    out[4] = 0.0;
+    flux
 }
 
 #[inline]
@@ -465,6 +616,33 @@ fn shockcooling_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
     out[2] = -flux * phase_soft.ln();
     out[3] = flux * 2.0 * ratio * ratio;
     out[4] = 0.0;
+}
+
+#[inline]
+fn shockcooling_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[1];
+    let n = params[2];
+    let tau_tr = params[3].exp();
+    let phase = t - t0;
+    let sig5 = 1.0 / (1.0 + (-phase * 5.0).exp());
+    let phase_soft = (1.0 + phase.exp()).ln() + 1e-6;
+    let sig_p = phase.exp() / (1.0 + phase.exp());
+    let cooling = phase_soft.powf(-n);
+    let ratio = phase_soft / tau_tr;
+    let cutoff = (-ratio * ratio).exp();
+    let base = cooling * cutoff;
+    let flux = a * sig5 * base;
+
+    out[0] = flux;
+    out[1] = a
+        * base
+        * (-5.0 * sig5 * (1.0 - sig5)
+            + sig5 * sig_p * (n / phase_soft + 2.0 * phase_soft / (tau_tr * tau_tr)));
+    out[2] = -flux * phase_soft.ln();
+    out[3] = flux * 2.0 * ratio * ratio;
+    out[4] = 0.0;
+    flux
 }
 
 #[inline]
@@ -513,6 +691,35 @@ fn afterglow_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
 }
 
 #[inline]
+fn afterglow_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    let a = params[0].exp();
+    let t0 = params[1];
+    let t_b = params[2].exp();
+    let alpha1 = params[3];
+    let alpha2 = params[4];
+    let phase = t - t0;
+    let phase_soft = (1.0 + phase.exp()).ln() + 1e-6;
+    let sig_p = phase.exp() / (1.0 + phase.exp());
+    let r = phase_soft / t_b;
+    let ln_r = r.ln();
+    let u1 = (2.0 * alpha1 * ln_r).exp();
+    let u2 = (2.0 * alpha2 * ln_r).exp();
+    let u = u1 + u2;
+    let flux = a * u.powf(-0.5);
+
+    out[0] = flux;
+    let du_dps = (2.0 * alpha1 * u1 + 2.0 * alpha2 * u2) / phase_soft;
+    let dflux_dps = a * (-0.5) * u.powf(-1.5) * du_dps;
+    out[1] = dflux_dps * (-sig_p);
+    let du_dlog_tb = -(2.0 * alpha1 * u1 + 2.0 * alpha2 * u2);
+    out[2] = a * (-0.5) * u.powf(-1.5) * du_dlog_tb;
+    out[3] = a * (-0.5) * u.powf(-1.5) * 2.0 * ln_r * u1;
+    out[4] = a * (-0.5) * u.powf(-1.5) * 2.0 * ln_r * u2;
+    out[5] = 0.0;
+    flux
+}
+
+#[inline]
 fn eval_model(model: SviModel, params: &[f64], t: f64) -> f64 {
     match model {
         SviModel::Bazin => bazin_flux_eval(params, t),
@@ -527,6 +734,7 @@ fn eval_model(model: SviModel, params: &[f64], t: f64) -> f64 {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn eval_model_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64]) {
     match model {
         SviModel::Bazin => bazin_flux_grad(params, t, out),
@@ -536,6 +744,20 @@ fn eval_model_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64]) {
         SviModel::Magnetar => magnetar_flux_grad(params, t, out),
         SviModel::ShockCooling => shockcooling_flux_grad(params, t, out),
         SviModel::Afterglow => afterglow_flux_grad(params, t, out),
+        SviModel::MetzgerKN => panic!("MetzgerKN requires batch evaluation"),
+    }
+}
+
+#[inline]
+fn eval_model_and_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64]) -> f64 {
+    match model {
+        SviModel::Bazin => bazin_flux_eval_and_grad(params, t, out),
+        SviModel::Villar => villar_flux_eval_and_grad(params, t, out),
+        SviModel::Tde => tde_flux_eval_and_grad(params, t, out),
+        SviModel::Arnett => arnett_flux_eval_and_grad(params, t, out),
+        SviModel::Magnetar => magnetar_flux_eval_and_grad(params, t, out),
+        SviModel::ShockCooling => shockcooling_flux_eval_and_grad(params, t, out),
+        SviModel::Afterglow => afterglow_flux_eval_and_grad(params, t, out),
         SviModel::MetzgerKN => panic!("MetzgerKN requires batch evaluation"),
     }
 }
@@ -1350,14 +1572,11 @@ impl Gradient for PsoCost<'_> {
         let sigma_extra = p[se_idx].exp();
         let sigma_extra_sq = sigma_extra * sigma_extra;
 
-        let mut preds = vec![0.0; n_obs];
-        eval_model_batch_into(self.model, p, self.times, &mut preds);
-
         let mut grad = vec![0.0; n_params];
         let mut model_grad = vec![0.0; n_params];
 
         for i in 0..n_obs {
-            let pred = preds[i];
+            let pred = eval_model_and_grad(self.model, p, self.times[i], &mut model_grad);
             if !pred.is_finite() {
                 // Return zero gradient for non-finite predictions
                 return Ok(vec![0.0; n_params]);
@@ -1373,7 +1592,6 @@ impl Gradient for PsoCost<'_> {
                 let cdf = 0.5 * (1.0 + erf_approx(z / std::f64::consts::SQRT_2));
                 let ratio = phi / cdf.max(1e-300);
                 // dz/dpred = -1/sqrt(total_var), dz/dse = z * sigma_extra_sq / total_var
-                eval_model_grad(self.model, p, self.times[i], &mut model_grad);
                 for j in 0..n_params {
                     grad[j] += ratio * model_grad[j] / sqrt_var; // -(-1/sqrt_var) = +
                 }
@@ -1382,7 +1600,6 @@ impl Gradient for PsoCost<'_> {
             } else {
                 let diff = pred - self.flux[i];
                 // d/dp [diff²/total_var + ln(total_var)] = 2*diff/total_var * dpred/dp
-                eval_model_grad(self.model, p, self.times[i], &mut model_grad);
                 let scale = 2.0 * diff / total_var;
                 for j in 0..n_params {
                     grad[j] += scale * model_grad[j];
@@ -2277,10 +2494,6 @@ fn svi_fit(
                 let batch = metzger_kn_eval_batch(&theta, &data.times);
                 preds.copy_from_slice(&batch);
                 metzger_kn_grad_batch_into(&theta, &data.times, &mut kn_grads_flat);
-            } else {
-                for (i, &t) in data.times.iter().enumerate() {
-                    preds[i] = eval_model(model, &theta, t);
-                }
             }
 
             if model == SviModel::MetzgerKN {
@@ -2311,19 +2524,19 @@ fn svi_fit(
             }
 
             for i in 0..n_obs {
-                let pred = preds[i];
+                let pred;
+                if model.is_sequential() {
+                    pred = preds[i];
+                    let base_off = i * n_params;
+                    grad_buf.copy_from_slice(&kn_grads_flat[base_off..base_off + n_params]);
+                } else {
+                    pred = eval_model_and_grad(model, &theta, data.times[i], &mut grad_buf);
+                }
                 if !pred.is_finite() {
                     continue;
                 }
                 let total_var = obs_var[i] + sigma_extra_sq;
                 let sigma_total = total_var.sqrt();
-
-                if model.is_sequential() {
-                    let base_off = i * n_params;
-                    grad_buf.copy_from_slice(&kn_grads_flat[base_off..base_off + n_params]);
-                } else {
-                    eval_model_grad(model, &theta, data.times[i], &mut grad_buf);
-                }
 
                 if data.is_upper[i] {
                     let z = (data.upper_flux[i] - pred) / sigma_total;
@@ -3105,13 +3318,13 @@ pub struct GpuPsoBandResult {
 /// computes mag-space chi2, and assembles the final ParametricBandResult.
 ///
 /// `flux_bands`: maps band_name → BandData in flux space.
-/// `gpu_results`: per-band GPU PSO results, indexed by band sort order
-///   (most-populated band first). Must match the band ordering that would
-///   be produced by sorting bands by descending observation count.
+/// `gpu_results`: per-band GPU PSO results, one per entry in `band_names`.
+/// `band_names`: explicit band ordering matching `gpu_results`.
 /// `method`: uncertainty estimation method.
 pub fn finalize_parametric_from_gpu(
     flux_bands: &HashMap<String, BandData>,
     gpu_results: &[GpuPsoBandResult],
+    band_names: &[String],
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
     if flux_bands.is_empty() || gpu_results.is_empty() {
@@ -3124,8 +3337,8 @@ pub fn finalize_parametric_from_gpu(
     let svi_n_samples = 4;
     let zp = 23.9;
 
-    // Prepare band data (same as fit_parametric)
-    let mut band_entries: Vec<(String, BandFitData, Vec<f64>)> = Vec::new();
+    // Build BandFitData for each unique band
+    let mut band_data_map: HashMap<String, (BandFitData, Vec<f64>)> = HashMap::new();
 
     for (band_name, band_data) in flux_bands {
         let fluxes = &band_data.values;
@@ -3165,16 +3378,19 @@ pub fn finalize_parametric_from_gpu(
             peak_flux_obs: peak_flux,
         };
 
-        band_entries.push((band_name.clone(), fit_data, mags_obs));
+        band_data_map.insert(band_name.clone(), (fit_data, mags_obs));
     }
-
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
+    for (band_idx, band_name) in band_names.iter().enumerate() {
         if band_idx >= gpu_results.len() { break; }
         let gpu = &gpu_results[band_idx];
+
+        let (data, mags_obs) = match band_data_map.get(band_name) {
+            Some(d) => d,
+            None => continue,
+        };
 
         if gpu.pso_params.is_empty() { continue; }
 
@@ -3281,10 +3497,12 @@ pub fn svi_model_meta(model_name: &SviModelName) -> (usize, usize, usize) {
 /// mu/log_sigma/elbo from GPU SVI kernel.
 ///
 /// `svi_outputs` must be parallel to `gpu_results` (same length and ordering).
+/// `band_names`: explicit band ordering matching `gpu_results` and `svi_outputs`.
 pub fn finalize_parametric_with_gpu_svi(
     flux_bands: &HashMap<String, BandData>,
     gpu_results: &[GpuPsoBandResult],
     svi_outputs: &[(Vec<f64>, Vec<f64>, f64)], // (mu, log_sigma, elbo) per band
+    band_names: &[String],
 ) -> Vec<ParametricBandResult> {
     if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
         return Vec::new();
@@ -3293,8 +3511,8 @@ pub fn finalize_parametric_with_gpu_svi(
     let zp = 23.9;
     let snr_threshold = 3.0;
 
-    // Prepare band data (same as finalize_parametric_from_gpu)
-    let mut band_entries: Vec<(String, BandFitData, Vec<f64>)> = Vec::new();
+    // Build BandFitData for each unique band
+    let mut band_data_map: HashMap<String, (BandFitData, Vec<f64>)> = HashMap::new();
 
     for (band_name, band_data) in flux_bands {
         let fluxes = &band_data.values;
@@ -3334,17 +3552,20 @@ pub fn finalize_parametric_with_gpu_svi(
             peak_flux_obs: peak_flux,
         };
 
-        band_entries.push((band_name.clone(), fit_data, mags_obs));
+        band_data_map.insert(band_name.clone(), (fit_data, mags_obs));
     }
-
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
+    for (band_idx, band_name) in band_names.iter().enumerate() {
         if band_idx >= gpu_results.len() || band_idx >= svi_outputs.len() { break; }
         let gpu = &gpu_results[band_idx];
         let (ref svi_mu, ref svi_log_sigma, svi_elbo) = svi_outputs[band_idx];
+
+        let (data, mags_obs) = match band_data_map.get(band_name) {
+            Some(d) => d,
+            None => continue,
+        };
 
         if gpu.pso_params.is_empty() { continue; }
 
