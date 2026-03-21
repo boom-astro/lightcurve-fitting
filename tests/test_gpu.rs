@@ -76,7 +76,7 @@ fn gpu_batch_pso_finds_reasonable_cost() {
     let data = GpuBatchData::new(&sources).unwrap();
 
     let results = ctx.batch_pso(
-        GpuModelName::Bazin, &data, 40, 50, 10, 42,
+        GpuModelName::Bazin, &data, &sources, 40, 50, 10, 42,
     ).unwrap();
 
     assert_eq!(results.len(), 10);
@@ -98,7 +98,7 @@ fn gpu_batch_pso_many_sources() {
     let data = GpuBatchData::new(&sources).unwrap();
 
     let results = ctx.batch_pso(
-        GpuModelName::Bazin, &data, 40, 50, 10, 42,
+        GpuModelName::Bazin, &data, &sources, 40, 50, 10, 42,
     ).unwrap();
 
     assert_eq!(results.len(), 100);
@@ -115,7 +115,7 @@ fn gpu_batch_model_select() {
         .collect();
     let data = GpuBatchData::new(&sources).unwrap();
 
-    let results = ctx.batch_model_select(&data, 40, 50, 10, 2.0).unwrap();
+    let results = ctx.batch_model_select(&data, &sources, 40, 50, 10, 2.0).unwrap();
 
     assert_eq!(results.len(), 5);
     for (i, (model, result)) in results.iter().enumerate() {
@@ -136,7 +136,7 @@ fn gpu_batch_pso_all_models() {
 
     // Test each model individually
     for &model in ALL_GPU_MODELS {
-        let results = ctx.batch_pso(model, &data, 20, 30, 8, 42).unwrap();
+        let results = ctx.batch_pso(model, &data, &sources, 20, 30, 8, 42).unwrap();
         assert_eq!(results.len(), 3, "{:?} wrong result count", model);
         for (i, r) in results.iter().enumerate() {
             assert_eq!(r.params.len(), model.n_params(), "{:?} src {} wrong params", model, i);

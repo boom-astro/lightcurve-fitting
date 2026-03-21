@@ -587,7 +587,7 @@ fn main() {
         };
 
         let all_model_results = gpu.batch_all_models(
-            &gpu_data, 30, 60, 12,
+            &gpu_data, &all_batch_sources, 30, 60, 12,
         ).unwrap_or_default();
         eprintln!("  Step 3a (PSO all models): {:.2}s", t_step.elapsed().as_secs_f64());
 

@@ -218,6 +218,12 @@ extern "C" __global__ void batch_gp_fit_predict(
     double my_amp = 0.0;
     double my_inv2ls2 = 0.0;
 
+    // Declare local scratch outside if-block so winning thread can
+    // copy its cached Cholesky/alpha to shared memory
+    double my_K[GP_MAX_M * GP_MAX_M];
+    double my_alpha[GP_MAX_M];
+    double my_tmp[GP_MAX_M];
+
     if (tid < n_hp_total) {
         int ia = tid / n_hp_ls;
         int il = tid % n_hp_ls;
@@ -229,14 +235,9 @@ extern "C" __global__ void batch_gp_fit_predict(
             my_amp = amp;
             my_inv2ls2 = inv_2ls2;
 
-            // Local scratch for this thread's Cholesky
-            double K[GP_MAX_M * GP_MAX_M];
-            double alpha[GP_MAX_M];
-            double tmp[GP_MAX_M];
-
             my_score = gp_try_hyperparams(
                 sh_sub_t, sh_sub_v, sh_sub_nv, m, y_mean,
-                amp, inv_2ls2, K, alpha, tmp);
+                amp, inv_2ls2, my_K, my_alpha, my_tmp);
         }
     }
 
@@ -257,10 +258,19 @@ extern "C" __global__ void batch_gp_fit_predict(
     }
     __syncthreads();
 
-    // Winner thread writes its hyperparameters to shared memory
+    // Winner thread copies its cached Cholesky and alpha to shared
+    // memory, eliminating the redundant O(m³) refit that thread 0
+    // previously performed.
     if (tid == sh_winner[0]) {
         sh_best_amp[0] = my_amp;
         sh_best_inv[0] = my_inv2ls2;
+
+        // Copy alpha and L (Cholesky factor, stored in-place in K)
+        for (int i = 0; i < m; i++) {
+            sh_alpha[i] = my_alpha[i];
+            for (int j = 0; j < m; j++)
+                sh_L[i * m + j] = my_K[i * m + j];
+        }
     }
     __syncthreads();
 
@@ -269,30 +279,18 @@ extern "C" __global__ void batch_gp_fit_predict(
 
     if (amp == 0.0 && inv_2ls2 == 0.0) return;  // all combos failed
 
-    // ---- Thread 0 refits with best hyperparameters and stores state ----
+    // ---- Thread 0 stores GP state from the cached refit ----
     if (tid == 0) {
-        // Rebuild K + Cholesky in shared L
+        // Verify the cached Cholesky is valid (diagonal should be positive)
+        bool valid = true;
         for (int i = 0; i < m; i++) {
-            for (int j = 0; j <= i; j++) {
-                double v = gp_rbf(sh_sub_t[i], sh_sub_t[j], amp, inv_2ls2);
-                sh_L[i * m + j] = v;
-                sh_L[j * m + i] = v;
-            }
-            double nv = sh_sub_nv[i];
-            if (nv < 1e-10) nv = 1e-10;
-            sh_L[i * m + i] += nv;
+            if (sh_L[i * m + i] <= 0.0) { valid = false; break; }
         }
 
-        if (!gp_cholesky(sh_L, m)) {
+        if (!valid) {
             sh_m_val[0] = 0;  // signal failure
         } else {
-            double y_c[GP_MAX_M];
-            double tmp[GP_MAX_M];
-            for (int i = 0; i < m; i++) y_c[i] = sh_sub_v[i] - y_mean;
-            gp_solve_l(sh_L, y_c, tmp, m);
-            gp_solve_lt(sh_L, tmp, sh_alpha, m);
-
-            // Store GP state
+            // Store GP state directly from cached data
             for (int i = 0; i < m; i++) out_state[i] = sh_alpha[i];
             for (int i = m; i < GP_MAX_M; i++) out_state[i] = 0.0;
             for (int i = 0; i < m; i++) out_state[GP_MAX_M + i] = sh_sub_t[i];
