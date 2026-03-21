@@ -309,9 +309,8 @@ extern "C" __global__ void batch_svi_fit(
                     if (!isfinite(pred)) continue;
                 }
 
-                // rsqrt optimization
                 double total_var = obs_v[i] + se_sq;
-                double inv_sigma = rsqrt(total_var);
+                double inv_sigma = 1.0 / sqrt(total_var);
                 double inv_total = inv_sigma * inv_sigma;
 
                 if (obs_u[i]) {
@@ -379,6 +378,21 @@ extern "C" __global__ void batch_svi_fit(
 
         // Thread 0: Adam update + early stopping
         if (tid == 0) {
+            // Gradient clipping (clip norm to 10 if ||grad||^2 > 100)
+            double grad_norm_sq = 0.0;
+            for (int j = 0; j < np; j++) {
+                double g_mu = -grad_mu_acc[j];
+                double g_ls = -(grad_ls_acc[j] + 1.0);
+                grad_norm_sq += g_mu * g_mu + g_ls * g_ls;
+            }
+            if (grad_norm_sq > 100.0) {
+                double scale = 10.0 / sqrt(grad_norm_sq);
+                for (int j = 0; j < np; j++) {
+                    grad_mu_acc[j] *= scale;
+                    grad_ls_acc[j] *= scale;
+                }
+            }
+
             adam_t++;
             double bc1 = 1.0 - pow(0.9, (double)adam_t);
             double bc2 = 1.0 - pow(0.999, (double)adam_t);

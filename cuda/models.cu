@@ -721,11 +721,27 @@ extern "C" __global__ void batch_pso_full(
             if (l_peak <= 0.0 || !isfinite(l_peak)) {
                 neg_ll = 1e99;
             } else {
+                // Avoid fixed-size preds array overflow
+                double max_pred = -1e99;
+                for (int i = 0; i < n_obs; i++) {
+                    double phase = obs_t[i] - t0;
+                    double p = metzger_kn_interp(grid_t, grid_lrad, phase);
+                    if (!obs_u[i] && isfinite(p) && p > max_pred)
+                        max_pred = p;
+                }
+                // Compute scale as (1/max_pred) clamped to [0.1, 10.0]
+                double scale = 1.0;
+                if (max_pred > 1e-10 && isfinite(max_pred)) {
+                    scale = 1.0 / max_pred;
+                    if (scale < 0.1) scale = 0.1;
+                    if (scale > 10.0) scale = 10.0;
+                }
+                // Compute likelihood with scaled predictions
                 double se = exp(pos[n_params - 1]);
                 double se_sq = se * se;
                 for (int i = 0; i < n_obs; i++) {
                     double phase = obs_t[i] - t0;
-                    double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
+                    double pred = metzger_kn_interp(grid_t, grid_lrad, phase) * scale;
                     if (!isfinite(pred)) { neg_ll = 1e99; break; }
                     double total_var = obs_v[i] + se_sq;
                     if (obs_u[i]) {
@@ -1178,11 +1194,27 @@ extern "C" __global__ void batch_pso_full_kn(
         if (l_peak <= 0.0 || !isfinite(l_peak)) {
             neg_ll = 1e99;
         } else {
+            // Avoid fixed-size preds array overflow
+            double max_pred = -1e99;
+            for (int i = 0; i < n_obs; i++) {
+                double phase = obs_t[i] - t0;
+                double p = metzger_kn_interp(grid_t, grid_lrad, phase);
+                if (!obs_u[i] && isfinite(p) && p > max_pred)
+                    max_pred = p;
+            }
+            // Compute scale as (1/max_pred) clamped to [0.1, 10.0]
+            double scale = 1.0;
+            if (max_pred > 1e-10 && isfinite(max_pred)) {
+                scale = 1.0 / max_pred;
+                if (scale < 0.1) scale = 0.1;
+                if (scale > 10.0) scale = 10.0;
+            }
+            // Compute likelihood with scaled predictions
             double se = exp(pos[n_params - 1]);
             double se_sq = se * se;
             for (int i = 0; i < n_obs; i++) {
                 double phase = obs_t[i] - t0;
-                double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
+                double pred = metzger_kn_interp(grid_t, grid_lrad, phase) * scale;
                 if (!isfinite(pred)) { neg_ll = 1e99; break; }
                 double total_var = obs_v[i] + se_sq;
                 if (obs_u[i]) {

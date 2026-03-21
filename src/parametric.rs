@@ -3571,11 +3571,15 @@ pub fn finalize_parametric_with_gpu_svi(
 
         let pso_model = SviModel::from_name(&gpu.model);
 
+        // Apply sigma inflation to match CPU path (GPU outputs raw VI posterior)
+        let log_inflation = SIGMA_INFLATION_FACTOR.ln();
+        let inflated_log_sigma: Vec<f64> = svi_log_sigma.iter().map(|ls| ls + log_inflation).collect();
+
         // profile_t0_refine on the GPU SVI result
         let mut svi_result = SviFitResult {
             model: pso_model,
             mu: svi_mu.clone(),
-            log_sigma: svi_log_sigma.clone(),
+            log_sigma: inflated_log_sigma,
             elbo: svi_elbo,
         };
         profile_t0_refine(&mut svi_result, data);
