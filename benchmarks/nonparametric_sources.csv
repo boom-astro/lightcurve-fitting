@@ -1,5 +1,5 @@
 fitter,backend,n_sources,n_points_per_band,total_obs,wall_sec,throughput_src_per_sec,throughput_pts_per_sec
-nonparametric,CPU,10,30,900,0.0031,3234,291085
-nonparametric,CPU,100,30,9000,0.0337,2964,266803
-nonparametric,CPU,500,30,45000,0.1455,3436,309261
-nonparametric,CPU,1000,30,90000,0.3236,3091,278153
+nonparametric,CPU,10,30,900,0.0031,3177,285941
+nonparametric,CPU,100,30,9000,0.0386,2593,233336
+nonparametric,CPU,500,30,45000,0.1765,2833,254975
+nonparametric,CPU,1000,30,90000,0.3794,2636,237224

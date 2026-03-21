@@ -230,6 +230,16 @@ extern "C" __global__ void batch_svi_fit(
     int stall = 0;
 
     for (int step = 0; step < n_steps; step++) {
+        // Cosine annealing LR (matches CPU schedule)
+        double step_lr;
+        if (step < 50) {
+            step_lr = lr * 0.1 + lr * 0.9 * (double)step / 50.0;
+        } else {
+            int denom = (n_steps - 50) > 1 ? (n_steps - 50) : 1;
+            double progress = (double)(step - 50) / (double)denom;
+            step_lr = lr * (0.1 + 0.9 * 0.5 * (1.0 + cos(M_PI * progress)));
+        }
+
         // Thread 0: compute sigma from log_sigma
         if (tid == 0) {
             for (int j = 0; j < np; j++) {
@@ -404,7 +414,7 @@ extern "C" __global__ void batch_svi_fit(
                     adam_v_arr[j] = 0.999 * adam_v_arr[j] + 0.001 * g_mu * g_mu;
                     double m_hat = adam_m[j] / bc1;
                     double v_hat = adam_v_arr[j] / bc2;
-                    s_mu[j] = r_mu[j] - lr * m_hat / (sqrt(v_hat) + 1e-8);
+                    s_mu[j] = r_mu[j] - step_lr * m_hat / (sqrt(v_hat) + 1e-8);
                 }
                 // log_sigma gradient
                 double g_ls = -(grad_ls_acc[j] + 1.0);
@@ -414,7 +424,7 @@ extern "C" __global__ void batch_svi_fit(
                     adam_v_arr[ls_idx] = 0.999 * adam_v_arr[ls_idx] + 0.001 * g_ls * g_ls;
                     double m_hat = adam_m[ls_idx] / bc1;
                     double v_hat = adam_v_arr[ls_idx] / bc2;
-                    s_log_sigma[j] = r_log_sigma[j] - lr * m_hat / (sqrt(v_hat) + 1e-8);
+                    s_log_sigma[j] = r_log_sigma[j] - step_lr * m_hat / (sqrt(v_hat) + 1e-8);
                 }
             }
 

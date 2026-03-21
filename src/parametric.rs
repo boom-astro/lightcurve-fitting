@@ -3571,7 +3571,7 @@ pub fn finalize_parametric_with_gpu_svi(
 
         let pso_model = SviModel::from_name(&gpu.model);
 
-        // Apply sigma inflation to match CPU path (GPU outputs raw VI posterior)
+        // Apply sigma inflation to match CPU
         let log_inflation = SIGMA_INFLATION_FACTOR.ln();
         let inflated_log_sigma: Vec<f64> = svi_log_sigma.iter().map(|ls| ls + log_inflation).collect();
 
