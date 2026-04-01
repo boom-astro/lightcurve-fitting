@@ -3,12 +3,13 @@
 //! Uses Apple's Metal API via objc2-metal for compute shader dispatch.
 //! All GPU computations use float32; data is converted f64↔f32 at boundaries.
 
-use std::ffi::c_int;
+use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
+use dispatch2::DispatchData;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -99,10 +100,8 @@ impl GpuContext {
     ///
     /// The `_device` parameter is ignored — Metal uses the system default device.
     pub fn new(_device: i32) -> Result<Self, String> {
-        let device = {
-            let ptr = unsafe { MTLCreateSystemDefaultDevice() };
-            ptr.ok_or("No Metal device available")?
-        };
+        let device = MTLCreateSystemDefaultDevice()
+            .ok_or("No Metal device available")?;
 
         let queue = device
             .newCommandQueue()
@@ -112,18 +111,11 @@ impl GpuContext {
         let metallib_bytes: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/lightcurve.metallib"));
 
-        let data = unsafe {
-            objc2_foundation::NSData::dataWithBytes_length(
-                metallib_bytes.as_ptr() as *const _,
-                metallib_bytes.len(),
-            )
-        };
+        let data = DispatchData::from_bytes(metallib_bytes);
 
-        let library = unsafe {
-            device
-                .newLibraryWithData_error(&data)
-                .map_err(|e| format!("Failed to load metallib: {}", e))?
-        };
+        let library = device
+            .newLibraryWithData_error(&data)
+            .map_err(|e| format!("Failed to load metallib: {}", e))?;
 
         Ok(Self {
             device,
@@ -140,11 +132,9 @@ impl GpuContext {
             .newFunctionWithName(&ns_name)
             .ok_or_else(|| format!("Metal function '{}' not found in library", name))?;
 
-        unsafe {
-            self.device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|e| format!("Failed to create pipeline for '{}': {}", name, e))
-        }
+        self.device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| format!("Failed to create pipeline for '{}': {}", name, e))
     }
 
     /// Create a command buffer, encode a compute pass, and return (encoder, buffer).
@@ -178,12 +168,12 @@ impl GpuContext {
     ) {
         encoder.setComputePipelineState(pipeline);
         let threadgroups = MTLSize {
-            width: grid_size as u64,
+            width: grid_size,
             height: 1,
             depth: 1,
         };
         let threads_per = MTLSize {
-            width: block_size as u64,
+            width: block_size,
             height: 1,
             depth: 1,
         };
@@ -246,24 +236,26 @@ impl GpuContext {
 
         let (cmd_buf, encoder) = self.begin_compute()?;
         encoder.setComputePipelineState(&pipeline);
-        encoder.setBuffer_offset_atIndex(Some(&d_params.buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&d_out.buffer), 0, 2);
-        encoder.setBytes_length_atIndex(
-            &n_draws_i as *const i32 as *const _,
-            std::mem::size_of::<i32>(),
-            3,
-        );
-        encoder.setBytes_length_atIndex(
-            &n_times_i as *const i32 as *const _,
-            std::mem::size_of::<i32>(),
-            4,
-        );
-        encoder.setBytes_length_atIndex(
-            &n_params_i as *const i32 as *const _,
-            std::mem::size_of::<i32>(),
-            5,
-        );
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&d_params.buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&d_out.buffer), 0, 2);
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_draws_i as *const i32 as *mut _),
+                std::mem::size_of::<i32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_times_i as *const i32 as *mut _),
+                std::mem::size_of::<i32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_params_i as *const i32 as *mut _),
+                std::mem::size_of::<i32>(),
+                5,
+            );
+        }
 
         let total = if model == GpuModelName::MetzgerKN {
             n_draws
@@ -273,8 +265,8 @@ impl GpuContext {
         let block: usize = 256;
         let grid = (total + block - 1) / block;
 
-        let threadgroups = MTLSize { width: grid as u64, height: 1, depth: 1 };
-        let threads_per = MTLSize { width: block as u64, height: 1, depth: 1 };
+        let threadgroups = MTLSize { width: grid, height: 1, depth: 1 };
+        let threads_per = MTLSize { width: block, height: 1, depth: 1 };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
         encoder.endEncoding();
         cmd_buf.commit();
@@ -360,21 +352,23 @@ impl GpuContext {
             let grid = (total_particles + block - 1) / block;
             let (cmd_buf, encoder) = self.begin_compute()?;
             encoder.setComputePipelineState(&pipeline);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
-            encoder.setBuffer_offset_atIndex(Some(&d_positions.buffer), 0, 6);
-            encoder.setBuffer_offset_atIndex(Some(&d_costs.buffer), 0, 7);
-            encoder.setBytes_length_atIndex(&n_sources_i as *const _ as *const _, 4, 8);
-            encoder.setBytes_length_atIndex(&n_particles_i as *const _ as *const _, 4, 9);
-            encoder.setBytes_length_atIndex(&n_params_i as *const _ as *const _, 4, 10);
-            encoder.setBytes_length_atIndex(&model_id_i as *const _ as *const _, 4, 11);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(&d_positions.buffer), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(&d_costs.buffer), 0, 7);
+                encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_sources_i as *const _ as *mut _), 4, 8);
+                encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_particles_i as *const _ as *mut _), 4, 9);
+                encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_params_i as *const _ as *mut _), 4, 10);
+                encoder.setBytes_length_atIndex(NonNull::new_unchecked(&model_id_i as *const _ as *mut _), 4, 11);
+            }
 
-            let threadgroups = MTLSize { width: grid as u64, height: 1, depth: 1 };
-            let threads_per = MTLSize { width: block as u64, height: 1, depth: 1 };
+            let threadgroups = MTLSize { width: grid, height: 1, depth: 1 };
+            let threads_per = MTLSize { width: block, height: 1, depth: 1 };
             encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
             encoder.endEncoding();
             cmd_buf.commit();
@@ -733,21 +727,23 @@ impl GpuContext {
                 let grid = (total_particles + block - 1) / block;
                 let (cmd_buf, encoder) = self.begin_compute()?;
                 encoder.setComputePipelineState(&pipeline);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(&d_positions.buffer), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(&d_costs.buffer), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(&d_source_k.buffer), 0, 8);
-                encoder.setBytes_length_atIndex(&n_sources_i as *const _ as *const _, 4, 9);
-                encoder.setBytes_length_atIndex(&n_particles_i as *const _ as *const _, 4, 10);
-                encoder.setBytes_length_atIndex(&n_params_i as *const _ as *const _, 4, 11);
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
+                    encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
+                    encoder.setBuffer_offset_atIndex(Some(&d_positions.buffer), 0, 6);
+                    encoder.setBuffer_offset_atIndex(Some(&d_costs.buffer), 0, 7);
+                    encoder.setBuffer_offset_atIndex(Some(&d_source_k.buffer), 0, 8);
+                    encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_sources_i as *const _ as *mut _), 4, 9);
+                    encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_particles_i as *const _ as *mut _), 4, 10);
+                    encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_params_i as *const _ as *mut _), 4, 11);
+                }
 
-                let threadgroups = MTLSize { width: grid as u64, height: 1, depth: 1 };
-                let threads_per = MTLSize { width: block as u64, height: 1, depth: 1 };
+                let threadgroups = MTLSize { width: grid, height: 1, depth: 1 };
+                let threads_per = MTLSize { width: block, height: 1, depth: 1 };
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
                 encoder.endEncoding();
                 cmd_buf.commit();
@@ -940,23 +936,25 @@ impl GpuContext {
         let pipeline1 = self.pipeline("batch_gp_fit_predict")?;
         let (cmd_buf, encoder) = self.begin_compute()?;
         encoder.setComputePipelineState(&pipeline1);
-        encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&d_mags.buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&d_noise_var.buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&d_offsets.buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&d_query.buffer), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&d_amps.buffer), 0, 5);
-        encoder.setBuffer_offset_atIndex(Some(&d_ls.buffer), 0, 6);
-        encoder.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 7);
-        encoder.setBuffer_offset_atIndex(Some(&d_pred_grid.buffer), 0, 8);
-        encoder.setBuffer_offset_atIndex(Some(&d_std_grid.buffer), 0, 9);
-        encoder.setBytes_length_atIndex(&n_bands_i as *const _ as *const _, 4, 10);
-        encoder.setBytes_length_atIndex(&n_hp_amp_i as *const _ as *const _, 4, 11);
-        encoder.setBytes_length_atIndex(&n_hp_ls_i as *const _ as *const _, 4, 12);
-        encoder.setBytes_length_atIndex(&max_subsample_i as *const _ as *const _, 4, 13);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&d_mags.buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&d_noise_var.buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&d_offsets.buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&d_query.buffer), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&d_amps.buffer), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&d_ls.buffer), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 7);
+            encoder.setBuffer_offset_atIndex(Some(&d_pred_grid.buffer), 0, 8);
+            encoder.setBuffer_offset_atIndex(Some(&d_std_grid.buffer), 0, 9);
+            encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_bands_i as *const _ as *mut _), 4, 10);
+            encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_hp_amp_i as *const _ as *mut _), 4, 11);
+            encoder.setBytes_length_atIndex(NonNull::new_unchecked(&n_hp_ls_i as *const _ as *mut _), 4, 12);
+            encoder.setBytes_length_atIndex(NonNull::new_unchecked(&max_subsample_i as *const _ as *mut _), 4, 13);
+        }
 
-        let threadgroups = MTLSize { width: n_bands as u64, height: 1, depth: 1 };
-        let threads_per = MTLSize { width: n_hp_total as u64, height: 1, depth: 1 };
+        let threadgroups = MTLSize { width: n_bands, height: 1, depth: 1 };
+        let threads_per = MTLSize { width: n_hp_total, height: 1, depth: 1 };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
         encoder.endEncoding();
         cmd_buf.commit();
@@ -969,17 +967,19 @@ impl GpuContext {
         let pipeline2 = self.pipeline("batch_gp_predict_obs")?;
         let (cmd_buf2, encoder2) = self.begin_compute()?;
         encoder2.setComputePipelineState(&pipeline2);
-        encoder2.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 0);
-        encoder2.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 1);
-        encoder2.setBuffer_offset_atIndex(Some(&d_obs_to_band.buffer), 0, 2);
-        encoder2.setBuffer_offset_atIndex(Some(&d_pred_obs.buffer), 0, 3);
         let total_obs_i = total_obs as i32;
-        encoder2.setBytes_length_atIndex(&total_obs_i as *const _ as *const _, 4, 4);
+        unsafe {
+            encoder2.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 0);
+            encoder2.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 1);
+            encoder2.setBuffer_offset_atIndex(Some(&d_obs_to_band.buffer), 0, 2);
+            encoder2.setBuffer_offset_atIndex(Some(&d_pred_obs.buffer), 0, 3);
+            encoder2.setBytes_length_atIndex(NonNull::new_unchecked(&total_obs_i as *const _ as *mut _), 4, 4);
+        }
 
         let block2: usize = 256;
         let grid2 = (total_obs + block2 - 1) / block2;
-        let tg2 = MTLSize { width: grid2 as u64, height: 1, depth: 1 };
-        let tp2 = MTLSize { width: block2 as u64, height: 1, depth: 1 };
+        let tg2 = MTLSize { width: grid2, height: 1, depth: 1 };
+        let tp2 = MTLSize { width: block2, height: 1, depth: 1 };
         encoder2.dispatchThreadgroups_threadsPerThreadgroup(tg2, tp2);
         encoder2.endEncoding();
         cmd_buf2.commit();
@@ -1147,27 +1147,29 @@ impl GpuContext {
 
         let (cmd_buf, encoder) = self.begin_compute()?;
         encoder.setComputePipelineState(&pipeline);
-        encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&d_waves.buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&d_mags.buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&d_noise_var.buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&d_offsets.buffer), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&d_query_t.buffer), 0, 5);
-        encoder.setBuffer_offset_atIndex(Some(&d_query_w.buffer), 0, 6);
-        encoder.setBuffer_offset_atIndex(Some(&d_amps.buffer), 0, 7);
-        encoder.setBuffer_offset_atIndex(Some(&d_lst.buffer), 0, 8);
-        encoder.setBuffer_offset_atIndex(Some(&d_lsw.buffer), 0, 9);
-        encoder.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 10);
-        encoder.setBuffer_offset_atIndex(Some(&d_pred_grid.buffer), 0, 11);
-        encoder.setBuffer_offset_atIndex(Some(&d_std_grid.buffer), 0, 12);
-        encoder.setBytes_length_atIndex(
-            &params_struct as *const Gp2dParams as *const _,
-            std::mem::size_of::<Gp2dParams>(),
-            13,
-        );
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&d_times.buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&d_waves.buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&d_mags.buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&d_noise_var.buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&d_offsets.buffer), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&d_query_t.buffer), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&d_query_w.buffer), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(&d_amps.buffer), 0, 7);
+            encoder.setBuffer_offset_atIndex(Some(&d_lst.buffer), 0, 8);
+            encoder.setBuffer_offset_atIndex(Some(&d_lsw.buffer), 0, 9);
+            encoder.setBuffer_offset_atIndex(Some(&d_gp_state.buffer), 0, 10);
+            encoder.setBuffer_offset_atIndex(Some(&d_pred_grid.buffer), 0, 11);
+            encoder.setBuffer_offset_atIndex(Some(&d_std_grid.buffer), 0, 12);
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&params_struct as *const Gp2dParams as *mut _),
+                std::mem::size_of::<Gp2dParams>(),
+                13,
+            );
+        }
 
-        let threadgroups = MTLSize { width: n_sources as u64, height: 1, depth: 1 };
-        let threads_per = MTLSize { width: n_hp_total as u64, height: 1, depth: 1 };
+        let threadgroups = MTLSize { width: n_sources, height: 1, depth: 1 };
+        let threads_per = MTLSize { width: n_hp_total, height: 1, depth: 1 };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
         encoder.endEncoding();
         cmd_buf.commit();
@@ -1331,26 +1333,28 @@ impl GpuContext {
 
         let (cmd_buf, encoder) = self.begin_compute()?;
         encoder.setComputePipelineState(&pipeline);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
-        encoder.setBuffer_offset_atIndex(Some(&d_pso.buffer), 0, 6);
-        encoder.setBuffer_offset_atIndex(Some(&d_model_ids.buffer), 0, 7);
-        encoder.setBuffer_offset_atIndex(Some(&d_n_params.buffer), 0, 8);
-        encoder.setBuffer_offset_atIndex(Some(&d_se_idx.buffer), 0, 9);
-        encoder.setBuffer_offset_atIndex(Some(&d_prior_centers.buffer), 0, 10);
-        encoder.setBuffer_offset_atIndex(Some(&d_prior_widths.buffer), 0, 11);
-        encoder.setBuffer_offset_atIndex(Some(&d_out_mu.buffer), 0, 12);
-        encoder.setBuffer_offset_atIndex(Some(&d_out_ls.buffer), 0, 13);
-        encoder.setBuffer_offset_atIndex(Some(&d_out_elbo.buffer), 0, 14);
-        encoder.setBuffer_offset_atIndex(Some(&d_config_ints.buffer), 0, 15);
-        encoder.setBuffer_offset_atIndex(Some(&d_config_floats.buffer), 0, 16);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&data.d_times.buffer), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&data.d_flux.buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&data.d_obs_var.buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&data.d_is_upper.buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&data.d_upper_flux.buffer), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&data.d_offsets.buffer), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&d_pso.buffer), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(&d_model_ids.buffer), 0, 7);
+            encoder.setBuffer_offset_atIndex(Some(&d_n_params.buffer), 0, 8);
+            encoder.setBuffer_offset_atIndex(Some(&d_se_idx.buffer), 0, 9);
+            encoder.setBuffer_offset_atIndex(Some(&d_prior_centers.buffer), 0, 10);
+            encoder.setBuffer_offset_atIndex(Some(&d_prior_widths.buffer), 0, 11);
+            encoder.setBuffer_offset_atIndex(Some(&d_out_mu.buffer), 0, 12);
+            encoder.setBuffer_offset_atIndex(Some(&d_out_ls.buffer), 0, 13);
+            encoder.setBuffer_offset_atIndex(Some(&d_out_elbo.buffer), 0, 14);
+            encoder.setBuffer_offset_atIndex(Some(&d_config_ints.buffer), 0, 15);
+            encoder.setBuffer_offset_atIndex(Some(&d_config_floats.buffer), 0, 16);
+        }
 
-        let threadgroups = MTLSize { width: grid as u64, height: 1, depth: 1 };
-        let threads_per = MTLSize { width: block as u64, height: 1, depth: 1 };
+        let threadgroups = MTLSize { width: grid, height: 1, depth: 1 };
+        let threads_per = MTLSize { width: block, height: 1, depth: 1 };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per);
         encoder.endEncoding();
         cmd_buf.commit();
@@ -1402,7 +1406,7 @@ impl GpuBatchData {
     /// Callers should use `GpuBatchData::new(sources)` — the Metal feature
     /// changes the signature to include the context.
     pub fn new(sources: &[BatchSource]) -> Result<Self, String> {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }
+        let device = MTLCreateSystemDefaultDevice()
             .ok_or("No Metal device available for GpuBatchData")?;
         Self::new_with_device(sources, &device)
     }
