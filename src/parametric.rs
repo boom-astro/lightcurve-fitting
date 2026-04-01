@@ -4102,6 +4102,14 @@ pub fn fit_parametric_multiband(
         let mut per_model_chi2 = HashMap::new();
         per_model_chi2.insert(SviModelName::Villar, finite_or_none(best_cost));
 
+        // MultiBazin: run on the first (most-populated) band
+        let multi_bazin = if b == 0 {
+            let mb = fit_multi_bazin(data);
+            if mb.params.is_empty() { None } else { Some(mb) }
+        } else {
+            None
+        };
+
         results.push(ParametricBandResult {
             band: band_name.clone(),
             model: SviModelName::Villar,
@@ -4115,7 +4123,7 @@ pub fn fit_parametric_multiband(
             per_model_chi2,
             per_model_params: HashMap::new(),
             uncertainty_method: method,
-            multi_bazin: None,
+            multi_bazin,
         });
     }
 
