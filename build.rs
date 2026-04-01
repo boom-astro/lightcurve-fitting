@@ -24,7 +24,70 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed=cuda/svi.cu");
 }
 
+#[cfg(feature = "metal")]
+fn build_metal() {
+    use std::process::Command;
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let metal_files = [
+        "metal/models.metal",
+        "metal/gp.metal",
+        "metal/gp2d.metal",
+        "metal/svi.metal",
+    ];
+
+    let mut air_paths = Vec::new();
+
+    for src in &metal_files {
+        let stem = std::path::Path::new(src)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let air_path = format!("{}/{}.air", out_dir, stem);
+
+        let status = Command::new("xcrun")
+            .args([
+                "-sdk", "macosx", "metal",
+                "-c", src,
+                "-o", &air_path,
+                "-std=metal3.0",
+                "-I", "metal/", // for #include "models_device.h"
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to run xcrun metal for {}: {}", src, e));
+
+        assert!(
+            status.success(),
+            "Metal shader compilation failed for {}",
+            src
+        );
+        air_paths.push(air_path);
+        println!("cargo:rerun-if-changed={}", src);
+    }
+
+    // Link .air files into a single .metallib
+    let metallib_path = format!("{}/lightcurve.metallib", out_dir);
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["-sdk", "macosx", "metallib"]);
+    for air in &air_paths {
+        cmd.arg(air);
+    }
+    cmd.args(["-o", &metallib_path]);
+
+    let status = cmd
+        .status()
+        .expect("Failed to run xcrun metallib");
+
+    assert!(status.success(), "metallib linking failed");
+
+    println!("cargo:rerun-if-changed=metal/models_device.h");
+}
+
 fn main() {
     #[cfg(feature = "cuda")]
     build_cuda();
+
+    #[cfg(feature = "metal")]
+    build_metal();
 }

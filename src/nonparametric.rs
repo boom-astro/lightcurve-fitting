@@ -787,7 +787,7 @@ pub fn fit_nonparametric(
 ///
 /// Each source's bands are independently fit. Returns results in the same
 /// order as the input `sources` slice.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn fit_nonparametric_batch_gpu(
     gpu: &crate::gpu::GpuContext,
     sources: &[HashMap<String, BandData>],
@@ -796,7 +796,7 @@ pub fn fit_nonparametric_batch_gpu(
 }
 
 /// Like [`fit_nonparametric_batch_gpu`] but with configurable subsample size.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn fit_nonparametric_batch_gpu_with_opts(
     gpu: &crate::gpu::GpuContext,
     sources: &[HashMap<String, BandData>],

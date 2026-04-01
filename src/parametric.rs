@@ -1301,6 +1301,22 @@ impl PsoCost<'_> {
     /// reuses a prediction buffer.
     #[inline]
     fn cost_from_slice(&self, p: &[f64], pred_buf: &mut [f64]) -> f64 {
+        // Villar physical constraint (JAX-calibrated, Sushant/villar-pso)
+        if self.model == SviModel::Villar {
+            // Params: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+            let beta = p[1];
+            let gamma = p[2].exp(); // physical gamma = exp(log_gamma)
+            let tau_rise = p[4].exp();
+            let tau_fall = p[5].exp();
+            let c1 = (gamma * beta - 1.0).max(0.0);
+            let c2 = ((-gamma / tau_rise).exp() * (tau_fall / tau_rise - 1.0) - 1.0).max(0.0);
+            let c3 = (beta * tau_fall - 1.0 + beta * gamma).max(0.0);
+            let constraint = c1 + c2 + c3;
+            if constraint > 0.0 {
+                return 1e12 + 10_000.0 * constraint;
+            }
+        }
+
         let se_idx = self.model.sigma_extra_idx();
         let sigma_extra = p[se_idx].exp();
         let sigma_extra_sq = sigma_extra * sigma_extra;
@@ -1529,8 +1545,11 @@ fn pso_bounds(model: SviModel) -> (Vec<f64>, Vec<f64>) {
             vec![3.0, 0.3, 100.0, 5.0, 6.0, 0.0],
         ),
         SviModel::Villar => (
-            vec![-3.0, -0.05, -3.0, -100.0, -2.0, -2.0, -5.0],
-            vec![3.0, 0.1, 5.0, 100.0, 5.0, 7.0, 0.0],
+            // JAX-calibrated bounds (Sushant/villar-pso), converted from log10→ln
+            // and kept slightly wider for single-band generality.
+            // [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+            vec![-1.5, -0.02, 1.0, -60.0, -1.0, 1.0, -6.0],
+            vec![1.5,  0.05,  5.0,  40.0,  3.0, 5.5,  0.0],
         ),
         SviModel::MetzgerKN => (
             vec![-3.0, -2.0, -1.0, -2.0, -5.0],
@@ -1570,16 +1589,16 @@ fn population_priors(model: SviModel) -> Vec<(f64, f64)> {
     let ln10 = std::f64::consts::LN_10;
     match model {
         SviModel::Villar => {
-            // Kenworthy+ 2024, Table 2 (r-band reference): log10 → ln
+            // JAX-calibrated priors (Sushant/villar-pso): log10 means/stds → ln
             // [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
             vec![
-                (0.096 * ln10, 0.15 * ln10),   // log_A: μ=0.096, σ=0.058 in log10 → widen 2.5x for robustness
-                (0.008, 0.012),                 // beta: linear, σ=0.004 → widen 3x
-                (1.43 * ln10, 0.9 * ln10),     // log_gamma: μ=1.43, σ=0.31 → widen 3x
-                (0.0, 30.0),                    // t0: broad, data-informed bounds handle this
-                (0.67 * ln10, 1.2 * ln10),      // log_tau_rise: μ=0.67, σ=0.43 → widen 3x
-                (1.53 * ln10, 0.9 * ln10),      // log_tau_fall: μ=1.53, σ=0.30 → widen 3x
-                (-1.66 * ln10, 1.0 * ln10),     // log_sigma_extra: μ=-1.66, σ=0.34 → widen 3x
+                (-0.009 * ln10, 0.10 * ln10),   // log_A: JAX μ=-0.009, σ=0.10 in log10
+                (0.009, 0.010),                   // beta: linear
+                (1.327 * ln10, 0.40 * ln10),     // log_gamma: JAX μ=1.327, σ=0.40 in log10
+                (-12.0, 15.0),                    // t0: JAX μ=-12, σ=15
+                (0.360 * ln10, 0.35 * ln10),     // log_tau_rise: JAX μ=0.36, σ=0.35 in log10
+                (1.454 * ln10, 0.40 * ln10),     // log_tau_fall: JAX μ=1.454, σ=0.40 in log10
+                (-1.033 * ln10, 0.50 * ln10),    // log_sigma_extra: JAX μ=-1.033, σ=0.50 in log10
             ]
         }
         SviModel::Bazin => {
@@ -1602,8 +1621,8 @@ fn population_priors(model: SviModel) -> Vec<(f64, f64)> {
 }
 
 /// Public accessor for GPU PSO to use population priors.
-#[cfg(feature = "cuda")]
-pub fn population_priors_for_gpu(model: crate::gpu::GpuModelName) -> Vec<(f64, f64)> {
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn population_priors_for_gpu(model: crate::gpu_types::GpuModelName) -> Vec<(f64, f64)> {
     population_priors(SviModel::from_name(&model.to_svi_name()))
 }
 
@@ -3725,6 +3744,19 @@ pub fn fit_parametric(
     fit_all_models: bool,
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
+    // Use joint multi-band Villar fitting when ≥2 bands with data are available.
+    // This produces better fits via band-balanced likelihood and shared structure
+    // (JAX-calibrated, Sushant/villar-pso).
+    let bands_with_data: usize = bands.values()
+        .filter(|b| !b.values.is_empty())
+        .count();
+    if bands_with_data >= 2 && !fit_all_models {
+        let multiband_results = fit_parametric_multiband(bands, method);
+        if !multiband_results.is_empty() {
+            return multiband_results;
+        }
+    }
+    // Fall back to per-band fitting
     fit_parametric_model(bands, fit_all_models, method, None)
 }
 
@@ -3738,17 +3770,31 @@ pub fn fit_parametric(
 /// beta (additive in linear) and t0 (additive in days).
 fn relative_band_priors() -> Vec<(f64, f64, bool)> {
     // (mean, sigma, is_additive)
+    // JAX-calibrated offset priors (Sushant/villar-pso), converted from log10→ln.
     // Villar: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
     let ln10 = std::f64::consts::LN_10;
     vec![
-        (-0.08 * ln10, 0.3 * ln10, false),    // log_A: multiplicative ratio in log10 → ln
-        (0.0, 0.01, true),                      // beta: additive offset (linear)
-        (-0.05 * ln10, 0.45 * ln10, false),    // log_gamma: multiplicative ratio
-        (-3.4, 12.0, true),                     // t0: additive offset (days)
-        (-0.15 * ln10, 0.6 * ln10, false),     // log_tau_rise: multiplicative ratio
-        (-0.15 * ln10, 0.75 * ln10, false),    // log_tau_fall: multiplicative ratio
-        (-0.15 * ln10, 0.75 * ln10, false),    // log_sigma_extra: multiplicative ratio
+        (-0.015 * ln10, 0.08 * ln10, false),  // log_A: JAX μ=-0.015, σ=0.08 in log10
+        (-0.001, 0.008, true),                  // beta: linear offset
+        (-0.095 * ln10, 0.25 * ln10, false),  // log_gamma: JAX μ=-0.095, σ=0.25 in log10
+        (-1.181, 1.5, true),                    // t0: JAX μ=-1.181 days, σ=1.5
+        (-0.195 * ln10, 0.35 * ln10, false),  // log_tau_rise: JAX μ=-0.195, σ=0.35 in log10
+        (-0.323 * ln10, 0.25 * ln10, false),  // log_tau_fall: JAX μ=-0.323, σ=0.25 in log10
+        (-0.025 * ln10, 0.30 * ln10, false),  // log_sigma_extra: JAX μ=-0.025, σ=0.30 in log10
     ]
+}
+
+/// Villar physical validity constraint (matches JAX `_villar_constraint`).
+/// Evaluates for one band's physical parameters.
+/// Returns 0 if valid, positive penalty otherwise.
+fn villar_constraint(log_gamma: f64, beta: f64, log_tau_rise: f64, log_tau_fall: f64) -> f64 {
+    let gamma = log_gamma.exp();
+    let tau_rise = log_tau_rise.exp();
+    let tau_fall = log_tau_fall.exp();
+    let c1 = (gamma * beta - 1.0).max(0.0);
+    let c2 = ((-gamma / tau_rise).exp() * (tau_fall / tau_rise - 1.0) - 1.0).max(0.0);
+    let c3 = (beta * tau_fall - 1.0 + beta * gamma).max(0.0);
+    c1 + c2 + c3
 }
 
 /// Joint multi-band Villar fit with relative priors between bands.
@@ -3844,14 +3890,28 @@ pub fn fit_parametric_multiband(
         joint_upper[t0_idx] = (peak_time + 10.0).min(joint_upper[t0_idx]);
     }
 
-    // Joint cost function: sum of NLL across all bands + relative priors
+    // Joint cost function: band-balanced NLL + physical constraints + priors
+    // (JAX-calibrated, Sushant/villar-pso)
     let se_idx = model.sigma_extra_idx();
     let pop_prior_ref = population_priors(model);
 
+    // Pre-compute band sizes for band-balanced weighting
+    let band_n_obs: Vec<usize> = band_entries.iter().map(|e| e.1.times.len()).collect();
+    let n_total_obs: usize = band_n_obs.iter().sum();
+
     let joint_cost = |p: &[f64]| -> f64 {
         let ref_params = &p[..n_model_params];
-        let mut total_nll = 0.0;
-        let mut total_n = 0usize;
+
+        // Physical constraint on reference band
+        // Villar params: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+        let ref_constraint = villar_constraint(ref_params[2], ref_params[1], ref_params[4], ref_params[5]);
+        if ref_constraint > 0.0 {
+            return 1e12 + 10_000.0 * ref_constraint;
+        }
+
+        // Band-balanced likelihood: each band contributes equally
+        // NLL_band / n_band * (n_total / n_bands)
+        let mut balanced_nll = 0.0;
 
         // Reference band
         {
@@ -3861,17 +3921,21 @@ pub fn fit_parametric_multiband(
             let sigma_extra_sq = sigma_extra * sigma_extra;
             let mut preds = vec![0.0; n];
             eval_model_batch_into(model, ref_params, &data.times, &mut preds);
+            let mut band_nll = 0.0;
             for i in 0..n {
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    total_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
-                    total_nll += diff * diff / tv + tv.ln();
+                    band_nll += diff * diff / tv + tv.ln();
                 }
             }
-            total_n += n;
+            // Band-balanced: normalize by band size, weight equally
+            if n > 0 {
+                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
+            }
         }
 
         // Non-reference bands
@@ -3884,32 +3948,36 @@ pub fn fit_parametric_multiband(
             // Reconstruct band params from reference + offsets
             let mut band_params = vec![0.0; n_model_params];
             for j in 0..n_model_params {
-                let (_mean, _sigma, is_add) = rel_priors[j];
-                if is_add {
-                    band_params[j] = ref_params[j] + offsets[j];
-                } else {
-                    band_params[j] = ref_params[j] + offsets[j]; // additive in log space = multiplicative in linear
-                }
+                band_params[j] = ref_params[j] + offsets[j];
+            }
+
+            // Physical constraint on this band
+            let band_constraint = villar_constraint(band_params[2], band_params[1], band_params[4], band_params[5]);
+            if band_constraint > 0.0 {
+                return 1e12 + 10_000.0 * band_constraint;
             }
 
             let sigma_extra = band_params[se_idx].exp();
             let sigma_extra_sq = sigma_extra * sigma_extra;
             let mut preds = vec![0.0; n];
             eval_model_batch_into(model, &band_params, &data.times, &mut preds);
+            let mut band_nll = 0.0;
             for i in 0..n {
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    total_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
-                    total_nll += diff * diff / tv + tv.ln();
+                    band_nll += diff * diff / tv + tv.ln();
                 }
             }
-            total_n += n;
+            if n > 0 {
+                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
+            }
         }
 
-        let n_total = total_n.max(1) as f64;
+        let n_total = n_total_obs.max(1) as f64;
 
         // Reference band population prior
         let mut neg_lp = 0.0;
@@ -3931,7 +3999,7 @@ pub fn fit_parametric_multiband(
             }
         }
 
-        (total_nll + neg_lp / n_total) / n_total
+        (balanced_nll + neg_lp) / n_total
     };
 
     // Run PSO on the joint space
@@ -3967,12 +4035,14 @@ pub fn fit_parametric_multiband(
         }
 
         for (i, &seed) in seeds.iter().enumerate() {
+            // JAX-calibrated PSO config (Sushant/villar-pso):
+            // 200 particles, 1500 max iters, 60 stall iters
             let (params, cost) = if i == 1 {
                 pso_minimize_seeded(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    40, 80, 15, seed, &seed_particle)
+                    200, 1500, 60, seed, &seed_particle)
             } else {
                 pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    40, 80, 15, seed)
+                    200, 1500, 60, seed)
             };
             if cost < best_c {
                 best_c = cost;
