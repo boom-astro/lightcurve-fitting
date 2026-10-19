@@ -156,6 +156,8 @@ Fit parametric lightcurve models (Bazin, Villar, TDE, etc.) to all bands.
 | `svi_elbo` | float or null | SVI evidence lower bound (or Laplace log-evidence) |
 | `n_obs` | int | Number of observations in this band |
 | `mag_chi2` | float or null | Chi-squared in magnitude space |
+| `pso_flux_scale` | float | Multiply `eval_model(model, pso_params, ...)` by this to get the fitted flux (1.0 except for MetzgerKN) |
+| `svi_flux_scale` | float | As `pso_flux_scale`, for `svi_mu` |
 | `per_model_chi2` | dict[str, float or null] | Chi-squared for each model attempted |
 | `per_model_params` | dict[str, list[float]] | PSO params for each model (only when `fit_all_models=True`) |
 | `uncertainty_method` | str | Which uncertainty method was used (`"Svi"` or `"Laplace"`) |
@@ -214,6 +216,8 @@ Evaluate a parametric model at the given times.
 - `times` (list[float]): Time values (relative days) at which to evaluate.
 
 **Returns:** `list[float]` -- predicted flux values, one per time point.
+For `"MetzgerKN"`, multiply by the result's `pso_flux_scale` or
+`svi_flux_scale` (matching the params passed) to get the flux the fit used.
 
 ---
 

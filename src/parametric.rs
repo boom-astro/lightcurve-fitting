@@ -828,6 +828,36 @@ fn eval_model_batch(model: SviModel, params: &[f64], times: &[f64]) -> Vec<f64> 
     out
 }
 
+/// MetzgerKN has no amplitude parameter, so its flux is rescaled to peak at 1
+/// over the non-upper-limit points. Scales `preds` in place and returns the
+/// factor (1.0 for every other model, or when the peak is degenerate).
+fn apply_metzger_kn_scale(model: SviModel, preds: &mut [f64], is_upper: &[bool]) -> f64 {
+    if model != SviModel::MetzgerKN {
+        return 1.0;
+    }
+    let max_pred = preds
+        .iter()
+        .zip(is_upper.iter())
+        .filter(|(_, is_up)| !**is_up)
+        .map(|(p, _)| *p)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !(max_pred > 1e-10 && max_pred.is_finite()) {
+        return 1.0;
+    }
+    let scale = (1.0 / max_pred).clamp(0.1, 10.0);
+    for pred in preds.iter_mut() {
+        *pred *= scale;
+    }
+    scale
+}
+
+/// Model predictions at the band's times, with the MetzgerKN rescale applied.
+fn scaled_preds(model: SviModel, params: &[f64], data: &BandFitData) -> (Vec<f64>, f64) {
+    let mut preds = eval_model_batch(model, params, &data.times);
+    let scale = apply_metzger_kn_scale(model, &mut preds, &data.is_upper);
+    (preds, scale)
+}
+
 /// Write model predictions into a pre-allocated buffer (avoids allocation in hot loops).
 fn eval_model_batch_into(model: SviModel, params: &[f64], times: &[f64], out: &mut [f64]) {
     if model.is_sequential() {
@@ -1322,19 +1352,7 @@ impl PsoCost<'_> {
         let sigma_extra_sq = sigma_extra * sigma_extra;
         eval_model_batch_into(self.model, p, self.times, pred_buf);
 
-        if self.model == SviModel::MetzgerKN {
-            let max_pred = pred_buf.iter()
-                .zip(self.is_upper.iter())
-                .filter(|(_, is_up)| !**is_up)
-                .map(|(p, _)| *p)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if max_pred > 1e-10 && max_pred.is_finite() {
-                let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-                for pred in pred_buf[..self.times.len()].iter_mut() {
-                    *pred *= scale;
-                }
-            }
-        }
+        apply_metzger_kn_scale(self.model, &mut pred_buf[..self.times.len()], self.is_upper);
 
         let n = self.times.len().max(1) as f64;
         let mut neg_ll = 0.0;
@@ -2465,22 +2483,7 @@ fn neg_log_posterior(model: SviModel, data: &BandFitData, params: &[f64]) -> f64
     let se_idx = model.sigma_extra_idx();
     let sigma_extra = params[se_idx].exp();
     let sigma_extra_sq = sigma_extra * sigma_extra;
-    let mut preds = eval_model_batch(model, params, &data.times);
-
-    if model == SviModel::MetzgerKN {
-        let max_pred = preds
-            .iter()
-            .zip(data.is_upper.iter())
-            .filter(|(_, is_up)| !**is_up)
-            .map(|(p, _)| *p)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if max_pred > 1e-10 && max_pred.is_finite() {
-            let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-            for pred in preds.iter_mut() {
-                *pred *= scale;
-            }
-        }
-    }
+    let (preds, _) = scaled_preds(model, params, data);
 
     let mut neg_ll = 0.0;
     for i in 0..data.times.len() {
@@ -2900,22 +2903,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
             }
         }
 
-        let mut preds = eval_model_batch(model, &params, &data.times);
-
-        if model == SviModel::MetzgerKN {
-            let max_pred = preds
-                .iter()
-                .zip(data.is_upper.iter())
-                .filter(|(_, is_up)| !**is_up)
-                .map(|(p, _)| *p)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if max_pred > 1e-10 && max_pred.is_finite() {
-                let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-                for pred in preds.iter_mut() {
-                    *pred *= scale;
-                }
-            }
-        }
+        let (preds, _) = scaled_preds(model, &params, data);
 
         let se = params[se_idx].exp();
         let se_sq = se * se;
@@ -3054,6 +3042,10 @@ fn flux_to_mag(flux: f64, zp: f64) -> f64 {
 // Public API
 // ---------------------------------------------------------------------------
 
+fn unit_scale() -> f64 {
+    1.0
+}
+
 /// Result of parametric SVI fitting for a single band.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParametricBandResult {
@@ -3066,6 +3058,13 @@ pub struct ParametricBandResult {
     pub svi_elbo: Option<f64>,
     pub n_obs: usize,
     pub mag_chi2: Option<f64>,
+    /// Factor to multiply `eval_model_flux(model, pso_params, ..)` by to get
+    /// the flux the fit used. 1.0 except for MetzgerKN.
+    #[serde(default = "unit_scale")]
+    pub pso_flux_scale: f64,
+    /// As `pso_flux_scale`, for `svi_mu`.
+    #[serde(default = "unit_scale")]
+    pub svi_flux_scale: f64,
     pub per_model_chi2: HashMap<SviModelName, Option<f64>>,
     /// PSO best-fit parameters for every model attempted (populated when
     /// fit_all_models is true).
@@ -3087,7 +3086,9 @@ pub struct ParametricBandResult {
 /// `svi_mu` from a `ParametricBandResult` directly.
 /// `times` are the time values (relative days) at which to evaluate.
 ///
-/// Returns a Vec of predicted flux values, one per time point.
+/// Returns a Vec of predicted flux values, one per time point. For MetzgerKN,
+/// multiply by the result's `pso_flux_scale` or `svi_flux_scale` (matching the
+/// params passed) to reproduce the flux the fit used.
 pub fn eval_model_flux(model: SviModelName, params: &[f64], times: &[f64]) -> Vec<f64> {
     let m = match model {
         SviModelName::Bazin => SviModel::Bazin,
@@ -3216,14 +3217,11 @@ pub fn finalize_parametric_from_gpu(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -3251,6 +3249,8 @@ pub fn finalize_parametric_from_gpu(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: gpu.per_model_params.clone(),
             uncertainty_method: method,
@@ -3384,14 +3384,11 @@ pub fn finalize_parametric_with_gpu_svi(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -3419,6 +3416,8 @@ pub fn finalize_parametric_with_gpu_svi(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: gpu.per_model_params.clone(),
             uncertainty_method: UncertaintyMethod::Svi,
@@ -3516,14 +3515,11 @@ pub fn finalize_all_models_with_gpu_svi(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -3551,6 +3547,8 @@ pub fn finalize_all_models_with_gpu_svi(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: HashMap::new(), // Not needed — each model has its own entry
             uncertainty_method: UncertaintyMethod::Svi,
@@ -3688,14 +3686,11 @@ pub fn fit_parametric_model(
 
         // Compute reduced chi² in magnitude space using SVI mu.
         // Fall back to PSO params if SVI gives too few positive predictions.
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -3737,6 +3732,8 @@ pub fn fit_parametric_model(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2,
             per_model_params,
             uncertainty_method: method,
@@ -4090,7 +4087,8 @@ pub fn fit_parametric_multiband(
         profile_refine_all(&mut svi_result, data);
 
         // Mag chi2
-        let preds = eval_model_batch(model, &svi_result.mu, &data.times);
+        let (preds, svi_flux_scale) = scaled_preds(model, &svi_result.mu, data);
+        let (_, pso_flux_scale) = scaled_preds(model, &band_params, data);
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4129,6 +4127,8 @@ pub fn fit_parametric_multiband(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2,
             per_model_params: HashMap::new(),
             uncertainty_method: method,
