@@ -2816,21 +2816,27 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
     let n_obs = data.times.len();
     let mut params = result.mu.clone();
     let mut best_t0 = mu_t0;
+    let mut best_params = result.mu.clone();
     let mut best_ll = f64::NEG_INFINITY;
 
     let log_a_idx = 0;
     let has_baseline = matches!(model, SviModel::Bazin | SviModel::Tde);
 
-    for gi in 0..n_grid {
-        let t0 = t0_lo + (t0_hi - t0_lo) * gi as f64 / (n_grid - 1).max(1) as f64;
+    // Score the current t0 first, so a grid point only replaces it if it fits better
+    for gi in 0..=n_grid {
+        let t0 = if gi == 0 {
+            mu_t0
+        } else {
+            t0_lo + (t0_hi - t0_lo) * (gi - 1) as f64 / (n_grid - 1).max(1) as f64
+        };
 
         for j in 0..params.len() {
             params[j] = result.mu[j];
         }
         params[t0_idx] = t0;
 
-        // Analytically re-fit amplitude
-        {
+        // Analytically re-fit amplitude (MetzgerKN has none: its params[0] is log10 M_ej)
+        if model != SviModel::MetzgerKN {
             let saved_log_a = params[log_a_idx];
             params[log_a_idx] = 0.0;
             let saved_b = if has_baseline {
@@ -2934,6 +2940,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         if ll > best_ll {
             best_ll = ll;
             best_t0 = t0;
+            best_params = params.clone();
         }
     }
 
@@ -3003,6 +3010,8 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
 
     let profile_sigma = ((t0_hi_1sig - t0_lo_1sig) / 2.0).max(0.1);
 
+    // Keep the amplitude (and baseline) re-fitted at best_t0, not just t0
+    result.mu = best_params;
     result.mu[t0_idx] = best_t0;
     result.log_sigma[t0_idx] = profile_sigma.ln();
 }
