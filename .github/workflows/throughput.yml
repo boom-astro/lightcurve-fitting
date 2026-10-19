@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  schedule:
+    # Refresh the main-branch baseline before its artifact expires.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +36,7 @@ jobs:
         with:
           name: throughput-logs
           path: wall_time.txt
+          retention-days: 90
 
       - name: Download baseline benchmark (PR only)
         if: github.event_name == 'pull_request'
@@ -66,8 +71,19 @@ jobs:
           echo "baseline=$baseline" >> $GITHUB_OUTPUT
           echo "current=$current" >> $GITHUB_OUTPUT
 
-      - name: Post comment on PR (if applicable)
+      - name: Write job summary (PR only)
         if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "Throughput results (\`${{ github.sha }}\`):"
+            echo "| New wall time | Baseline wall time | Difference |"
+            echo "| -------------- | ------------------ | ---------- |"
+            echo "| ${{ steps.compare-with-baseline.outputs.current }} | ${{ steps.compare-with-baseline.outputs.baseline }} | ${{ steps.compare-with-baseline.outputs.percentage_diff }}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Fork PRs get a read-only token, so they only get the job summary.
+      - name: Post comment on PR (if applicable)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: peter-evans/create-or-update-comment@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
