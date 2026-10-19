@@ -375,20 +375,30 @@ inline bool lc_eval_model_grad(int model_id, const thread float* p, float t, thr
 #define LC_SECS_DAY  86400.0f
 #define LC_SCALE     1e30f
 
-inline float lc_metzger_kn_at_single(const thread float* p, float obs_time) {
+#define LC_KN_NGRID 100
+
+// MetzgerKN luminosity on a log time grid out to 1.05x the source's largest
+// phase, normalized to its peak. All points of a source share one grid, as in
+// metzger_kn_eval_batch on the CPU.
+struct LcKnGrid {
+    float l[LC_KN_NGRID];
+    float log_t_min;
+    float log_t_max;
+    bool ok;
+};
+
+inline void lc_metzger_kn_grid(const thread float* p, float phase_max, thread LcKnGrid* g) {
+    g->ok = false;
+    if (phase_max <= 0.01f) return;
+
     float m_ej    = pow(10.0f, p[0]) * LC_MSUN_CGS;
     float v_ej    = pow(10.0f, p[1]) * LC_C_CGS_VAL;
     float kappa_r = pow(10.0f, p[2]);
-    float t0      = p[3];
-    float phase   = obs_time - t0;
 
-    if (phase <= 0.0f) return 0.0f;
-
-    float phase_max = phase * 1.05f;
-    if (phase_max < 0.02f) phase_max = 0.02f;
-    float log_t_min = log(0.01f);
-    float log_t_max = log(phase_max);
-    int ngrid = 100;
+    g->log_t_min = log(0.01f);
+    g->log_t_max = log(phase_max * 1.05f);
+    float log_t_min = g->log_t_min;
+    float log_t_max = g->log_t_max;
 
     float ye = 0.1f;
     float xn0 = 1.0f - 2.0f * ye;
@@ -396,17 +406,11 @@ inline float lc_metzger_kn_at_single(const thread float* p, float obs_time) {
     float e_th = e0 / LC_SCALE;
     float e_kin = e0 / LC_SCALE;
     float v = v_ej;
-
-    float grid_t_0 = exp(log_t_min);
-    float r = grid_t_0 * LC_SECS_DAY * v;
-
+    float r = exp(log_t_min) * LC_SECS_DAY * v;
     float l_peak = 0.0f;
-    float l_at_phase = 0.0f;
-    float prev_t = grid_t_0;
-    float prev_lrad = 0.0f;
 
-    for (int i = 0; i < ngrid; i++) {
-        float t_day = exp(log_t_min + (log_t_max - log_t_min) * float(i) / float(ngrid - 1));
+    for (int i = 0; i < LC_KN_NGRID; i++) {
+        float t_day = exp(log_t_min + (log_t_max - log_t_min) * (float)i / (float)(LC_KN_NGRID - 1));
         float t_sec = t_day * LC_SECS_DAY;
 
         float eth_factor = 0.34f * pow(t_day, 0.74f);
@@ -426,21 +430,12 @@ inline float lc_metzger_kn_at_single(const thread float* p, float obs_time) {
         float t_diff = 3.0f * kappa_eff * m_ej / (4.0f * M_PI_F * LC_C_CGS_VAL * v * t_sec) + r / LC_C_CGS_VAL;
 
         float l_rad = (e_th > 0.0f && t_diff > 0.0f) ? e_th / t_diff : 0.0f;
+        g->l[i] = l_rad;
         if (l_rad > l_peak) l_peak = l_rad;
 
-        if (i > 0 && phase >= prev_t && phase <= t_day) {
-            float frac = (phase - prev_t) / (t_day - prev_t);
-            l_at_phase = prev_lrad + frac * (l_rad - prev_lrad);
-        }
-        if (i == ngrid - 1 && phase >= t_day) l_at_phase = l_rad;
-        if (i == 0 && phase <= t_day) l_at_phase = l_rad;
-
-        prev_t = t_day;
-        prev_lrad = l_rad;
-
         float l_pdv = (r > 0.0f) ? e_th * v / r : 0.0f;
-        if (i < ngrid - 1) {
-            float t_next = exp(log_t_min + (log_t_max - log_t_min) * float(i + 1) / float(ngrid - 1));
+        if (i < LC_KN_NGRID - 1) {
+            float t_next = exp(log_t_min + (log_t_max - log_t_min) * (float)(i + 1) / (float)(LC_KN_NGRID - 1));
             float dt_sec = (t_next - t_day) * LC_SECS_DAY;
             e_th += (l_heat - l_pdv - l_rad) * dt_sec;
             if (e_th < 0.0f) e_th = 0.0f;
@@ -451,8 +446,32 @@ inline float lc_metzger_kn_at_single(const thread float* p, float obs_time) {
         }
     }
 
-    if (l_peak <= 0.0f || !isfinite(l_peak)) return 0.0f;
-    return l_at_phase / l_peak;
+    if (l_peak <= 0.0f || !isfinite(l_peak)) return;
+    for (int i = 0; i < LC_KN_NGRID; i++) g->l[i] /= l_peak;
+    g->ok = true;
+}
+
+// Linear interpolation of a lc_metzger_kn_grid result at one phase.
+inline float lc_metzger_kn_interp(const thread LcKnGrid* g, float phase) {
+    if (!g->ok || phase <= 0.0f) return 0.0f;
+    float dlog = (g->log_t_max - g->log_t_min) / (float)(LC_KN_NGRID - 1);
+    float u = (log(phase) - g->log_t_min) / dlog;
+    if (u <= 0.0f) return g->l[0];
+    if (u >= (float)(LC_KN_NGRID - 1)) return g->l[LC_KN_NGRID - 1];
+    int i = (int)u;
+    if (i > LC_KN_NGRID - 2) i = LC_KN_NGRID - 2;
+    float t_i = exp(g->log_t_min + dlog * (float)i);
+    float t_j = exp(g->log_t_min + dlog * (float)(i + 1));
+    float frac = (phase - t_i) / (t_j - t_i);
+    return g->l[i] + frac * (g->l[i + 1] - g->l[i]);
+}
+
+// MetzgerKN has no amplitude parameter, so predictions are rescaled to peak
+// at 1 over the detections, as apply_metzger_kn_scale does on the CPU.
+inline float lc_metzger_kn_scale(float max_pred) {
+    if (!(max_pred > 1e-10f && isfinite(max_pred))) return 1.0f;
+    float s = 1.0f / max_pred;
+    return s < 0.1f ? 0.1f : (s > 10.0f ? 10.0f : s);
 }
 
 // Unified model dispatch
@@ -465,7 +484,7 @@ inline float lc_eval_model_at(int model_id, const thread float* p, float t) {
         case 4: return lc_magnetar_at(p, t);
         case 5: return lc_shock_cooling_at(p, t);
         case 6: return lc_afterglow_at(p, t);
-        case 7: return lc_metzger_kn_at_single(p, t);
+        // MetzgerKN (7) needs every time in the source: use lc_metzger_kn_grid.
         default: return 0.0f;
     }
 }

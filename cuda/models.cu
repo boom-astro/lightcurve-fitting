@@ -7,6 +7,7 @@
 //      source's observations.
 
 #include <math.h>
+#include "models_device.h"
 
 // ===========================================================================
 // Device helpers
@@ -422,97 +423,6 @@ DEFINE_EVAL_KERNEL(afterglow_eval,      afterglow_at)
 //   positions: [n_sources × n_particles × n_params], row-major.
 //   costs (output): [n_sources × n_particles].
 
-// Device function: solve MetzgerKN ODE and evaluate at a single time.
-// This is used by batch_pso_cost for model_id=7.
-// It solves the full ODE each time (inefficient but correct for PSO where
-// each particle has different params).
-__device__ double metzger_kn_at_single(const double* p, double obs_time) {
-    double m_ej   = pow(10.0, p[0]) * MSUN_CGS;
-    double v_ej   = pow(10.0, p[1]) * C_CGS_VAL;
-    double kappa_r = pow(10.0, p[2]);
-    double t0     = p[3];
-    double phase  = obs_time - t0;
-
-    if (phase <= 0.0) return 0.0;
-
-    // Build grid up to this phase
-    double phase_max = phase * 1.05;
-    if (phase_max < 0.02) phase_max = 0.02;
-    double log_t_min = log(0.01);
-    double log_t_max = log(phase_max);
-    int ngrid = 100; // Reduced grid for PSO (speed vs accuracy tradeoff)
-
-    double ye = 0.1;
-    double xn0 = 1.0 - 2.0 * ye;
-    double scale = 1e40;
-    double e0 = 0.5 * m_ej * v_ej * v_ej;
-    double e_th = e0 / scale;
-    double e_kin = e0 / scale;
-    double v = v_ej;
-
-    double grid_t_0 = exp(log_t_min);
-    double r = grid_t_0 * SECS_DAY * v;
-
-    double l_peak = 0.0;
-    double l_at_phase = 0.0;
-    double prev_t = grid_t_0;
-    double prev_lrad = 0.0;
-
-    for (int i = 0; i < ngrid; i++) {
-        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(ngrid - 1));
-        double t_sec = t_day * SECS_DAY;
-
-        double eth_factor = 0.34 * pow(t_day, 0.74);
-        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
-        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
-
-        double xn = xn0 * exp(-t_sec / 900.0);
-        double eps_neutron = 3.2e14 * xn;
-        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
-        if (time_term < 1e-30) time_term = 1e-30;
-        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
-        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
-
-        double xr = 1.0 - xn0;
-        double xn_decayed = xn0 - xn;
-        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
-        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
-
-        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
-        if (l_rad > l_peak) l_peak = l_rad;
-
-        // Interpolate if phase falls in this interval
-        if (i > 0 && phase >= prev_t && phase <= t_day) {
-            double frac = (phase - prev_t) / (t_day - prev_t);
-            l_at_phase = prev_lrad + frac * (l_rad - prev_lrad);
-        }
-        if (i == ngrid - 1 && phase >= t_day) {
-            l_at_phase = l_rad;
-        }
-        if (i == 0 && phase <= t_day) {
-            l_at_phase = l_rad;
-        }
-
-        prev_t = t_day;
-        prev_lrad = l_rad;
-
-        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
-        if (i < ngrid - 1) {
-            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(ngrid - 1));
-            double dt_sec = (t_next - t_day) * SECS_DAY;
-            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
-            if (e_th < 0.0) e_th = 0.0;
-            e_kin += l_pdv * dt_sec;
-            v = sqrt(2.0 * e_kin * scale / m_ej);
-            if (v > C_CGS_VAL) v = C_CGS_VAL;
-            r += v * dt_sec;
-        }
-    }
-
-    if (l_peak <= 0.0 || !isfinite(l_peak)) return 0.0;
-    return l_at_phase / l_peak;
-}
-
 extern "C" __global__ void batch_pso_cost(
     const double* __restrict__ all_times,
     const double* __restrict__ all_flux,
@@ -546,11 +456,19 @@ extern "C" __global__ void batch_pso_cost(
     double neg_ll = 0.0;
 
     if (model_id == 7) {
-        // MetzgerKN: solve ODE once, evaluate at all observation times
-        // For PSO cost, we solve per-observation (less efficient but avoids
-        // large stack allocation). Each observation gets its own ODE solve.
+        double t_max = all_times[obs_start];
+        for (int i = obs_start + 1; i < obs_end; i++) t_max = fmax(t_max, all_times[i]);
+        LcKnGrid kn;
+        lc_metzger_kn_grid(p, t_max - p[3], &kn);
+        double max_pred = -INFINITY;
         for (int i = obs_start; i < obs_end; i++) {
-            double pred = metzger_kn_at_single(p, all_times[i]);
+            if (!all_is_upper[i])
+                max_pred = fmax(max_pred, lc_metzger_kn_interp(&kn, all_times[i] - p[3]));
+        }
+        double kn_scale = lc_metzger_kn_scale(max_pred);
+
+        for (int i = obs_start; i < obs_end; i++) {
+            double pred = kn_scale * lc_metzger_kn_interp(&kn, all_times[i] - p[3]);
             if (!isfinite(pred)) { costs[idx] = 1e99; return; }
 
             double total_var = all_obs_var[i] + sigma_extra_sq;

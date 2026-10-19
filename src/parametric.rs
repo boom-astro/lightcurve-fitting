@@ -2713,7 +2713,7 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
     let obs_var = &data.obs_var;
 
     // Compute log-likelihood at MAP
-    let map_preds = eval_model_batch(model, &result.mu, &data.times);
+    let (map_preds, _) = scaled_preds(model, &result.mu, data);
     let se = result.mu[se_idx].exp();
     let se_sq = se * se;
     let mut map_ll = 0.0;
@@ -2753,7 +2753,7 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
             let mut p = result.mu.clone();
             p[j] = val;
 
-            let preds = eval_model_batch(model, &p, &data.times);
+            let (preds, _) = scaled_preds(model, &p, data);
             let se_p = p[se_idx].exp();
             let se_sq_p = se_p * se_p;
             let mut ll = 0.0;
@@ -2946,7 +2946,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         let mut p = result.mu.clone();
         p[t0_idx] = t0;
         // Quick re-eval at this t0 (without re-fitting amplitude for speed)
-        let preds_at = eval_model_batch(model, &p, &data.times);
+        let (preds_at, _) = scaled_preds(model, &p, data);
         let se = p[se_idx].exp();
         let se_sq = se * se;
         let mut ll_at = 0.0;
@@ -2975,7 +2975,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         }
         let mut p = result.mu.clone();
         p[t0_idx] = t0;
-        let preds_at = eval_model_batch(model, &p, &data.times);
+        let (preds_at, _) = scaled_preds(model, &p, data);
         let se = p[se_idx].exp();
         let se_sq = se * se;
         let mut ll_at = 0.0;

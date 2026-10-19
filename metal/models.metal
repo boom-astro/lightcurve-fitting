@@ -402,8 +402,24 @@ kernel void batch_pso_cost(
 
     float neg_ll = 0.0f;
 
+    LcKnGrid kn;
+    float kn_scale = 1.0f;
+    if (model_id == 7) {
+        float t_max = all_times[obs_start];
+        for (int i = obs_start + 1; i < obs_end; i++) t_max = max(t_max, all_times[i]);
+        lc_metzger_kn_grid(local_p, t_max - local_p[3], &kn);
+        float max_pred = -INFINITY;
+        for (int i = obs_start; i < obs_end; i++) {
+            if (!all_is_upper[i])
+                max_pred = max(max_pred, lc_metzger_kn_interp(&kn, all_times[i] - local_p[3]));
+        }
+        kn_scale = lc_metzger_kn_scale(max_pred);
+    }
+
     for (int i = obs_start; i < obs_end; i++) {
-        float pred = lc_eval_model_at(model_id, local_p, all_times[i]);
+        float pred = (model_id == 7)
+            ? kn_scale * lc_metzger_kn_interp(&kn, all_times[i] - local_p[3])
+            : lc_eval_model_at(model_id, local_p, all_times[i]);
         if (!isfinite(pred)) { costs[idx] = 1e30f; return; }
 
         float total_var = all_obs_var[i] + sigma_extra_sq;
