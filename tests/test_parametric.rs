@@ -252,3 +252,68 @@ fn metzger_kn_flux_scale_normalizes_detections() {
     }
     assert!(n_checked > 0, "no fit landed inside the clamp range");
 }
+
+#[test]
+fn gpu_finalize_pairs_results_by_band_name() {
+    use lightcurve_fitting::{
+        finalize_parametric_from_gpu, finalize_parametric_with_gpu_svi, fit_parametric_model, GpuPsoBandResult,
+    };
+    use std::collections::HashMap;
+
+    // All bands have the same number of points, so ordering by size is ambiguous.
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1200);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let cpu = fit_parametric_model(&flux_bands, false, UncertaintyMethod::Laplace, Some(SviModelName::Bazin));
+    assert!(cpu.len() >= 2);
+
+    let mut band_names = Vec::new();
+    let mut gpu_results = Vec::new();
+    let mut svi_outputs = Vec::new();
+    for r in cpu.iter().rev() {
+        band_names.push(r.band.clone());
+        gpu_results.push(GpuPsoBandResult {
+            model: r.model,
+            pso_params: r.pso_params.clone(),
+            pso_cost: 0.0,
+            per_model_chi2: HashMap::new(),
+            per_model_params: HashMap::new(),
+            multi_bazin: None,
+        });
+        svi_outputs.push((r.svi_mu.clone(), r.svi_log_sigma.clone(), 0.0));
+    }
+
+    let with_svi = finalize_parametric_with_gpu_svi(&flux_bands, &gpu_results, &svi_outputs, &band_names);
+    let from_gpu = finalize_parametric_from_gpu(&flux_bands, &gpu_results, &band_names, UncertaintyMethod::Laplace);
+    for results in [&with_svi, &from_gpu] {
+        assert_eq!(results.len(), cpu.len());
+        for r in results {
+            let expected = cpu.iter().find(|c| c.band == r.band).unwrap();
+            assert_eq!(r.pso_params, expected.pso_params, "band {} got another band's params", r.band);
+            // mag_chi2 is computed from the band's data, so it also catches a band
+            // paired with the wrong data.
+            let (got, want) = (r.mag_chi2.unwrap(), expected.mag_chi2.unwrap());
+            assert!((got - want).abs() <= 1e-9 * want.abs().max(1.0), "band {} mag_chi2 {} vs {}", r.band, got, want);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "band_names must be parallel to gpu_results")]
+fn gpu_finalize_rejects_mismatched_band_names() {
+    use lightcurve_fitting::{finalize_parametric_with_gpu_svi, GpuPsoBandResult};
+    use std::collections::HashMap;
+
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1200);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let gpu = GpuPsoBandResult {
+        model: SviModelName::Bazin,
+        pso_params: vec![0.0; 6],
+        pso_cost: 0.0,
+        per_model_chi2: HashMap::new(),
+        per_model_params: HashMap::new(),
+        multi_bazin: None,
+    };
+    let svi = (vec![0.0; 6], vec![0.0; 6], 0.0);
+    // Two results, one name.
+    finalize_parametric_with_gpu_svi(&flux_bands, &[gpu.clone(), gpu], &[svi.clone(), svi], &["g".to_string()]);
+}

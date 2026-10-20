@@ -1132,12 +1132,12 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         };
 
         // First run: standard PSO
-        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42);
+        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42, None);
 
         // If we have a seed, run a second PSO restart with the seed injected
         if let Some(ref seed) = init {
-            let (params2, cost2) = pso_minimize_seeded(
-                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, seed,
+            let (params2, cost2) = pso_minimize(
+                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, Some(seed),
             );
             if cost2 < cost1 {
                 params1 = params2;
@@ -1146,7 +1146,7 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         }
 
         // Third restart
-        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271);
+        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271, None);
         if cost3 < cost1 {
             params1 = params3;
             cost1 = cost3;
@@ -1184,115 +1184,6 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
         per_k_cost,
         per_k_bic,
     }
-}
-
-/// PSO variant that injects a seed particle into the initial swarm.
-fn pso_minimize_seeded(
-    mut cost_fn: impl FnMut(&[f64]) -> f64,
-    lower: &[f64],
-    upper: &[f64],
-    n_particles: usize,
-    max_iters: usize,
-    stall_iters: usize,
-    seed_rng: u64,
-    seed_particle: &[f64],
-) -> (Vec<f64>, f64) {
-    let dim = lower.len();
-    let mut rng = SmallRng::seed_from_u64(seed_rng);
-
-    let w_max = 0.9;
-    let w_min = 0.4;
-    let c1 = 1.5;
-    let c2 = 1.5;
-
-    let v_max: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
-
-    let total = n_particles * dim;
-    let mut positions = vec![0.0; total];
-    let mut velocities = vec![0.0; total];
-    let mut pbest_pos = vec![0.0; total];
-    let mut pbest_cost = vec![f64::INFINITY; n_particles];
-
-    let mut gbest_pos = vec![0.0; dim];
-    let mut gbest_cost = f64::INFINITY;
-
-    for p in 0..n_particles {
-        let base = p * dim;
-        if p == 0 {
-            // First particle is the seed
-            positions[base..base + dim].copy_from_slice(seed_particle);
-        } else {
-            for d in 0..dim {
-                positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-            }
-        }
-        for d in 0..dim {
-            velocities[base + d] =
-                v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
-        }
-        let cost = cost_fn(&positions[base..base + dim]);
-        pbest_cost[p] = cost;
-        pbest_pos[base..base + dim].copy_from_slice(&positions[base..base + dim]);
-        if cost < gbest_cost {
-            gbest_cost = cost;
-            gbest_pos.copy_from_slice(&positions[base..base + dim]);
-        }
-    }
-
-    let mut iters_without_improvement = 0usize;
-    let mut prev_gbest = gbest_cost;
-    let inv_max_iters = 1.0 / max_iters as f64;
-
-    for iter in 0..max_iters {
-        let w = w_max - (w_max - w_min) * (iter as f64) * inv_max_iters;
-
-        for p in 0..n_particles {
-            let base = p * dim;
-            for d in 0..dim {
-                let r1: f64 = rng.random();
-                let r2: f64 = rng.random();
-                let mut v = w * velocities[base + d]
-                    + c1 * r1 * (pbest_pos[base + d] - positions[base + d])
-                    + c2 * r2 * (gbest_pos[d] - positions[base + d]);
-
-                v = v.clamp(-v_max[d], v_max[d]);
-
-                let new_pos = positions[base + d] + v;
-                if new_pos <= lower[d] {
-                    positions[base + d] = lower[d];
-                    velocities[base + d] = 0.0;
-                } else if new_pos >= upper[d] {
-                    positions[base + d] = upper[d];
-                    velocities[base + d] = 0.0;
-                } else {
-                    positions[base + d] = new_pos;
-                    velocities[base + d] = v;
-                }
-            }
-            let cost = cost_fn(&positions[base..base + dim]);
-            if cost < pbest_cost[p] {
-                pbest_cost[p] = cost;
-                pbest_pos[base..base + dim]
-                    .copy_from_slice(&positions[base..base + dim]);
-                if cost < gbest_cost {
-                    gbest_cost = cost;
-                    gbest_pos.copy_from_slice(&positions[base..base + dim]);
-                }
-            }
-        }
-        let improved = prev_gbest - gbest_cost > 0.01 * prev_gbest.abs().max(1e-10);
-        if improved {
-            iters_without_improvement = 0;
-            prev_gbest = gbest_cost;
-        } else {
-            iters_without_improvement += 1;
-            if iters_without_improvement >= stall_iters {
-                break;
-            }
-        }
-    }
-
-    (gbest_pos, gbest_cost)
 }
 
 /// Result of MultiBazin greedy fit for a single band.
@@ -1660,7 +1551,8 @@ fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
 /// - Linear inertia decay (w_max → w_min) for exploration→exploitation;
 /// - Velocity clamping to V_max = fraction of domain width per dimension;
 /// - Wall absorption: velocity zeroed on dimensions that hit bounds;
-/// - Stall-based early stopping (relative improvement threshold).
+/// - Stall-based early stopping (relative improvement threshold);
+/// - Optional seed particle placed at index 0.
 fn pso_minimize(
     mut cost_fn: impl FnMut(&[f64]) -> f64,
     lower: &[f64],
@@ -1669,6 +1561,7 @@ fn pso_minimize(
     max_iters: usize,
     stall_iters: usize,
     seed: u64,
+    seed_particle: Option<&[f64]>,
 ) -> (Vec<f64>, f64) {
     let dim = lower.len();
     let mut rng = SmallRng::seed_from_u64(seed);
@@ -1692,13 +1585,31 @@ fn pso_minimize(
     let mut gbest_pos = vec![0.0; dim];
     let mut gbest_cost = f64::INFINITY;
 
-    // Initialise particles uniformly in bounds
+    // Initialise particles uniformly in bounds. The two arms draw from the RNG
+    // in different orders; each is kept so fits stay reproducible.
     for p in 0..n_particles {
         let base = p * dim;
-        for d in 0..dim {
-            positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-            velocities[base + d] =
-                v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
+        match seed_particle {
+            Some(sp) => {
+                if p == 0 {
+                    positions[base..base + dim].copy_from_slice(sp);
+                } else {
+                    for d in 0..dim {
+                        positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                    }
+                }
+                for d in 0..dim {
+                    velocities[base + d] =
+                        v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
+                }
+            }
+            None => {
+                for d in 0..dim {
+                    positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                    velocities[base + d] =
+                        v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
+                }
+            }
         }
         let cost = cost_fn(&positions[base..base + dim]);
         pbest_cost[p] = cost;
@@ -1825,7 +1736,7 @@ fn profile_t0_search(
             problem.cost_from_slice(&full, &mut pred_buf)
         };
         let (best_reduced, cost) = pso_minimize(
-            cost_fn, &lower, &upper, 30, 60, 12, 42,
+            cost_fn, &lower, &upper, 30, 60, 12, 42, None,
         );
         let mut full = Vec::with_capacity(best_reduced.len() + 1);
         for (i, &val) in best_reduced.iter().enumerate() {
@@ -1985,25 +1896,14 @@ fn pso_fit_single_model(data: &BandFitData, model: SviModel) -> (SviModel, Vec<f
         let mut pred_buf = vec![0.0; data.times.len()];
         let cost_fn = |p: &[f64]| problem.cost_from_slice(p, &mut pred_buf);
 
-        let (params, chi2) = match i {
-            1 => {
-                // Second restart: seed at peak
-                if let Some(ref sp) = seed_at_peak {
-                    pso_minimize_seeded(cost_fn, &lower, &upper, 30, 60, 12, seed, sp)
-                } else {
-                    pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed)
-                }
-            }
-            2 => {
-                // Third restart: seed with early t0
-                if let Some(ref sp) = seed_early_t0 {
-                    pso_minimize_seeded(cost_fn, &lower, &upper, 30, 60, 12, seed, sp)
-                } else {
-                    pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed)
-                }
-            }
-            _ => pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed),
+        // Restart 1 is seeded at the peak, restart 2 with an early t0.
+        let seed_particle = match i {
+            1 => seed_at_peak.as_deref(),
+            2 => seed_early_t0.as_deref(),
+            _ => None,
         };
+        let (params, chi2) =
+            pso_minimize(cost_fn, &lower, &upper, 30, 60, 12, seed, seed_particle);
 
         if i == 0 { first_chi2 = chi2; }
         if chi2 < best_chi2 {
@@ -2615,6 +2515,21 @@ fn log_sigma_from_hessian(hessian: &[f64], n: usize) -> Vec<f64> {
     diag_inv.iter().map(|&d| 0.5 * d.max(1e-30).ln()).collect()
 }
 
+/// Zero the Hessian row and column of each flagged parameter. A parameter whose
+/// own curvature is non-finite then gets the wide fallback sigma from
+/// `log_sigma_from_hessian`, without inflating the sigmas of the parameters it
+/// was coupled to.
+fn decouple_params(hessian: &mut [f64], n: usize, flagged: &[bool]) {
+    for (i, &f) in flagged.iter().enumerate() {
+        if f {
+            for k in 0..n {
+                hessian[i * n + k] = 0.0;
+                hessian[k * n + i] = 0.0;
+            }
+        }
+    }
+}
+
 /// Laplace approximation: compute Hessian of neg-log-posterior at MAP
 /// estimate via central finite differences, then invert for uncertainties.
 ///
@@ -2634,6 +2549,7 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
 
     // Central finite-difference Hessian over shape params only
     let mut hessian = vec![0.0; n_shape * n_shape];
+    let mut no_curvature = vec![false; n_shape];
     let mut params_pp = map_params.to_vec();
     let mut params_pm = map_params.to_vec();
     let mut params_mp = map_params.to_vec();
@@ -2666,10 +2582,15 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let fmm = neg_log_posterior(model, data, &params_mm);
 
             let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if si == sj && !h_ij.is_finite() {
+                no_curvature[si] = true;
+            }
+            let h_ij = if h_ij.is_finite() { h_ij } else { 0.0 };
             hessian[si * n_shape + sj] = h_ij;
             hessian[sj * n_shape + si] = h_ij;
         }
     }
+    decouple_params(&mut hessian, n_shape, &no_curvature);
 
     let shape_log_sigma = log_sigma_from_hessian(&hessian, n_shape);
 
@@ -3129,15 +3050,17 @@ pub struct GpuPsoBandResult {
 /// computes mag-space chi2, and assembles the final ParametricBandResult.
 ///
 /// `flux_bands`: maps band_name → BandData in flux space.
-/// `gpu_results`: per-band GPU PSO results, indexed by band sort order
-///   (most-populated band first). Must match the band ordering that would
-///   be produced by sorting bands by descending observation count.
+/// `gpu_results`: per-band GPU PSO results.
+/// `band_names`: the band each entry of `gpu_results` belongs to. The first
+///   entry's `multi_bazin` is kept.
 /// `method`: uncertainty estimation method.
 pub fn finalize_parametric_from_gpu(
     flux_bands: &HashMap<String, BandData>,
     gpu_results: &[GpuPsoBandResult],
+    band_names: &[String],
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() {
         return Vec::new();
     }
@@ -3192,13 +3115,12 @@ pub fn finalize_parametric_from_gpu(
         band_entries.push((band_name.clone(), fit_data, mags_obs));
     }
 
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
-
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
-        if band_idx >= gpu_results.len() { break; }
-        let gpu = &gpu_results[band_idx];
+    for (band_idx, (gpu, band_name)) in gpu_results.iter().zip(band_names).enumerate() {
+        let Some((_, data, mags_obs)) = band_entries.iter().find(|e| &e.0 == band_name) else {
+            continue;
+        };
 
         if gpu.pso_params.is_empty() { continue; }
 
@@ -3303,12 +3225,14 @@ pub fn svi_model_meta(model_name: &SviModelName) -> (usize, usize, usize) {
 /// Like `finalize_parametric_from_gpu` but skips CPU SVI — uses pre-computed
 /// mu/log_sigma/elbo from GPU SVI kernel.
 ///
-/// `svi_outputs` must be parallel to `gpu_results` (same length and ordering).
+/// `svi_outputs` and `band_names` are parallel to `gpu_results`.
 pub fn finalize_parametric_with_gpu_svi(
     flux_bands: &HashMap<String, BandData>,
     gpu_results: &[GpuPsoBandResult],
     svi_outputs: &[(Vec<f64>, Vec<f64>, f64)], // (mu, log_sigma, elbo) per band
+    band_names: &[String],
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
         return Vec::new();
     }
@@ -3360,13 +3284,13 @@ pub fn finalize_parametric_with_gpu_svi(
         band_entries.push((band_name.clone(), fit_data, mags_obs));
     }
 
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
-
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
-        if band_idx >= gpu_results.len() || band_idx >= svi_outputs.len() { break; }
-        let gpu = &gpu_results[band_idx];
+    for (band_idx, (gpu, band_name)) in gpu_results.iter().zip(band_names).enumerate() {
+        if band_idx >= svi_outputs.len() { break; }
+        let Some((_, data, mags_obs)) = band_entries.iter().find(|e| &e.0 == band_name) else {
+            continue;
+        };
         let (ref svi_mu, ref svi_log_sigma, svi_elbo) = svi_outputs[band_idx];
 
         if gpu.pso_params.is_empty() { continue; }
@@ -4043,13 +3967,8 @@ pub fn fit_parametric_multiband(
         for (i, &seed) in seeds.iter().enumerate() {
             // JAX-calibrated PSO config (Sushant/villar-pso):
             // 200 particles, 1500 max iters, 60 stall iters
-            let (params, cost) = if i == 1 {
-                pso_minimize_seeded(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    200, 1500, 60, seed, &seed_particle)
-            } else {
-                pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
-                    200, 1500, 60, seed)
-            };
+            let (params, cost) = pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
+                200, 1500, 60, seed, (i == 1).then_some(seed_particle.as_slice()));
             if cost < best_c {
                 best_c = cost;
                 best = params;
@@ -4137,4 +4056,24 @@ pub fn fit_parametric_multiband(
     }
 
     results
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoupled_param_keeps_others_sigma() {
+        // Parameter 0's curvature was non-finite (zeroed); parameter 1 is well
+        // measured (H = 9 -> sigma = 1/3) and coupled to it.
+        let mut hessian = vec![0.0, 1.0, 1.0, 9.0];
+        decouple_params(&mut hessian, 2, &[true, false]);
+        let sigma: Vec<f64> = log_sigma_from_hessian(&hessian, 2).iter().map(|l| l.exp()).collect();
+        assert!(sigma[0] > 100.0, "unmeasured parameter should get the wide fallback, got {}", sigma[0]);
+        assert!((sigma[1] - 1.0 / 3.0).abs() < 1e-9, "coupled parameter's sigma changed: {}", sigma[1]);
+    }
 }
