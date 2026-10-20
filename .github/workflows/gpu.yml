@@ -20,12 +20,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # No GPU on hosted runners, so this only checks that the kernels and
-      # their Rust bindings compile and link.
+      # No GPU on hosted runners, so this only checks that the kernels, their
+      # Rust bindings and the extract-features binary compile and link.
       - name: Build with CUDA kernels
         env:
           RUSTFLAGS: -L /usr/local/cuda/lib64
-        run: cargo build --release --features cuda --tests
+        run: cargo build --release --features cuda,cli --bins --tests
 
   metal:
     name: Metal
