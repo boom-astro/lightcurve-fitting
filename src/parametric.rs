@@ -3636,7 +3636,8 @@ pub fn fit_parametric_model(
         band_entries.push((band_name.clone(), fit_data, mags_obs));
     }
 
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+    // Most-populated band first; ties go by name so the order is the same every run.
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()).then_with(|| a.0.cmp(&b.0)));
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
@@ -3855,7 +3856,8 @@ pub fn fit_parametric_multiband(
             obs_var, is_upper, upper_flux, noise_frac_median, peak_flux_obs: peak_flux,
         }, mags_obs));
     }
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+    // Most-populated band first; ties go by name so the order is the same every run.
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()).then_with(|| a.0.cmp(&b.0)));
 
     if band_entries.is_empty() {
         return Vec::new();
