@@ -375,7 +375,7 @@ inline bool lc_eval_model_grad(int model_id, const thread float* p, float t, thr
 #define LC_SECS_DAY  86400.0f
 #define LC_SCALE     1e30f
 
-#define LC_KN_NGRID 100
+#define LC_KN_NGRID 200
 
 // MetzgerKN luminosity on a log time grid out to 1.05x the source's largest
 // phase, normalized to its peak. All points of a source share one grid, as in
