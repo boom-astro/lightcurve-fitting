@@ -2515,6 +2515,21 @@ fn log_sigma_from_hessian(hessian: &[f64], n: usize) -> Vec<f64> {
     diag_inv.iter().map(|&d| 0.5 * d.max(1e-30).ln()).collect()
 }
 
+/// Zero the Hessian row and column of each flagged parameter. A parameter whose
+/// own curvature is non-finite then gets the wide fallback sigma from
+/// `log_sigma_from_hessian`, without inflating the sigmas of the parameters it
+/// was coupled to.
+fn decouple_params(hessian: &mut [f64], n: usize, flagged: &[bool]) {
+    for (i, &f) in flagged.iter().enumerate() {
+        if f {
+            for k in 0..n {
+                hessian[i * n + k] = 0.0;
+                hessian[k * n + i] = 0.0;
+            }
+        }
+    }
+}
+
 /// Laplace approximation: compute Hessian of neg-log-posterior at MAP
 /// estimate via central finite differences, then invert for uncertainties.
 ///
@@ -2534,6 +2549,7 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
 
     // Central finite-difference Hessian over shape params only
     let mut hessian = vec![0.0; n_shape * n_shape];
+    let mut no_curvature = vec![false; n_shape];
     let mut params_pp = map_params.to_vec();
     let mut params_pm = map_params.to_vec();
     let mut params_mp = map_params.to_vec();
@@ -2566,11 +2582,15 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let fmm = neg_log_posterior(model, data, &params_mm);
 
             let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if si == sj && !h_ij.is_finite() {
+                no_curvature[si] = true;
+            }
             let h_ij = if h_ij.is_finite() { h_ij } else { 0.0 };
             hessian[si * n_shape + sj] = h_ij;
             hessian[sj * n_shape + si] = h_ij;
         }
     }
+    decouple_params(&mut hessian, n_shape, &no_curvature);
 
     let shape_log_sigma = log_sigma_from_hessian(&hessian, n_shape);
 
@@ -3040,6 +3060,7 @@ pub fn finalize_parametric_from_gpu(
     band_names: &[String],
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() {
         return Vec::new();
     }
@@ -3211,6 +3232,7 @@ pub fn finalize_parametric_with_gpu_svi(
     svi_outputs: &[(Vec<f64>, Vec<f64>, f64)], // (mu, log_sigma, elbo) per band
     band_names: &[String],
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
         return Vec::new();
     }
@@ -4034,4 +4056,24 @@ pub fn fit_parametric_multiband(
     }
 
     results
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoupled_param_keeps_others_sigma() {
+        // Parameter 0's curvature was non-finite (zeroed); parameter 1 is well
+        // measured (H = 9 -> sigma = 1/3) and coupled to it.
+        let mut hessian = vec![0.0, 1.0, 1.0, 9.0];
+        decouple_params(&mut hessian, 2, &[true, false]);
+        let sigma: Vec<f64> = log_sigma_from_hessian(&hessian, 2).iter().map(|l| l.exp()).collect();
+        assert!(sigma[0] > 100.0, "unmeasured parameter should get the wide fallback, got {}", sigma[0]);
+        assert!((sigma[1] - 1.0 / 3.0).abs() < 1e-9, "coupled parameter's sigma changed: {}", sigma[1]);
+    }
 }
