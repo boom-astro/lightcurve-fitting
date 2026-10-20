@@ -44,6 +44,35 @@ inline float warp_reduce_sum(float val) {
     return val; // result valid in lane 0
 }
 
+// Simdgroup-level max, valid in every lane
+inline float warp_allreduce_max(float val) {
+    return simd_max(val);
+}
+
+// Log-likelihood of one observation, with its derivatives with respect to the
+// prediction and to log sigma_extra.
+inline float svi_obs_loglik(
+    float flux, float obs_var, int is_upper, float upper_flux, float pred, float se_sq,
+    thread float* dll_dpred, thread float* dll_dlse)
+{
+    float total_var = obs_var + se_sq;
+    float sigma_total = sqrt(total_var);
+    float inv_total = 1.0f / total_var;
+    if (is_upper) {
+        float z = (upper_flux - pred) / sigma_total;
+        float phi_z = exp(-0.5f * z * z) / sqrt(2.0f * M_PI_F);
+        float cdf_z = max(0.5f * (1.0f + lc_erf_approx(z * M_SQRT1_2_F)), 1e-38f);
+        *dll_dpred = -phi_z / (cdf_z * sigma_total);
+        *dll_dlse = (phi_z / cdf_z) * (-(upper_flux - pred) * se_sq / (sigma_total * total_var));
+        return lc_log_normal_cdf_d(z);
+    }
+    float residual = flux - pred;
+    float r2 = residual * residual;
+    *dll_dpred = residual * inv_total;
+    *dll_dlse = (r2 * inv_total * inv_total - inv_total) * se_sq;
+    return -0.5f * (r2 * inv_total + log(2.0f * M_PI_F * total_var));
+}
+
 // ===========================================================================
 // Batch SVI kernel: one simdgroup per source, cooperative observation loop
 // ===========================================================================
@@ -97,7 +126,11 @@ kernel void batch_svi_fit(
     int model_id = model_ids[warp_id];
     int np       = n_params_arr[warp_id];
     int se_idx   = se_idx_arr[warp_id];
-    bool use_analytical = (model_id != 7);
+
+    // MetzgerKN grids run out to the source's latest observation.
+    float t_max = -INFINITY;
+    for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) t_max = max(t_max, all_times[i]);
+    t_max = warp_allreduce_max(t_max);
 
     // Load PSO init and prior params (all lanes load — cheap and avoids broadcast)
     int base_off = int(warp_id) * max_params;
@@ -179,57 +212,69 @@ kernel void batch_svi_fit(
             float local_dll[SVI_MAX_PARAMS];
             for (int j = 0; j < np; j++) local_dll[j] = 0.0f;
 
-            for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) {
-                float obs_t = all_times[i];
-                float pred = lc_eval_model_at(model_id, theta, obs_t);
-                if (!isfinite(pred)) continue;
-
-                if (use_analytical) {
-                    lc_eval_model_grad(model_id, theta, obs_t, model_grad);
-                } else {
-                    float theta_pert[SVI_MAX_PARAMS];
-                    for (int k = 0; k < np; k++) theta_pert[k] = theta[k];
-                    for (int j = 0; j < np; j++) {
-                        if (j == se_idx) { model_grad[j] = 0.0f; continue; }
-                        float h = max(1e-5f, 1e-5f * abs(theta[j]));
-                        theta_pert[j] = theta[j] + h;
-                        float pred_pert = lc_eval_model_at(model_id, theta_pert, obs_t);
-                        theta_pert[j] = theta[j];
-                        model_grad[j] = isfinite(pred_pert) ? (pred_pert - pred) / h : 0.0f;
-                    }
-                    model_grad[se_idx] = 0.0f;
+            if (model_id == 7) {
+                // Rescaled as in svi_fit on the CPU: the scale is held fixed in
+                // the gradient, and samples where the clamp moves it by more
+                // than half are skipped.
+                LcKnGrid kn;
+                lc_metzger_kn_grid(theta, t_max - theta[3], &kn);
+                float max_pred = -INFINITY;
+                for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) {
+                    if (!all_is_upper[i])
+                        max_pred = max(max_pred, lc_metzger_kn_interp(&kn, all_times[i] - theta[3]));
+                }
+                max_pred = warp_allreduce_max(max_pred);
+                float kn_scale = lc_metzger_kn_scale(max_pred);
+                if (max_pred > 1e-10f && isfinite(max_pred)
+                    && abs(1.0f / max_pred - kn_scale) * max_pred > 0.5f) {
+                    continue;
                 }
 
-                float total_var = all_obs_var[i] + se_sq;
-                float sigma_total = sqrt(total_var);
-                float inv_total = 1.0f / total_var;
+                for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) {
+                    float pred = kn_scale * lc_metzger_kn_interp(&kn, all_times[i] - theta[3]);
+                    if (!isfinite(pred)) continue;
+                    float dll_dpred, dll_dlse;
+                    local_log_lik += svi_obs_loglik(all_flux[i], all_obs_var[i], all_is_upper[i],
+                                                    all_upper_flux[i], pred, se_sq, &dll_dpred, &dll_dlse);
+                    local_dll[se_idx] += dll_dlse;
+                }
 
-                if (all_is_upper[i]) {
-                    float z = (all_upper_flux[i] - pred) / sigma_total;
-                    local_log_lik += lc_log_normal_cdf_d(z);
+                float theta_pert[SVI_MAX_PARAMS];
+                for (int k = 0; k < np; k++) theta_pert[k] = theta[k];
+                for (int j = 0; j < np; j++) {
+                    if (j == se_idx) continue;
+                    float h = max(1e-5f, 1e-5f * abs(theta[j]));
+                    theta_pert[j] = theta[j] + h;
+                    LcKnGrid kn_pert;
+                    lc_metzger_kn_grid(theta_pert, t_max - theta_pert[3], &kn_pert);
+                    for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) {
+                        float base = lc_metzger_kn_interp(&kn, all_times[i] - theta[3]);
+                        float pred = kn_scale * base;
+                        if (!isfinite(pred)) continue;
+                        float grad = kn_scale * (lc_metzger_kn_interp(&kn_pert, all_times[i] - theta_pert[3]) - base) / h;
+                        if (!isfinite(grad)) continue;
+                        float dll_dpred, dll_dlse;
+                        svi_obs_loglik(all_flux[i], all_obs_var[i], all_is_upper[i],
+                                       all_upper_flux[i], pred, se_sq, &dll_dpred, &dll_dlse);
+                        local_dll[j] += dll_dpred * grad;
+                    }
+                    theta_pert[j] = theta[j];
+                }
+            } else {
+                for (int i = obs_start + int(lane); i < obs_end; i += WARP_SIZE) {
+                    float obs_t = all_times[i];
+                    float pred = lc_eval_model_at(model_id, theta, obs_t);
+                    if (!isfinite(pred)) continue;
+                    lc_eval_model_grad(model_id, theta, obs_t, model_grad);
 
-                    float phi_z = exp(-0.5f * z * z) / sqrt(2.0f * M_PI_F);
-                    float cdf_z = max(0.5f * (1.0f + lc_erf_approx(z * M_SQRT1_2_F)), 1e-38f);
-                    float dll_dpred = -phi_z / (cdf_z * sigma_total);
-
+                    float dll_dpred, dll_dlse;
+                    local_log_lik += svi_obs_loglik(all_flux[i], all_obs_var[i], all_is_upper[i],
+                                                    all_upper_flux[i], pred, se_sq, &dll_dpred, &dll_dlse);
                     for (int j = 0; j < np; j++) {
                         if (j != se_idx && isfinite(model_grad[j]))
                             local_dll[j] += dll_dpred * model_grad[j];
                     }
-
-                    float dz_dlse = -(all_upper_flux[i] - pred) * se_sq / (sigma_total * total_var);
-                    local_dll[se_idx] += (phi_z / cdf_z) * dz_dlse;
-                } else {
-                    float residual = all_flux[i] - pred;
-                    float r2 = residual * residual;
-                    local_log_lik += -0.5f * (r2 * inv_total + log(2.0f * M_PI_F * total_var));
-
-                    for (int j = 0; j < np; j++) {
-                        if (j != se_idx && isfinite(model_grad[j]))
-                            local_dll[j] += residual * inv_total * model_grad[j];
-                    }
-
-                    local_dll[se_idx] += (r2 * inv_total * inv_total - inv_total) * se_sq;
+                    local_dll[se_idx] += dll_dlse;
                 }
             }
 

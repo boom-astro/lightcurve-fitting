@@ -313,7 +313,10 @@ fn fit_fast(py: Python<'_>, bands: &PyBandDataMap, max_subsample: usize) -> PyRe
 ///         Pass ``result['pso_params']`` or ``result['svi_mu']`` directly.
 ///     times: Time values (relative days) at which to evaluate.
 ///
-/// Returns a list of predicted flux values, one per time point.
+/// Returns a list of predicted flux values, one per time point. For
+/// ``"MetzgerKN"``, multiply by ``result['pso_flux_scale']`` or
+/// ``result['svi_flux_scale']`` (matching the params passed) to get the
+/// flux the fit used.
 #[pyfunction]
 fn eval_model(model: &str, params: Vec<f64>, times: Vec<f64>) -> PyResult<Vec<f64>> {
     let m: SviModelName = serde_json::from_value(serde_json::Value::String(model.to_string()))

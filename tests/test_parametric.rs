@@ -204,3 +204,51 @@ fn parametric_laplace_uncertainties_reasonable() {
         }
     }
 }
+
+#[test]
+fn metzger_kn_flux_scale_normalizes_detections() {
+    use lightcurve_fitting::{eval_model_flux, fit_parametric_model};
+
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1100);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric_model(
+        &flux_bands,
+        false,
+        UncertaintyMethod::Laplace,
+        Some(SviModelName::MetzgerKN),
+    );
+    assert!(!results.is_empty());
+
+    let mut n_checked = 0;
+    for result in &results {
+        assert_eq!(result.model, SviModelName::MetzgerKN);
+        let band = &flux_bands[&result.band];
+        let det_times: Vec<f64> = band
+            .times
+            .iter()
+            .zip(band.values.iter().zip(band.errors.iter()))
+            .filter(|(_, (f, e))| !(**e > 0.0 && **f / **e < 3.0))
+            .map(|(t, _)| *t)
+            .collect();
+
+        for (params, scale) in [
+            (&result.pso_params, result.pso_flux_scale),
+            (&result.svi_mu, result.svi_flux_scale),
+        ] {
+            assert!((0.1..=10.0).contains(&scale), "scale {scale} outside clamp range");
+            let peak = eval_model_flux(SviModelName::MetzgerKN, params, &det_times)
+                .into_iter()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let raw = 1.0 / peak;
+            if (0.1..=10.0).contains(&raw) {
+                assert!(
+                    (peak * scale - 1.0).abs() < 1e-9,
+                    "scaled peak {} should be 1",
+                    peak * scale
+                );
+                n_checked += 1;
+            }
+        }
+    }
+    assert!(n_checked > 0, "no fit landed inside the clamp range");
+}

@@ -284,6 +284,97 @@ mod metal_gpu {
     }
 
     #[test]
+    fn metal_metzger_kn_pso_cost_matches_cpu() {
+        use lightcurve_fitting::gpu::SviBatchInput;
+        use lightcurve_fitting::svi_prior_for_model;
+
+        let ctx = GpuContext::new(0).expect("Metal init failed");
+
+        let t0 = 5.0;
+        let true_params = vec![-2.0, -1.0, 0.5, t0, -3.0];
+        let times: Vec<f64> = (0..30).map(|i| t0 - 2.0 + i as f64 * 0.5).collect();
+        let clean = eval_model_flux(SviModelName::MetzgerKN, &true_params, &times);
+        let noise_level = 0.05;
+        let flux: Vec<f64> = clean
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| 0.6 * f + noise_level * (i as f64 * 1.37).sin() * 0.3)
+            .collect();
+        let is_upper: Vec<bool> = flux.iter().map(|&f| f < 3.0 * noise_level).collect();
+        assert!(is_upper.iter().any(|&u| u) && is_upper.iter().any(|&u| !u));
+        let source = BatchSource {
+            times: times.clone(),
+            flux: flux.clone(),
+            obs_var: vec![noise_level * noise_level + 1e-10; times.len()],
+            upper_flux: vec![3.0 * noise_level; times.len()],
+            is_upper: is_upper.clone(),
+        };
+        let data = GpuBatchData::new(&[source]).unwrap();
+
+        let r = &ctx.batch_pso(GpuModelName::MetzgerKN, &data, 40, 40, 10, 7).unwrap()[0];
+
+        // CPU recomputation of the kernel's cost: peak-1 rescale over detections,
+        // then sum((pred - f)^2 / var + ln var) and -ln Phi(z) for upper limits.
+        let mut preds = eval_model_flux(SviModelName::MetzgerKN, &r.params, &times);
+        let max_det = preds
+            .iter()
+            .zip(&is_upper)
+            .filter(|(_, &u)| !u)
+            .map(|(p, _)| *p)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let scale = (1.0 / max_det).clamp(0.1, 10.0);
+        preds.iter_mut().for_each(|p| *p *= scale);
+        let se_sq = r.params[4].exp().powi(2);
+        let mut cost = 0.0;
+        for i in 0..times.len() {
+            let var = noise_level * noise_level + 1e-10 + se_sq;
+            if is_upper[i] {
+                let z = (3.0 * noise_level - preds[i]) / var.sqrt();
+                cost -= (0.5 * libm_erfc(-z / std::f64::consts::SQRT_2)).max(1e-300).ln();
+            } else {
+                cost += (preds[i] - flux[i]).powi(2) / var + var.ln();
+            }
+        }
+        cost /= times.len() as f64;
+
+        assert!(
+            (r.cost - cost).abs() < 0.02 * cost.abs().max(1.0),
+            "Metal cost {} vs CPU {}",
+            r.cost,
+            cost
+        );
+
+        let (centers, widths) = svi_prior_for_model(&SviModelName::MetzgerKN, &r.params);
+        let input = SviBatchInput {
+            model_id: GpuModelName::MetzgerKN.model_id() as usize,
+            pso_params: r.params.clone(),
+            se_idx: 4,
+            prior_centers: centers,
+            prior_widths: widths,
+        };
+        let svi = &ctx.batch_svi_fit(&data, &[input], 200, 4, 0.01).unwrap()[0];
+        assert!(svi.elbo.is_finite(), "SVI elbo not finite");
+        assert!(svi.mu.iter().chain(&svi.log_sigma).all(|v| v.is_finite()));
+    }
+
+    // Complementary error function (Numerical Recipes erfcc, |rel err| < 1.2e-7).
+    fn libm_erfc(x: f64) -> f64 {
+        let z = x.abs();
+        let t = 1.0 / (1.0 + 0.5 * z);
+        let r = t * (-z * z - 1.26551223
+            + t * (1.00002368
+            + t * (0.37409196
+            + t * (0.09678418
+            + t * (-0.18628806
+            + t * (0.27886807
+            + t * (-1.13520398
+            + t * (1.48851587
+            + t * (-0.82215223 + t * 0.17087277)))))))))
+            .exp();
+        if x >= 0.0 { r } else { 2.0 - r }
+    }
+
+    #[test]
     fn metal_batch_gp_fit() {
         let ctx = GpuContext::new(0).expect("Metal init failed");
 
