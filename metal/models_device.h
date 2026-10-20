@@ -402,9 +402,12 @@ inline void lc_metzger_kn_grid(const thread float* p, float phase_max, thread Lc
 
     float ye = 0.1f;
     float xn0 = 1.0f - 2.0f * ye;
-    float e0 = 0.5f * m_ej * v_ej * v_ej;
-    float e_th = e0 / LC_SCALE;
-    float e_kin = e0 / LC_SCALE;
+    // Energies carry a factor 1/LC_SCALE. Scaling m_ej before multiplying keeps
+    // every product inside float range (m_ej * v_ej^2 alone overflows).
+    float m_scaled = m_ej / LC_SCALE;
+    float e0 = 0.5f * m_scaled * v_ej * v_ej;
+    float e_th = e0;
+    float e_kin = e0;
     float v = v_ej;
     float r = exp(log_t_min) * LC_SECS_DAY * v;
     float l_peak = 0.0f;
@@ -422,7 +425,7 @@ inline void lc_metzger_kn_grid(const thread float* p, float phase_max, thread Lc
         float time_term = 0.5f - atan((t_sec - 1.3f) / 0.11f) / M_PI_F;
         if (time_term < 1e-30f) time_term = 1e-30f;
         float eps_rp = 2e18f * eth * pow(time_term, 1.3f);
-        float l_heat = m_ej * (eps_neutron + eps_rp) / LC_SCALE;
+        float l_heat = m_scaled * (eps_neutron + eps_rp);
 
         float xr = 1.0f - xn0;
         float xn_decayed = xn0 - xn;
@@ -440,7 +443,7 @@ inline void lc_metzger_kn_grid(const thread float* p, float phase_max, thread Lc
             e_th += (l_heat - l_pdv - l_rad) * dt_sec;
             if (e_th < 0.0f) e_th = 0.0f;
             e_kin += l_pdv * dt_sec;
-            v = sqrt(2.0f * e_kin * LC_SCALE / m_ej);
+            v = sqrt(2.0f * e_kin / m_scaled);
             if (v > LC_C_CGS_VAL) v = LC_C_CGS_VAL;
             r += v * dt_sec;
         }

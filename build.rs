@@ -36,6 +36,9 @@ fn build_metal() {
         "metal/svi.metal",
     ];
 
+    let strict_math = std::env::var_os("LCF_METAL_STRICT_MATH").is_some();
+    println!("cargo:rerun-if-env-changed=LCF_METAL_STRICT_MATH");
+
     let mut air_paths = Vec::new();
 
     for src in &metal_files {
@@ -46,14 +49,20 @@ fn build_metal() {
             .unwrap();
         let air_path = format!("{}/{}.air", out_dir, stem);
 
-        let status = Command::new("xcrun")
-            .args([
-                "-sdk", "macosx", "metal",
-                "-c", src,
-                "-o", &air_path,
-                "-std=metal3.0",
-                "-I", "metal/", // for #include "models_device.h"
-            ])
+        let mut cmd = Command::new("xcrun");
+        cmd.args([
+            "-sdk", "macosx", "metal",
+            "-c", src,
+            "-o", &air_path,
+            "-std=metal3.0",
+            "-I", "metal/", // for #include "models_device.h"
+        ]);
+        // CI builds once without fast-math so kernels can't rely on the
+        // compiler reassociating expressions to stay in float range.
+        if strict_math {
+            cmd.arg("-fno-fast-math");
+        }
+        let status = cmd
             .status()
             .unwrap_or_else(|e| panic!("Failed to run xcrun metal for {}: {}", src, e));
 
