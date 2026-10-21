@@ -768,11 +768,11 @@ fn eval_model_and_grad(model: SviModel, params: &[f64], t: f64, out: &mut [f64])
 // Metzger 1-zone kilonova
 // ---------------------------------------------------------------------------
 
-// cache the ODE so we don't re-solve it when only t0 changes
-// Coarse quantization: PSO neighbors with similar physics share ODE solutions.
-fn quantize(x: f64) -> i64 { (x * 1e2).round() as i64 }
-
-type KnCacheKey = (i64, i64, i64, i64);
+// Cache the ODE solve for repeated evaluations at the same parameters. The key
+// is exact (bit patterns of the physical params and the grid extent), so a hit
+// returns the same grid a fresh solve would: finite-difference gradients and
+// Hessians see every parameter change.
+type KnCacheKey = (u64, u64, u64, u64);
 type KnCacheVal = (Vec<f64>, Vec<f64>); // (grid_t_day, grid_norm)
 
 /// LRU cache 
@@ -825,9 +825,7 @@ thread_local! {
 fn metzger_kn_solve_ode(m_ej: f64, v_ej: f64, kappa_r: f64, phase_max: f64) -> Option<(Vec<f64>, Vec<f64>)> {
     let n_grid: usize = 200;
     let log_t_min = 0.01f64.ln();
-
-    let phase_bin = (phase_max / 10.0).ceil() * 10.0;
-    let log_t_max = (phase_bin * 1.05).ln();
+    let log_t_max = (phase_max * 1.05).ln();
 
     let grid_t_day: Vec<f64> = (0..n_grid)
         .map(|i| (log_t_min + (log_t_max - log_t_min) * i as f64 / (n_grid - 1) as f64).exp())
@@ -912,14 +910,13 @@ fn metzger_kn_eval_batch(params: &[f64], obs_times: &[f64]) -> Vec<f64> {
         return vec![0.0; obs_times.len()];
     }
 
-    let phase_bin = (phase_max / 10.0).ceil() * 10.0;
-    let key = (quantize(params[0]), quantize(params[1]), quantize(params[2]), quantize(phase_bin));
+    let key = (params[0].to_bits(), params[1].to_bits(), params[2].to_bits(), phase_max.to_bits());
 
     let cached = KN_CACHE.with(|c| c.borrow().get(&key).cloned());
     let (grid_t_day, grid_norm) = if let Some(val) = cached {
         val
     } else {
-        match metzger_kn_solve_ode(m_ej, v_ej, kappa_r, phase_bin) {
+        match metzger_kn_solve_ode(m_ej, v_ej, kappa_r, phase_max) {
             Some(val) => {
                 KN_CACHE.with(|c| {
                     c.borrow_mut().insert(key, val.clone());
@@ -1703,12 +1700,8 @@ impl PsoCost<'_> {
             }
         }
 
-        // Population prior penalty (Gaussian). Prior weight is equivalent to
-        // one data point: neg_lp is added before the /n averaging, so the
-        // prior has influence 1/n relative to per-point NLL (standard weak
-        // Bayesian regularization; prior dominates at n=1, data dominates
-        // as n grows). Previously the prior was divided by n twice — 1/n²
-        // scaling — which made it effectively vanish for any real lightcurve.
+        // Population prior penalty (Gaussian, added to NLL/n so it scales
+        // with data size — prior influence decreases with more observations).
         if !self.pop_priors.is_empty() {
             let mut neg_lp = 0.0;
             for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
@@ -1717,7 +1710,7 @@ impl PsoCost<'_> {
                     neg_lp += 0.5 * z * z;
                 }
             }
-            neg_ll += neg_lp;
+            neg_ll += neg_lp / n;
         }
 
         neg_ll / n
@@ -1796,12 +1789,13 @@ impl PsoCost<'_> {
             }
         }
 
-        // Population prior penalty (matches cost_from_slice)
+        // Population prior penalty (matches cost_from_preds: weighted by 1/n
+        // before the final /n)
         for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
             if j < n_params && width > 0.0 {
                 let z = (p[j] - center) / width;
-                neg_ll += 0.5 * z * z;
-                grad[j] += z / width;
+                neg_ll += 0.5 * z * z / n;
+                grad[j] += z / (width * n);
             }
         }
 
