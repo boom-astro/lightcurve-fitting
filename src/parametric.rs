@@ -1134,6 +1134,36 @@ fn eval_model_batch(model: SviModel, params: &[f64], times: &[f64]) -> Vec<f64> 
     out
 }
 
+/// MetzgerKN has no amplitude parameter, so its flux is rescaled to peak at 1
+/// over the non-upper-limit points. Scales `preds` in place and returns the
+/// factor (1.0 for every other model, or when the peak is degenerate).
+fn apply_metzger_kn_scale(model: SviModel, preds: &mut [f64], is_upper: &[bool]) -> f64 {
+    if model != SviModel::MetzgerKN {
+        return 1.0;
+    }
+    let max_pred = preds
+        .iter()
+        .zip(is_upper.iter())
+        .filter(|(_, is_up)| !**is_up)
+        .map(|(p, _)| *p)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !(max_pred > 1e-10 && max_pred.is_finite()) {
+        return 1.0;
+    }
+    let scale = (1.0 / max_pred).clamp(0.1, 10.0);
+    for pred in preds.iter_mut() {
+        *pred *= scale;
+    }
+    scale
+}
+
+/// Model predictions at the band's times, with the MetzgerKN rescale applied.
+fn scaled_preds(model: SviModel, params: &[f64], data: &BandFitData) -> (Vec<f64>, f64) {
+    let mut preds = eval_model_batch(model, params, &data.times);
+    let scale = apply_metzger_kn_scale(model, &mut preds, &data.is_upper);
+    (preds, scale)
+}
+
 /// Write model predictions into a pre-allocated buffer (avoids allocation in hot loops).
 fn eval_model_batch_into(model: SviModel, params: &[f64], times: &[f64], out: &mut [f64]) {
     if model.is_sequential() {
@@ -1621,25 +1651,28 @@ struct PsoCost<'a> {
 }
 
 impl PsoCost<'_> {
+    /// Villar physical constraint (JAX-calibrated, Sushant/villar-pso): the
+    /// penalty cost for parameters that violate it, `None` otherwise.
+    #[inline]
+    fn villar_penalty(&self, p: &[f64]) -> Option<f64> {
+        if self.model != SviModel::Villar {
+            return None;
+        }
+        // Params: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+        let constraint = villar_constraint(p[2], p[1], p[4], p[5]);
+        (constraint > 0.0).then(|| 1e12 + 10_000.0 * constraint)
+    }
+
     /// Hot-path cost evaluation that takes a slice (no Vec allocation) and
     /// reuses a prediction buffer.
     #[inline]
     fn cost_from_slice(&self, p: &[f64], pred_buf: &mut [f64]) -> f64 {
+        if let Some(penalty) = self.villar_penalty(p) {
+            return penalty;
+        }
         eval_model_batch_into(self.model, p, self.times, pred_buf);
 
-        if self.model == SviModel::MetzgerKN {
-            let max_pred = pred_buf.iter()
-                .zip(self.is_upper.iter())
-                .filter(|(_, is_up)| !**is_up)
-                .map(|(p, _)| *p)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if max_pred > 1e-10 && max_pred.is_finite() {
-                let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-                for pred in pred_buf[..self.times.len()].iter_mut() {
-                    *pred *= scale;
-                }
-            }
-        }
+        apply_metzger_kn_scale(self.model, &mut pred_buf[..self.times.len()], self.is_upper);
 
         self.cost_from_preds(p, pred_buf)
     }
@@ -1647,6 +1680,9 @@ impl PsoCost<'_> {
     /// Cost given precomputed model predictions for `p`.
     #[inline]
     fn cost_from_preds(&self, p: &[f64], preds: &[f64]) -> f64 {
+        if let Some(penalty) = self.villar_penalty(p) {
+            return penalty;
+        }
         let se_idx = self.model.sigma_extra_idx();
         let sigma_extra = p[se_idx].exp();
         let sigma_extra_sq = sigma_extra * sigma_extra;
@@ -2061,8 +2097,11 @@ fn pso_bounds(model: SviModel) -> (Vec<f64>, Vec<f64>) {
             vec![3.0, 0.3, 100.0, 5.0, 6.0, 0.0],
         ),
         SviModel::Villar => (
-            vec![-3.0, -0.05, -3.0, -100.0, -2.0, -2.0, -3.0],
-            vec![3.0, 0.1, 5.0, 100.0, 5.0, 7.0, 0.0],
+            // JAX-calibrated bounds (Sushant/villar-pso), converted from log10→ln
+            // and kept slightly wider for single-band generality.
+            // [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+            vec![-1.5, -0.02, 1.0, -60.0, -1.0, 1.0, -6.0],
+            vec![1.5,  0.05,  5.0,  40.0,  3.0, 5.5,  0.0],
         ),
         SviModel::MetzgerKN => (
             vec![-3.0, -2.0, -1.0, -2.0, -5.0],
@@ -2102,16 +2141,16 @@ fn population_priors(model: SviModel) -> Vec<(f64, f64)> {
     let ln10 = std::f64::consts::LN_10;
     match model {
         SviModel::Villar => {
-            // Kenworthy+ 2024, Table 2 (r-band reference): log10 → ln
+            // JAX-calibrated priors (Sushant/villar-pso): log10 means/stds → ln
             // [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
             vec![
-                (0.096 * ln10, 0.15 * ln10),   // log_A: μ=0.096, σ=0.058 in log10 → widen 2.5x for robustness
-                (0.008, 0.012),                 // beta: linear, σ=0.004 → widen 3x
-                (1.43 * ln10, 0.9 * ln10),     // log_gamma: μ=1.43, σ=0.31 → widen 3x
-                (0.0, 30.0),                    // t0: broad, data-informed bounds handle this
-                (0.67 * ln10, 1.2 * ln10),      // log_tau_rise: μ=0.67, σ=0.43 → widen 3x
-                (1.53 * ln10, 0.9 * ln10),      // log_tau_fall: μ=1.53, σ=0.30 → widen 3x
-                (-1.66 * ln10, 1.0 * ln10),     // log_sigma_extra: μ=-1.66, σ=0.34 → widen 3x
+                (-0.009 * ln10, 0.10 * ln10),   // log_A: JAX μ=-0.009, σ=0.10 in log10
+                (0.009, 0.010),                   // beta: linear
+                (1.327 * ln10, 0.40 * ln10),     // log_gamma: JAX μ=1.327, σ=0.40 in log10
+                (-12.0, 15.0),                    // t0: JAX μ=-12, σ=15
+                (0.360 * ln10, 0.35 * ln10),     // log_tau_rise: JAX μ=0.36, σ=0.35 in log10
+                (1.454 * ln10, 0.40 * ln10),     // log_tau_fall: JAX μ=1.454, σ=0.40 in log10
+                (-1.033 * ln10, 0.50 * ln10),    // log_sigma_extra: JAX μ=-1.033, σ=0.50 in log10
             ]
         }
         SviModel::Bazin => {
@@ -2145,8 +2184,8 @@ fn population_priors_for_fit(model: SviModel) -> Vec<(f64, f64)> {
 }
 
 /// Public accessor for GPU PSO to use population priors.
-#[cfg(feature = "cuda")]
-pub fn population_priors_for_gpu(model: crate::gpu::GpuModelName) -> Vec<(f64, f64)> {
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn population_priors_for_gpu(model: crate::gpu_types::GpuModelName) -> Vec<(f64, f64)> {
     population_priors(SviModel::from_name(&model.to_svi_name()))
 }
 
@@ -2189,8 +2228,8 @@ fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
 /// - Linear inertia decay (w_max → w_min) for exploration→exploitation;
 /// - Velocity clamping to V_max = fraction of domain width per dimension;
 /// - Wall absorption: velocity zeroed on dimensions that hit bounds;
-/// - Stall-based early stopping (relative improvement threshold).
-/// - Optional seed particle injected as particle 0.
+/// - Stall-based early stopping (relative improvement threshold);
+/// - Optional seed particle placed at index 0.
 fn pso_minimize(
     mut cost_fn: impl FnMut(&[f64]) -> f64,
     lower: &[f64],
@@ -2223,25 +2262,31 @@ fn pso_minimize(
     let mut gbest_pos = vec![0.0; dim];
     let mut gbest_cost = f64::INFINITY;
 
-    // Initialise particles uniformly in bounds (seed particle at index 0 if provided)
+    // Initialise particles uniformly in bounds. The two arms draw from the RNG
+    // in different orders; each is kept so fits stay reproducible.
     for p in 0..n_particles {
         let base = p * dim;
-        if p == 0 {
-            if let Some(sp) = seed_particle {
-                positions[base..base + dim].copy_from_slice(sp);
-            } else {
+        match seed_particle {
+            Some(sp) => {
+                if p == 0 {
+                    positions[base..base + dim].copy_from_slice(sp);
+                } else {
+                    for d in 0..dim {
+                        positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                    }
+                }
                 for d in 0..dim {
-                    positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                    velocities[base + d] =
+                        v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
                 }
             }
-        } else {
-            for d in 0..dim {
-                positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+            None => {
+                for d in 0..dim {
+                    positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                    velocities[base + d] =
+                        v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
+                }
             }
-        }
-        for d in 0..dim {
-            velocities[base + d] =
-                v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
         }
         let cost = cost_fn(&positions[base..base + dim]);
         pbest_cost[p] = cost;
@@ -3307,22 +3352,7 @@ fn neg_log_posterior(model: SviModel, data: &BandFitData, params: &[f64]) -> f64
     let se_idx = model.sigma_extra_idx();
     let sigma_extra = params[se_idx].exp();
     let sigma_extra_sq = sigma_extra * sigma_extra;
-    let mut preds = eval_model_batch(model, params, &data.times);
-
-    if model == SviModel::MetzgerKN {
-        let max_pred = preds
-            .iter()
-            .zip(data.is_upper.iter())
-            .filter(|(_, is_up)| !**is_up)
-            .map(|(p, _)| *p)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if max_pred > 1e-10 && max_pred.is_finite() {
-            let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-            for pred in preds.iter_mut() {
-                *pred *= scale;
-            }
-        }
-    }
+    let (preds, _) = scaled_preds(model, params, data);
 
     let mut neg_ll = 0.0;
     for i in 0..data.times.len() {
@@ -3454,6 +3484,21 @@ fn log_sigma_from_hessian(hessian: &[f64], n: usize) -> Vec<f64> {
     diag_inv.iter().map(|&d| 0.5 * d.max(1e-30).ln()).collect()
 }
 
+/// Zero the Hessian row and column of each flagged parameter. A parameter whose
+/// own curvature is non-finite then gets the wide fallback sigma from
+/// `log_sigma_from_hessian`, without inflating the sigmas of the parameters it
+/// was coupled to.
+fn decouple_params(hessian: &mut [f64], n: usize, flagged: &[bool]) {
+    for (i, &f) in flagged.iter().enumerate() {
+        if f {
+            for k in 0..n {
+                hessian[i * n + k] = 0.0;
+                hessian[k * n + i] = 0.0;
+            }
+        }
+    }
+}
+
 /// Laplace approximation: compute Hessian of neg-log-posterior at MAP
 /// estimate via central finite differences, then invert for uncertainties.
 ///
@@ -3473,6 +3518,7 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
 
     // Hessian via central finite differences (single step size)
     let mut hessian = vec![0.0; n_shape * n_shape];
+    let mut no_curvature = vec![false; n_shape];
     let mut buf = map_params.to_vec();
 
     for si in 0..n_shape {
@@ -3493,11 +3539,15 @@ fn laplace_fit(model: SviModel, data: &BandFitData, map_params: &[f64]) -> SviFi
             let fmm = neg_log_posterior(model, data, &buf);
 
             let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if si == sj && !h_ij.is_finite() {
+                no_curvature[si] = true;
+            }
             let h_ij = if h_ij.is_finite() { h_ij } else { 0.0 };
             hessian[si * n_shape + sj] = h_ij;
             hessian[sj * n_shape + si] = h_ij;
         }
     }
+    decouple_params(&mut hessian, n_shape, &no_curvature);
 
     let shape_log_sigma = log_sigma_from_hessian(&hessian, n_shape);
 
@@ -3541,7 +3591,7 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
     let obs_var = &data.obs_var;
 
     // Compute log-likelihood at MAP
-    let map_preds = eval_model_batch(model, &result.mu, &data.times);
+    let (map_preds, _) = scaled_preds(model, &result.mu, data);
     let se = result.mu[se_idx].exp();
     let se_sq = se * se;
     let mut map_ll = 0.0;
@@ -3586,7 +3636,7 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
             let mut p = result.mu.clone();
             p[j] = val;
 
-            let preds = eval_model_batch(model, &p, &data.times);
+            let (preds, _) = scaled_preds(model, &p, data);
             let se_p = p[se_idx].exp();
             let se_sq_p = se_p * se_p;
             let mut ll = 0.0;
@@ -3658,17 +3708,21 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
     let log_a_idx = 0;
     let has_baseline = matches!(model, SviModel::Bazin | SviModel::Tde);
 
-    for gi in 0..n_grid {
-        let t0 = t0_lo + (t0_hi - t0_lo) * gi as f64 / (n_grid - 1).max(1) as f64;
+    // Score the current t0 first, so a grid point only replaces it if it fits better
+    for gi in 0..=n_grid {
+        let t0 = if gi == 0 {
+            mu_t0
+        } else {
+            t0_lo + (t0_hi - t0_lo) * (gi - 1) as f64 / (n_grid - 1).max(1) as f64
+        };
 
         for j in 0..params.len() {
             params[j] = result.mu[j];
         }
         params[t0_idx] = t0;
 
-        // Analytically re-fit amplitude; keep shapes for reuse below
-        let shapes;
-        {
+        // Analytically re-fit amplitude (MetzgerKN has none: its params[0] is log10 M_ej)
+        let mut preds: Vec<f64> = if model != SviModel::MetzgerKN {
             let saved_log_a = params[log_a_idx];
             params[log_a_idx] = 0.0;
             let saved_b = if has_baseline {
@@ -3679,7 +3733,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
                 0.0
             };
 
-            shapes = eval_model_batch(model, &params, &data.times);
+            let shapes = eval_model_batch(model, &params, &data.times);
 
             if has_baseline {
                 let mut sw = 0.0;
@@ -3730,28 +3784,16 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
                     params[log_a_idx] = saved_log_a;
                 }
             }
-        }
 
-        // Reuse shapes from the amplitude fitting above instead of
-        // re-evaluating the model. preds = A * shapes + B (or just A * shapes).
-        let fitted_a = params[log_a_idx].exp();
-        let fitted_b = if has_baseline { params[1] } else { 0.0 };
-        let mut preds: Vec<f64> = shapes.iter().map(|&s| fitted_a * s + fitted_b).collect();
-
-        if model == SviModel::MetzgerKN {
-            let max_pred = preds
-                .iter()
-                .zip(data.is_upper.iter())
-                .filter(|(_, is_up)| !**is_up)
-                .map(|(p, _)| *p)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if max_pred > 1e-10 && max_pred.is_finite() {
-                let scale = (1.0 / max_pred).clamp(0.1, 10.0);
-                for pred in preds.iter_mut() {
-                    *pred *= scale;
-                }
-            }
-        }
+            // Reuse the shapes from the amplitude fit instead of re-evaluating
+            // the model: preds = A * shapes + B (or just A * shapes).
+            let fitted_a = params[log_a_idx].exp();
+            let fitted_b = if has_baseline { params[1] } else { 0.0 };
+            shapes.iter().map(|&s| fitted_a * s + fitted_b).collect()
+        } else {
+            eval_model_batch(model, &params, &data.times)
+        };
+        apply_metzger_kn_scale(model, &mut preds, &data.is_upper);
 
         let se = params[se_idx].exp();
         let se_sq = se * se;
@@ -3794,7 +3836,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         let mut p = result.mu.clone();
         p[t0_idx] = t0;
         // Quick re-eval at this t0 (without re-fitting amplitude for speed)
-        let preds_at = eval_model_batch(model, &p, &data.times);
+        let (preds_at, _) = scaled_preds(model, &p, data);
         let se = p[se_idx].exp();
         let se_sq = se * se;
         let mut ll_at = 0.0;
@@ -3823,7 +3865,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         }
         let mut p = result.mu.clone();
         p[t0_idx] = t0;
-        let preds_at = eval_model_batch(model, &p, &data.times);
+        let (preds_at, _) = scaled_preds(model, &p, data);
         let se = p[se_idx].exp();
         let se_sq = se * se;
         let mut ll_at = 0.0;
@@ -3846,7 +3888,9 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
 
     let profile_sigma = ((t0_hi_1sig - t0_lo_1sig) / 2.0).max(0.1);
 
+    // Keep the amplitude (and baseline) re-fitted at best_t0, not just t0
     result.mu = best_params;
+    result.mu[t0_idx] = best_t0;
     result.log_sigma[t0_idx] = profile_sigma.ln();
 }
 
@@ -3888,6 +3932,10 @@ fn flux_to_mag(flux: f64, zp: f64) -> f64 {
 // Public API
 // ---------------------------------------------------------------------------
 
+fn unit_scale() -> f64 {
+    1.0
+}
+
 /// Result of parametric SVI fitting for a single band.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParametricBandResult {
@@ -3900,6 +3948,13 @@ pub struct ParametricBandResult {
     pub svi_elbo: Option<f64>,
     pub n_obs: usize,
     pub mag_chi2: Option<f64>,
+    /// Factor to multiply `eval_model_flux(model, pso_params, ..)` by to get
+    /// the flux the fit used. 1.0 except for MetzgerKN.
+    #[serde(default = "unit_scale")]
+    pub pso_flux_scale: f64,
+    /// As `pso_flux_scale`, for `svi_mu`.
+    #[serde(default = "unit_scale")]
+    pub svi_flux_scale: f64,
     pub per_model_chi2: HashMap<SviModelName, Option<f64>>,
     /// PSO best-fit parameters for every model attempted (populated when
     /// fit_all_models is true).
@@ -3921,7 +3976,9 @@ pub struct ParametricBandResult {
 /// `svi_mu` from a `ParametricBandResult` directly.
 /// `times` are the time values (relative days) at which to evaluate.
 ///
-/// Returns a Vec of predicted flux values, one per time point.
+/// Returns a Vec of predicted flux values, one per time point. For MetzgerKN,
+/// multiply by the result's `pso_flux_scale` or `svi_flux_scale` (matching the
+/// params passed) to reproduce the flux the fit used.
 pub fn eval_model_flux(model: SviModelName, params: &[f64], times: &[f64]) -> Vec<f64> {
     let m = match model {
         SviModelName::Bazin => SviModel::Bazin,
@@ -3962,8 +4019,9 @@ pub struct GpuPsoBandResult {
 /// computes mag-space chi2, and assembles the final ParametricBandResult.
 ///
 /// `flux_bands`: maps band_name → BandData in flux space.
-/// `gpu_results`: per-band GPU PSO results, one per entry in `band_names`.
-/// `band_names`: explicit band ordering matching `gpu_results`.
+/// `gpu_results`: per-band GPU PSO results.
+/// `band_names`: the band each entry of `gpu_results` belongs to. The first
+///   entry's `multi_bazin` is kept.
 /// `method`: uncertainty estimation method.
 pub fn finalize_parametric_from_gpu(
     flux_bands: &HashMap<String, BandData>,
@@ -3971,6 +4029,7 @@ pub fn finalize_parametric_from_gpu(
     band_names: &[String],
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() {
         return Vec::new();
     }
@@ -4027,9 +4086,7 @@ pub fn finalize_parametric_from_gpu(
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, band_name) in band_names.iter().enumerate() {
-        if band_idx >= gpu_results.len() { break; }
-        let gpu = &gpu_results[band_idx];
+    for (band_idx, (gpu, band_name)) in gpu_results.iter().zip(band_names).enumerate() {
 
         let (data, mags_obs) = match band_data_map.get(band_name) {
             Some(d) => d,
@@ -4053,14 +4110,11 @@ pub fn finalize_parametric_from_gpu(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4088,6 +4142,8 @@ pub fn finalize_parametric_from_gpu(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: gpu.per_model_params.clone(),
             uncertainty_method: method,
@@ -4140,14 +4196,14 @@ pub fn svi_model_meta(model_name: &SviModelName) -> (usize, usize, usize) {
 /// Like `finalize_parametric_from_gpu` but skips CPU SVI — uses pre-computed
 /// mu/log_sigma/elbo from GPU SVI kernel.
 ///
-/// `svi_outputs` must be parallel to `gpu_results` (same length and ordering).
-/// `band_names`: explicit band ordering matching `gpu_results` and `svi_outputs`.
+/// `svi_outputs` and `band_names` are parallel to `gpu_results`.
 pub fn finalize_parametric_with_gpu_svi(
     flux_bands: &HashMap<String, BandData>,
     gpu_results: &[GpuPsoBandResult],
     svi_outputs: &[(Vec<f64>, Vec<f64>, f64)], // (mu, log_sigma, elbo) per band
     band_names: &[String],
 ) -> Vec<ParametricBandResult> {
+    assert_eq!(band_names.len(), gpu_results.len(), "band_names must be parallel to gpu_results");
     if flux_bands.is_empty() || gpu_results.is_empty() || svi_outputs.is_empty() {
         return Vec::new();
     }
@@ -4201,9 +4257,8 @@ pub fn finalize_parametric_with_gpu_svi(
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
 
-    for (band_idx, band_name) in band_names.iter().enumerate() {
-        if band_idx >= gpu_results.len() || band_idx >= svi_outputs.len() { break; }
-        let gpu = &gpu_results[band_idx];
+    for (band_idx, (gpu, band_name)) in gpu_results.iter().zip(band_names).enumerate() {
+        if band_idx >= svi_outputs.len() { break; }
         let (ref svi_mu, ref svi_log_sigma, svi_elbo) = svi_outputs[band_idx];
 
         let (data, mags_obs) = match band_data_map.get(band_name) {
@@ -4230,14 +4285,11 @@ pub fn finalize_parametric_with_gpu_svi(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4265,6 +4317,8 @@ pub fn finalize_parametric_with_gpu_svi(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: gpu.per_model_params.clone(),
             uncertainty_method: UncertaintyMethod::Svi,
@@ -4362,14 +4416,11 @@ pub fn finalize_all_models_with_gpu_svi(
         profile_refine_all(&mut svi_result, data);
 
         // Mag-space chi2
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &gpu.pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &gpu.pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4397,6 +4448,8 @@ pub fn finalize_all_models_with_gpu_svi(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2: gpu.per_model_chi2.clone(),
             per_model_params: HashMap::new(), // Not needed — each model has its own entry
             uncertainty_method: UncertaintyMethod::Svi,
@@ -4544,14 +4597,11 @@ pub fn fit_parametric_model(
 
         // Compute reduced chi² in magnitude space using SVI mu.
         // Fall back to PSO params if SVI gives too few positive predictions.
-        let svi_preds = eval_model_batch(pso_model, &svi_result.mu, &data.times);
+        let (svi_preds, svi_flux_scale) = scaled_preds(pso_model, &svi_result.mu, data);
+        let (pso_preds, pso_flux_scale) = scaled_preds(pso_model, &pso_params, data);
         let n_pos_svi = svi_preds.iter().filter(|&&p| p * data.peak_flux_obs > 0.0).count();
         let use_pso_for_mag = n_pos_svi < data.times.len() / 2;
-        let mag_preds = if use_pso_for_mag {
-            eval_model_batch(pso_model, &pso_params, &data.times)
-        } else {
-            svi_preds
-        };
+        let mag_preds = if use_pso_for_mag { pso_preds } else { svi_preds };
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4594,6 +4644,8 @@ pub fn fit_parametric_model(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2,
             per_model_params,
             uncertainty_method: method,
@@ -4610,6 +4662,19 @@ pub fn fit_parametric(
     fit_all_models: bool,
     method: UncertaintyMethod,
 ) -> Vec<ParametricBandResult> {
+    // Use joint multi-band Villar fitting when ≥2 bands with data are available.
+    // This produces better fits via band-balanced likelihood and shared structure
+    // (JAX-calibrated, Sushant/villar-pso).
+    let bands_with_data: usize = bands.values()
+        .filter(|b| !b.values.is_empty())
+        .count();
+    if bands_with_data >= 2 && !fit_all_models {
+        let multiband_results = fit_parametric_multiband(bands, method);
+        if !multiband_results.is_empty() {
+            return multiband_results;
+        }
+    }
+    // Fall back to per-band fitting
     fit_parametric_model(bands, fit_all_models, method, None)
 }
 
@@ -4623,17 +4688,31 @@ pub fn fit_parametric(
 /// beta (additive in linear) and t0 (additive in days).
 fn relative_band_priors() -> Vec<(f64, f64, bool)> {
     // (mean, sigma, is_additive)
+    // JAX-calibrated offset priors (Sushant/villar-pso), converted from log10→ln.
     // Villar: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
     let ln10 = std::f64::consts::LN_10;
     vec![
-        (-0.08 * ln10, 0.3 * ln10, false),    // log_A: multiplicative ratio in log10 → ln
-        (0.0, 0.01, true),                      // beta: additive offset (linear)
-        (-0.05 * ln10, 0.45 * ln10, false),    // log_gamma: multiplicative ratio
-        (-3.4, 12.0, true),                     // t0: additive offset (days)
-        (-0.15 * ln10, 0.6 * ln10, false),     // log_tau_rise: multiplicative ratio
-        (-0.15 * ln10, 0.75 * ln10, false),    // log_tau_fall: multiplicative ratio
-        (-0.15 * ln10, 0.75 * ln10, false),    // log_sigma_extra: multiplicative ratio
+        (-0.015 * ln10, 0.08 * ln10, false),  // log_A: JAX μ=-0.015, σ=0.08 in log10
+        (-0.001, 0.008, true),                  // beta: linear offset
+        (-0.095 * ln10, 0.25 * ln10, false),  // log_gamma: JAX μ=-0.095, σ=0.25 in log10
+        (-1.181, 1.5, true),                    // t0: JAX μ=-1.181 days, σ=1.5
+        (-0.195 * ln10, 0.35 * ln10, false),  // log_tau_rise: JAX μ=-0.195, σ=0.35 in log10
+        (-0.323 * ln10, 0.25 * ln10, false),  // log_tau_fall: JAX μ=-0.323, σ=0.25 in log10
+        (-0.025 * ln10, 0.30 * ln10, false),  // log_sigma_extra: JAX μ=-0.025, σ=0.30 in log10
     ]
+}
+
+/// Villar physical validity constraint (matches JAX `_villar_constraint`).
+/// Evaluates for one band's physical parameters.
+/// Returns 0 if valid, positive penalty otherwise.
+fn villar_constraint(log_gamma: f64, beta: f64, log_tau_rise: f64, log_tau_fall: f64) -> f64 {
+    let gamma = log_gamma.exp();
+    let tau_rise = log_tau_rise.exp();
+    let tau_fall = log_tau_fall.exp();
+    let c1 = (gamma * beta - 1.0).max(0.0);
+    let c2 = ((-gamma / tau_rise).exp() * (tau_fall / tau_rise - 1.0) - 1.0).max(0.0);
+    let c3 = (beta * tau_fall - 1.0 + beta * gamma).max(0.0);
+    c1 + c2 + c3
 }
 
 /// Joint multi-band Villar fit with relative priors between bands.
@@ -4729,14 +4808,28 @@ pub fn fit_parametric_multiband(
         joint_upper[t0_idx] = (peak_time + 10.0).min(joint_upper[t0_idx]);
     }
 
-    // Joint cost function: sum of NLL across all bands + relative priors
+    // Joint cost function: band-balanced NLL + physical constraints + priors
+    // (JAX-calibrated, Sushant/villar-pso)
     let se_idx = model.sigma_extra_idx();
     let pop_prior_ref = population_priors(model);
 
+    // Pre-compute band sizes for band-balanced weighting
+    let band_n_obs: Vec<usize> = band_entries.iter().map(|e| e.1.times.len()).collect();
+    let n_total_obs: usize = band_n_obs.iter().sum();
+
     let joint_cost = |p: &[f64]| -> f64 {
         let ref_params = &p[..n_model_params];
-        let mut total_nll = 0.0;
-        let mut total_n = 0usize;
+
+        // Physical constraint on reference band
+        // Villar params: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
+        let ref_constraint = villar_constraint(ref_params[2], ref_params[1], ref_params[4], ref_params[5]);
+        if ref_constraint > 0.0 {
+            return 1e12 + 10_000.0 * ref_constraint;
+        }
+
+        // Band-balanced likelihood: each band contributes equally
+        // NLL_band / n_band * (n_total / n_bands)
+        let mut balanced_nll = 0.0;
 
         // Reference band
         {
@@ -4746,17 +4839,21 @@ pub fn fit_parametric_multiband(
             let sigma_extra_sq = sigma_extra * sigma_extra;
             let mut preds = vec![0.0; n];
             eval_model_batch_into(model, ref_params, &data.times, &mut preds);
+            let mut band_nll = 0.0;
             for i in 0..n {
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    total_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
-                    total_nll += diff * diff / tv + tv.ln();
+                    band_nll += diff * diff / tv + tv.ln();
                 }
             }
-            total_n += n;
+            // Band-balanced: normalize by band size, weight equally
+            if n > 0 {
+                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
+            }
         }
 
         // Non-reference bands
@@ -4769,32 +4866,36 @@ pub fn fit_parametric_multiband(
             // Reconstruct band params from reference + offsets
             let mut band_params = vec![0.0; n_model_params];
             for j in 0..n_model_params {
-                let (_mean, _sigma, is_add) = rel_priors[j];
-                if is_add {
-                    band_params[j] = ref_params[j] + offsets[j];
-                } else {
-                    band_params[j] = ref_params[j] + offsets[j]; // additive in log space = multiplicative in linear
-                }
+                band_params[j] = ref_params[j] + offsets[j];
+            }
+
+            // Physical constraint on this band
+            let band_constraint = villar_constraint(band_params[2], band_params[1], band_params[4], band_params[5]);
+            if band_constraint > 0.0 {
+                return 1e12 + 10_000.0 * band_constraint;
             }
 
             let sigma_extra = band_params[se_idx].exp();
             let sigma_extra_sq = sigma_extra * sigma_extra;
             let mut preds = vec![0.0; n];
             eval_model_batch_into(model, &band_params, &data.times, &mut preds);
+            let mut band_nll = 0.0;
             for i in 0..n {
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    total_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
-                    total_nll += diff * diff / tv + tv.ln();
+                    band_nll += diff * diff / tv + tv.ln();
                 }
             }
-            total_n += n;
+            if n > 0 {
+                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
+            }
         }
 
-        let n_total = total_n.max(1) as f64;
+        let n_total = n_total_obs.max(1) as f64;
 
         // Reference band population prior
         let mut neg_lp = 0.0;
@@ -4816,7 +4917,7 @@ pub fn fit_parametric_multiband(
             }
         }
 
-        (total_nll + neg_lp / n_total) / n_total
+        (balanced_nll + neg_lp) / n_total
     };
 
     // Run PSO on the joint space
@@ -4852,11 +4953,10 @@ pub fn fit_parametric_multiband(
         }
 
         for (i, &seed) in seeds.iter().enumerate() {
-            let seed_ref: Option<&[f64]> = if i == 1 { Some(&seed_particle) } else { None };
-            let (params, cost) = pso_minimize(
-                |p| joint_cost(p), &joint_lower, &joint_upper,
-                40, 80, 15, seed, seed_ref,
-            );
+            // JAX-calibrated PSO config (Sushant/villar-pso):
+            // 200 particles, 1500 max iters, 60 stall iters
+            let (params, cost) = pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
+                200, 1500, 60, seed, (i == 1).then_some(seed_particle.as_slice()));
             if cost < best_c {
                 best_c = cost;
                 best = params;
@@ -4894,7 +4994,8 @@ pub fn fit_parametric_multiband(
         profile_refine_all(&mut svi_result, data);
 
         // Mag chi2
-        let preds = eval_model_batch(model, &svi_result.mu, &data.times);
+        let (preds, svi_flux_scale) = scaled_preds(model, &svi_result.mu, data);
+        let (_, pso_flux_scale) = scaled_preds(model, &band_params, data);
         let mut mag_chi2_sum = 0.0;
         let mut mag_chi2_n = 0usize;
         for i in 0..data.times.len() {
@@ -4915,6 +5016,14 @@ pub fn fit_parametric_multiband(
         let mut per_model_chi2 = HashMap::new();
         per_model_chi2.insert(SviModelName::Villar, finite_or_none(best_cost));
 
+        // MultiBazin: run on the first (most-populated) band
+        let multi_bazin = if b == 0 {
+            let mb = fit_multi_bazin(data, None);
+            if mb.params.is_empty() { None } else { Some(mb) }
+        } else {
+            None
+        };
+
         results.push(ParametricBandResult {
             band: band_name.clone(),
             model: SviModelName::Villar,
@@ -4925,10 +5034,12 @@ pub fn fit_parametric_multiband(
             svi_elbo: finite_or_none(svi_result.elbo),
             n_obs: data.times.len(),
             mag_chi2: finite_or_none(mag_chi2),
+            pso_flux_scale,
+            svi_flux_scale,
             per_model_chi2,
             per_model_params: HashMap::new(),
             uncertainty_method: method,
-            multi_bazin: None,
+            multi_bazin,
         });
     }
 
@@ -4990,7 +5101,15 @@ mod tests {
         let worst = multi_bazin_worst_grad_error(true);
         assert!(worst < 5e-2, "worst relative gradient error with upper limits {worst:e}");
     }
+
+    #[test]
+    fn decoupled_param_keeps_others_sigma() {
+        // Parameter 0's curvature was non-finite (zeroed); parameter 1 is well
+        // measured (H = 9 -> sigma = 1/3) and coupled to it.
+        let mut hessian = vec![0.0, 1.0, 1.0, 9.0];
+        decouple_params(&mut hessian, 2, &[true, false]);
+        let sigma: Vec<f64> = log_sigma_from_hessian(&hessian, 2).iter().map(|l| l.exp()).collect();
+        assert!(sigma[0] > 100.0, "unmeasured parameter should get the wide fallback, got {}", sigma[0]);
+        assert!((sigma[1] - 1.0 / 3.0).abs() < 1e-9, "coupled parameter's sigma changed: {}", sigma[1]);
+    }
 }
-
-
-

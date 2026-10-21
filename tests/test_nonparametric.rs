@@ -1,6 +1,6 @@
 mod synthetic;
 
-use lightcurve_fitting::{build_mag_bands, fit_nonparametric};
+use lightcurve_fitting::{build_flux_bands, build_mag_bands, extract_features, fit_nonparametric};
 
 #[test]
 fn nonparametric_returns_results_for_each_band() {
@@ -127,4 +127,20 @@ fn nonparametric_empty_bands() {
     let (results, gps) = fit_nonparametric(&std::collections::HashMap::new());
     assert!(results.is_empty());
     assert!(gps.is_empty());
+}
+
+#[test]
+fn beta_features_computed() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 999);
+    let mag_bands = build_mag_bands(&times, &mags, &errs, &bands);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+
+    let features = extract_features(&mag_bands, &flux_bands, "r");
+
+    let beta_std = features.get("np_beta_std").copied().flatten();
+    let beta_median = features.get("np_beta_median").copied().flatten();
+
+    // With g, r, i bands present we expect beta to be computable
+    assert!(beta_std.is_some(), "np_beta_std should be Some with multi-band data");
+    assert!(beta_median.is_some(), "np_beta_median should be Some with multi-band data");
 }

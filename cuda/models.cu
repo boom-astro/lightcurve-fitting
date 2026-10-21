@@ -11,6 +11,7 @@
 //   6. batch_pso_full_multi_bazin: GPU-resident MultiBazin PSO (K=1..4).
 
 #include <math.h>
+#include "models_device.h"
 
 // ===========================================================================
 // Device helpers
@@ -143,95 +144,6 @@ __device__ inline double afterglow_at(const double* p, double t) {
 #define C_CGS_VAL 2.998e10
 #define SECS_DAY  86400.0
 #define METZGER_NGRID 200
-#define METZGER_PSO_NGRID 100
-
-// Solve MetzgerKN ODE once and store normalized luminosity grid.
-__device__ double metzger_kn_solve_grid(
-    const double* p, double phase_max,
-    double* grid_t, double* grid_lrad)
-{
-    double m_ej    = pow(10.0, p[0]) * MSUN_CGS;
-    double v_ej    = pow(10.0, p[1]) * C_CGS_VAL;
-    double kappa_r = pow(10.0, p[2]);
-
-    if (phase_max < 0.02) phase_max = 0.02;
-    double log_t_min = log(0.01);
-    double log_t_max = log(phase_max);
-
-    double ye = 0.1;
-    double xn0 = 1.0 - 2.0 * ye;
-    double scale = 1e40;
-    double e0 = 0.5 * m_ej * v_ej * v_ej;
-    double e_th = e0 / scale;
-    double e_kin = e0 / scale;
-    double v = v_ej;
-
-    double grid_t_0 = exp(log_t_min);
-    double r = grid_t_0 * SECS_DAY * v;
-    double l_peak = 0.0;
-
-    for (int i = 0; i < METZGER_PSO_NGRID; i++) {
-        double t_day = exp(log_t_min + (log_t_max - log_t_min) * (double)i / (double)(METZGER_PSO_NGRID - 1));
-        double t_sec = t_day * SECS_DAY;
-        grid_t[i] = t_day;
-
-        double eth_factor = 0.34 * pow(t_day, 0.74);
-        double eth_log_term = (eth_factor > 1e-10) ? log(1.0 + eth_factor) / eth_factor : 1.0;
-        double eth = 0.36 * (exp(-0.56 * t_day) + eth_log_term);
-
-        double xn = xn0 * exp(-t_sec / 900.0);
-        double eps_neutron = 3.2e14 * xn;
-        double time_term = 0.5 - atan((t_sec - 1.3) / 0.11) / M_PI;
-        if (time_term < 1e-30) time_term = 1e-30;
-        double eps_rp = 2e18 * eth * pow(time_term, 1.3);
-        double l_heat = m_ej * (eps_neutron + eps_rp) / scale;
-
-        double xr = 1.0 - xn0;
-        double xn_decayed = xn0 - xn;
-        double kappa_eff = 0.4 * xn_decayed + kappa_r * xr;
-        double t_diff = 3.0 * kappa_eff * m_ej / (4.0 * M_PI * C_CGS_VAL * v * t_sec) + r / C_CGS_VAL;
-
-        double l_rad = (e_th > 0.0 && t_diff > 0.0) ? e_th / t_diff : 0.0;
-        grid_lrad[i] = l_rad;
-        if (l_rad > l_peak) l_peak = l_rad;
-
-        double l_pdv = (r > 0.0) ? e_th * v / r : 0.0;
-        if (i < METZGER_PSO_NGRID - 1) {
-            double t_next = exp(log_t_min + (log_t_max - log_t_min) * (double)(i + 1) / (double)(METZGER_PSO_NGRID - 1));
-            double dt_sec = (t_next - t_day) * SECS_DAY;
-            e_th += (l_heat - l_pdv - l_rad) * dt_sec;
-            if (e_th < 0.0) e_th = 0.0;
-            e_kin += l_pdv * dt_sec;
-            v = sqrt(2.0 * e_kin * scale / m_ej);
-            if (v > C_CGS_VAL) v = C_CGS_VAL;
-            r += v * dt_sec;
-        }
-    }
-
-    if (l_peak > 0.0 && isfinite(l_peak)) {
-        for (int i = 0; i < METZGER_PSO_NGRID; i++)
-            grid_lrad[i] /= l_peak;
-    }
-
-    return l_peak;
-}
-
-__device__ inline double metzger_kn_interp(
-    const double* grid_t, const double* grid_lrad, double phase)
-{
-    if (phase <= 0.0) return 0.0;
-    if (phase <= grid_t[0]) return grid_lrad[0];
-    if (phase >= grid_t[METZGER_PSO_NGRID - 1]) return grid_lrad[METZGER_PSO_NGRID - 1];
-
-    int lo = 0, hi = METZGER_PSO_NGRID - 1;
-    while (hi - lo > 1) {
-        int mid = (lo + hi) / 2;
-        if (grid_t[mid] < phase) lo = mid;
-        else hi = mid;
-    }
-    double frac = (phase - grid_t[lo]) / (grid_t[hi] - grid_t[lo]);
-    return grid_lrad[lo] + frac * (grid_lrad[hi] - grid_lrad[lo]);
-}
 
 // Metzger kernel: one thread per draw, loops over all times.
 extern "C" __global__ void metzger_kn_eval(
@@ -476,6 +388,18 @@ DEFINE_EVAL_KERNEL(afterglow_eval,      afterglow_at)
 // ===========================================================================
 // Batch PSO cost kernel (used by MultiBazin CPU-loop PSO)
 // ===========================================================================
+//
+// One thread per (source, particle) pair.  Each thread loops over its
+// source's observations and computes the negative log-likelihood (divided
+// by n_obs) — matching PsoCost::cost on the CPU side.
+//
+// Data layout:
+//   all_times, all_flux, all_obs_var, all_upper_flux: concatenated across
+//       sources.  source_offsets[src] .. source_offsets[src+1] gives the
+//       range for source `src`.
+//   all_is_upper: int (0/1) array, same layout.
+//   positions: [n_sources × n_particles × n_params], row-major.
+//   costs (output): [n_sources × n_particles].
 
 extern "C" __global__ void batch_pso_cost(
     const double* __restrict__ all_times,
@@ -512,20 +436,19 @@ extern "C" __global__ void batch_pso_cost(
     double neg_ll = 0.0;
 
     if (model_id == 7) {
-        double t0 = p[3];
-        double phase_max = 0.01;
+        double t_max = all_times[obs_start];
+        for (int i = obs_start + 1; i < obs_end; i++) t_max = fmax(t_max, all_times[i]);
+        LcKnGrid kn;
+        lc_metzger_kn_grid(p, t_max - p[3], &kn);
+        double max_pred = -INFINITY;
         for (int i = obs_start; i < obs_end; i++) {
-            double ph = all_times[i] - t0;
-            if (ph > phase_max) phase_max = ph;
+            if (!all_is_upper[i])
+                max_pred = fmax(max_pred, lc_metzger_kn_interp(&kn, all_times[i] - p[3]));
         }
-        double grid_t[METZGER_PSO_NGRID];
-        double grid_lrad[METZGER_PSO_NGRID];
-        double l_peak = metzger_kn_solve_grid(p, phase_max * 1.05, grid_t, grid_lrad);
-        if (l_peak <= 0.0 || !isfinite(l_peak)) { costs[idx] = 1e99; return; }
+        double kn_scale = lc_metzger_kn_scale(max_pred);
 
         for (int i = obs_start; i < obs_end; i++) {
-            double phase = all_times[i] - t0;
-            double pred = metzger_kn_interp(grid_t, grid_lrad, phase);
+            double pred = kn_scale * lc_metzger_kn_interp(&kn, all_times[i] - p[3]);
             if (!isfinite(pred)) { costs[idx] = 1e99; return; }
             double total_var = all_obs_var[i] + sigma_extra_sq;
             if (all_is_upper[i]) {
@@ -710,47 +633,30 @@ extern "C" __global__ void batch_pso_full(
         double neg_ll = 0.0;
 
         if (model_id == 7) {
-            double t0 = pos[3];
-            double phase_max = 0.01;
+            // MetzgerKN on the CPU's grid (lc_metzger_kn_grid), rescaled to peak at 1
+            // over the detections, as apply_metzger_kn_scale does on the CPU
+            double t_max = obs_t[0];
+            for (int i = 1; i < n_obs; i++) t_max = fmax(t_max, obs_t[i]);
+            LcKnGrid kn;
+            lc_metzger_kn_grid(pos, t_max - pos[3], &kn);
+            double max_pred = -INFINITY;
             for (int i = 0; i < n_obs; i++) {
-                double ph = obs_t[i] - t0;
-                if (ph > phase_max) phase_max = ph;
+                if (!obs_u[i])
+                    max_pred = fmax(max_pred, lc_metzger_kn_interp(&kn, obs_t[i] - pos[3]));
             }
-            double grid_t[METZGER_PSO_NGRID], grid_lrad[METZGER_PSO_NGRID];
-            double l_peak = metzger_kn_solve_grid(pos, phase_max * 1.05, grid_t, grid_lrad);
-            if (l_peak <= 0.0 || !isfinite(l_peak)) {
-                neg_ll = 1e99;
-            } else {
-                // Avoid fixed-size preds array overflow
-                double max_pred = -1e99;
-                for (int i = 0; i < n_obs; i++) {
-                    double phase = obs_t[i] - t0;
-                    double p = metzger_kn_interp(grid_t, grid_lrad, phase);
-                    if (!obs_u[i] && isfinite(p) && p > max_pred)
-                        max_pred = p;
-                }
-                // Compute scale as (1/max_pred) clamped to [0.1, 10.0]
-                double scale = 1.0;
-                if (max_pred > 1e-10 && isfinite(max_pred)) {
-                    scale = 1.0 / max_pred;
-                    if (scale < 0.1) scale = 0.1;
-                    if (scale > 10.0) scale = 10.0;
-                }
-                // Compute likelihood with scaled predictions
-                double se = exp(pos[n_params - 1]);
-                double se_sq = se * se;
-                for (int i = 0; i < n_obs; i++) {
-                    double phase = obs_t[i] - t0;
-                    double pred = metzger_kn_interp(grid_t, grid_lrad, phase) * scale;
-                    if (!isfinite(pred)) { neg_ll = 1e99; break; }
-                    double total_var = obs_v[i] + se_sq;
-                    if (obs_u[i]) {
-                        double z = (obs_uf[i] - pred) / sqrt(total_var);
-                        neg_ll -= log_normal_cdf_d(z);
-                    } else {
-                        double diff = pred - obs_f[i];
-                        neg_ll += diff * diff / total_var + log(total_var);
-                    }
+            double kn_scale = lc_metzger_kn_scale(max_pred);
+            double se = exp(pos[n_params - 1]);
+            double se_sq = se * se;
+            for (int i = 0; i < n_obs; i++) {
+                double pred = kn_scale * lc_metzger_kn_interp(&kn, obs_t[i] - pos[3]);
+                if (!isfinite(pred)) { neg_ll = 1e99; break; }
+                double total_var = obs_v[i] + se_sq;
+                if (obs_u[i]) {
+                    double z = (obs_uf[i] - pred) / sqrt(total_var);
+                    neg_ll -= log_normal_cdf_d(z);
+                } else {
+                    double diff = pred - obs_f[i];
+                    neg_ll += diff * diff / total_var + log(total_var);
                 }
             }
         } else {
@@ -1182,48 +1088,31 @@ extern "C" __global__ void batch_pso_full_kn(
         double w = w_max_pso - (w_max_pso - w_min_pso) * (double)iter * inv_max_iters;
 
         // Cost evaluation: MetzgerKN ODE only
-        double t0 = pos[3];
-        double phase_max = 0.01;
+        // MetzgerKN on the CPU's grid (lc_metzger_kn_grid), rescaled to peak at 1
+        // over the detections, as apply_metzger_kn_scale does on the CPU
+        double t_max = obs_t[0];
+        for (int i = 1; i < n_obs; i++) t_max = fmax(t_max, obs_t[i]);
+        LcKnGrid kn;
+        lc_metzger_kn_grid(pos, t_max - pos[3], &kn);
+        double max_pred = -INFINITY;
         for (int i = 0; i < n_obs; i++) {
-            double ph = obs_t[i] - t0;
-            if (ph > phase_max) phase_max = ph;
+            if (!obs_u[i])
+                max_pred = fmax(max_pred, lc_metzger_kn_interp(&kn, obs_t[i] - pos[3]));
         }
-        double grid_t[METZGER_PSO_NGRID], grid_lrad[METZGER_PSO_NGRID];
+        double kn_scale = lc_metzger_kn_scale(max_pred);
         double neg_ll = 0.0;
-        double l_peak = metzger_kn_solve_grid(pos, phase_max * 1.05, grid_t, grid_lrad);
-        if (l_peak <= 0.0 || !isfinite(l_peak)) {
-            neg_ll = 1e99;
-        } else {
-            // Avoid fixed-size preds array overflow
-            double max_pred = -1e99;
-            for (int i = 0; i < n_obs; i++) {
-                double phase = obs_t[i] - t0;
-                double p = metzger_kn_interp(grid_t, grid_lrad, phase);
-                if (!obs_u[i] && isfinite(p) && p > max_pred)
-                    max_pred = p;
-            }
-            // Compute scale as (1/max_pred) clamped to [0.1, 10.0]
-            double scale = 1.0;
-            if (max_pred > 1e-10 && isfinite(max_pred)) {
-                scale = 1.0 / max_pred;
-                if (scale < 0.1) scale = 0.1;
-                if (scale > 10.0) scale = 10.0;
-            }
-            // Compute likelihood with scaled predictions
-            double se = exp(pos[n_params - 1]);
-            double se_sq = se * se;
-            for (int i = 0; i < n_obs; i++) {
-                double phase = obs_t[i] - t0;
-                double pred = metzger_kn_interp(grid_t, grid_lrad, phase) * scale;
-                if (!isfinite(pred)) { neg_ll = 1e99; break; }
-                double total_var = obs_v[i] + se_sq;
-                if (obs_u[i]) {
-                    double z = (obs_uf[i] - pred) / sqrt(total_var);
-                    neg_ll -= log_normal_cdf_d(z);
-                } else {
-                    double diff = pred - obs_f[i];
-                    neg_ll += diff * diff / total_var + log(total_var);
-                }
+        double se = exp(pos[n_params - 1]);
+        double se_sq = se * se;
+        for (int i = 0; i < n_obs; i++) {
+            double pred = kn_scale * lc_metzger_kn_interp(&kn, obs_t[i] - pos[3]);
+            if (!isfinite(pred)) { neg_ll = 1e99; break; }
+            double total_var = obs_v[i] + se_sq;
+            if (obs_u[i]) {
+                double z = (obs_uf[i] - pred) / sqrt(total_var);
+                neg_ll -= log_normal_cdf_d(z);
+            } else {
+                double diff = pred - obs_f[i];
+                neg_ll += diff * diff / total_var + log(total_var);
             }
         }
 

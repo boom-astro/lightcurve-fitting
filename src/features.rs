@@ -10,11 +10,14 @@ use rayon::prelude::*;
 
 use crate::common::BandData;
 use crate::gp2d::{fit_gp_2d_with_thermal, Gp2dResult, Gp2dThermalResult};
+use crate::gp2d::get_band_wavelength;
 use crate::nonparametric::{fit_nonparametric, NonparametricBandResult};
 use crate::parametric::{
     fit_parametric, MultiBazinResult, ParametricBandResult, SviModelName, UncertaintyMethod,
 };
+use crate::sparse_gp::DenseGP;
 use crate::thermal::{fit_thermal, ThermalResult};
+use crate::sbpl::{fit_sbpl, SbplResult};
 
 /// Alias for the feature map type.
 pub type FeatureMap = HashMap<String, Option<f64>>;
@@ -261,6 +264,112 @@ fn extract_np_features(np_results: &[NonparametricBandResult], ref_band: &str) -
 }
 
 // ---------------------------------------------------------------------------
+// Spectral-index (beta) features — source-level, requires trained GPs
+// ---------------------------------------------------------------------------
+
+const C_ANGSTROM_PER_SEC: f64 = 2.997_924_58e18;
+
+fn band_frequency_hz(band: &str) -> Option<f64> {
+    let lambda = get_band_wavelength(band)?;
+    if lambda <= 0.0 || !lambda.is_finite() { return None; }
+    Some(C_ANGSTROM_PER_SEC / lambda)
+}
+
+fn beta_median_of(vals: &mut [f64]) -> f64 {
+    if vals.is_empty() { return f64::NAN; }
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let n = vals.len();
+    if n % 2 == 1 { vals[n / 2] } else { 0.5 * (vals[n / 2 - 1] + vals[n / 2]) }
+}
+
+fn ols_slope(xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.len() < 2 || ys.len() != xs.len() { return f64::NAN; }
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let (mut cov, mut var) = (0.0f64, 0.0f64);
+    for i in 0..xs.len() {
+        let dx = xs[i] - mx;
+        cov += dx * (ys[i] - my);
+        var += dx * dx;
+    }
+    if var <= 1e-20 { f64::NAN } else { cov / var }
+}
+
+/// Compute spectral-index beta features using trained per-band GPs.
+///
+/// Evaluates all band GPs on a shared 50-point time grid, then at each
+/// epoch fits log(F_nu) = const + beta*log(nu) across available bands.
+fn extract_beta_features(
+    gps: &HashMap<String, DenseGP>,
+    t_min: f64,
+    t_max: f64,
+) -> FeatureMap {
+    let mut f = FeatureMap::new();
+    for k in ["np_beta_std", "np_beta_median"] {
+        f.insert(k.into(), None);
+    }
+
+    if gps.len() < 2 || !t_min.is_finite() || !t_max.is_finite() || t_max <= t_min {
+        return f;
+    }
+
+    let n = 50usize;
+    let times: Vec<f64> = (0..n)
+        .map(|i| t_min + i as f64 * (t_max - t_min) / (n - 1) as f64)
+        .collect();
+
+    // Collect (log_nu, predictions) for bands with known frequencies
+    let mut log_freqs: Vec<f64> = Vec::new();
+    let mut all_preds: Vec<Vec<f64>> = Vec::new();
+    for (band, gp) in gps {
+        if let Some(nu) = band_frequency_hz(band) {
+            log_freqs.push(nu.ln());
+            all_preds.push(gp.predict(&times));
+        }
+    }
+    if log_freqs.len() < 2 { return f; }
+
+    // Per-epoch beta: slope of log(F_nu) vs log(nu)
+    let mut betas: Vec<f64> = Vec::with_capacity(n);
+    let mut achromatic_mag: Vec<f64> = Vec::with_capacity(n);
+    for t_idx in 0..n {
+        let mut lnu: Vec<f64> = Vec::new();
+        let mut lfnu: Vec<f64> = Vec::new();
+        let mut mags: Vec<f64> = Vec::new();
+        for b_idx in 0..log_freqs.len() {
+            let mag = all_preds[b_idx][t_idx];
+            if !mag.is_finite() { continue; }
+            let fnu = 10f64.powf(-0.4 * mag);
+            if fnu <= 0.0 || !fnu.is_finite() { continue; }
+            lnu.push(log_freqs[b_idx]);
+            lfnu.push(fnu.ln());
+            mags.push(mag);
+        }
+        betas.push(if lnu.len() >= 2 { ols_slope(&lnu, &lfnu) } else { f64::NAN });
+        if !mags.is_empty() {
+            mags.sort_by(|a, b| a.total_cmp(b));
+            let nm = mags.len();
+            achromatic_mag.push(if nm % 2 == 1 { mags[nm/2] } else { 0.5*(mags[nm/2-1]+mags[nm/2]) });
+        } else {
+            achromatic_mag.push(f64::NAN);
+        }
+    }
+
+    let mut finite_betas: Vec<f64> = betas.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite_betas.len() < 2 { return f; }
+
+    let beta_median = beta_median_of(&mut finite_betas);
+    let n_b = finite_betas.len() as f64;
+    let beta_mean = finite_betas.iter().sum::<f64>() / n_b;
+    let beta_std = (finite_betas.iter().map(|v| (v - beta_mean).powi(2)).sum::<f64>() / n_b).sqrt();
+
+    f.insert("np_beta_std".into(), if beta_std.is_finite() { Some(beta_std) } else { None });
+    f.insert("np_beta_median".into(), if beta_median.is_finite() { Some(beta_median) } else { None });
+    f
+}
+
+// ---------------------------------------------------------------------------
 // Parametric features
 // ---------------------------------------------------------------------------
 
@@ -391,6 +500,46 @@ fn extract_thermal_features(thermal: &Option<ThermalResult>) -> FeatureMap {
 }
 
 // ---------------------------------------------------------------------------
+// SBPL features
+// ---------------------------------------------------------------------------
+
+fn extract_sbpl_features(sbpl: &Option<SbplResult>) -> FeatureMap {
+    let mut f = FeatureMap::new();
+    match sbpl {
+        Some(s) => {
+            f.insert("sbpl_alpha1".into(), s.alpha1);
+            f.insert("sbpl_alpha2".into(), s.alpha2);
+            f.insert("sbpl_beta".into(), s.beta);
+            f.insert("sbpl_d".into(), s.d);
+            f.insert("sbpl_loga".into(), s.loga);
+            f.insert("sbpl_tb".into(), s.tb);
+            f.insert("sbpl_t0".into(), s.t0);
+            f.insert("sbpl_alpha1_err".into(), s.alpha1_err);
+            f.insert("sbpl_alpha2_err".into(), s.alpha2_err);
+            f.insert("sbpl_beta_err".into(), s.beta_err);
+            f.insert("sbpl_d_err".into(), s.d_err);
+            f.insert("sbpl_loga_err".into(), s.loga_err);
+            f.insert("sbpl_tb_err".into(), s.tb_err);
+            f.insert("sbpl_t0_err".into(), s.t0_err);
+            f.insert("sbpl_reduced_chi2".into(), s.reduced_chi2);
+            f.insert("sbpl_n_obs".into(), Some(s.n_obs as f64));
+            f.insert("sbpl_n_bands".into(), Some(s.n_bands as f64));
+        }
+        None => {
+            for key in [
+                "sbpl_alpha1", "sbpl_alpha2", "sbpl_beta", "sbpl_d", "sbpl_loga", "sbpl_tb", "sbpl_t0",
+                "sbpl_alpha1_err", "sbpl_alpha2_err", "sbpl_beta_err", "sbpl_d_err", "sbpl_loga_err",
+                "sbpl_tb_err", "sbpl_t0_err", "sbpl_reduced_chi2",
+                "sbpl_n_obs", "sbpl_n_bands",
+            ] {
+                f.insert(key.to_string(), None);
+            }
+        }
+    }
+    f
+}
+
+// ---------------------------------------------------------------------------
 // 2D GP features
 // ---------------------------------------------------------------------------
 
@@ -478,6 +627,7 @@ pub fn extract_features_from_results(
     np_results: &[NonparametricBandResult],
     param_results: &[ParametricBandResult],
     thermal: &Option<ThermalResult>,
+    sbpl: &Option<SbplResult>,
     gp2d_result: &Option<Gp2dResult>,
     gp2d_thermal: &Option<Gp2dThermalResult>,
     ref_band: &str,
@@ -486,6 +636,7 @@ pub fn extract_features_from_results(
     features.extend(extract_np_features(np_results, ref_band));
     features.extend(extract_param_features(param_results, ref_band));
     features.extend(extract_thermal_features(thermal));
+    features.extend(extract_sbpl_features(sbpl));
     features.extend(extract_gp2d_features(gp2d_result, gp2d_thermal));
     features
 }
@@ -504,6 +655,14 @@ pub fn extract_features(
     let (np_results, gps) = fit_nonparametric(mag_bands);
     let thermal = fit_thermal(mag_bands, Some(&gps));
 
+    // SBPL multi-band fit (flux space)
+    let sbpl = fit_sbpl(flux_bands);
+
+    // Spectral-index beta (cross-band, requires GPs)
+    let t_min = mag_bands.values().flat_map(|b| b.times.iter().copied()).fold(f64::INFINITY, f64::min);
+    let t_max = mag_bands.values().flat_map(|b| b.times.iter().copied()).fold(f64::NEG_INFINITY, f64::max);
+    let beta_features = extract_beta_features(&gps, t_min, t_max);
+
     // Parametric (fit_all_models=true for per-model chi2)
     let param_results = fit_parametric(flux_bands, true, UncertaintyMethod::Svi);
 
@@ -513,7 +672,10 @@ pub fn extract_features(
         None => (None, None),
     };
 
-    extract_features_from_results(&np_results, &param_results, &thermal, &gp2d_result, &gp2d_thermal, ref_band)
+    extract_features_from_results(&np_results, &param_results, &thermal, &sbpl, &gp2d_result, &gp2d_thermal, ref_band)
+        .into_iter()
+        .chain(beta_features)
+        .collect()
 }
 
 /// Run all fitters and extract features for many sources in parallel (Layer 3).

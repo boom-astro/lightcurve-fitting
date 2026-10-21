@@ -20,7 +20,7 @@ use ndarray::Array2;
 use ndarray_npy::NpzReader;
 
 use lightcurve_fitting::{
-    BandData, build_flux_bands, build_mag_bands,
+    BandData, build_flux_bands, build_mag_bands, fit_sbpl,
     fit_nonparametric_batch_gpu, fit_gp_2d_batch_gpu,
     finalize_all_models_with_gpu_svi, svi_prior_for_model, svi_model_meta,
     GpuPsoBandResult, SviBatchInput, SviModelName,
@@ -750,8 +750,10 @@ fn main() {
                 None => (None, None),
             };
 
+            let sbpl = fit_sbpl(&valid_flux_bands[vi]);
+
             let features = extract_features_from_results(
-                np_bands, param_bands, thermal,
+                np_bands, param_bands, thermal, &sbpl,
                 &gp2d_result, &gp2d_thermal,
                 &cli.ref_band,
             );

@@ -1,0 +1,45 @@
+name: GPU builds
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cuda:
+    name: CUDA (compile only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No GPU on hosted runners, so this only checks that the kernels, their
+      # Rust bindings and the extract-features binary compile and link.
+      - name: Build with CUDA kernels
+        env:
+          RUSTFLAGS: -L /usr/local/cuda/lib64
+        run: cargo build --release --features cuda,cli --bins --tests
+
+  metal:
+    name: Metal
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Metal toolchain
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Metal tests
+        run: cargo test --release --features metal --test test_metal
+      - name: Metal tests without fast-math
+        env:
+          LCF_METAL_STRICT_MATH: "1"
+        run: cargo test --release --features metal --test test_metal

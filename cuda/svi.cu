@@ -2,7 +2,7 @@
 //
 // One BLOCK (128 threads) per source/band. All 128 threads cooperate on the
 // observation loop (the inner hot loop), then thread 0 does the Adam update.
-// Uses fused model eval+gradient (finite-diff fallback for MetzgerKN only),
+// Uses fused model eval+gradient (finite-diff gradient for MetzgerKN only),
 // Reparameterization trick: theta = mu + sigma * eps, eps ~ N(0,1).
 
 #include "models_device.h"
@@ -54,7 +54,53 @@ __device__ inline double svi_block_reduce_sum(double val, volatile double* s_war
         s_warp_buf[0] = sum;
     }
     __syncthreads();
-    return s_warp_buf[0]; // broadcast to all threads
+    double result = s_warp_buf[0]; // broadcast to all threads
+    // Every thread must read the result before the next reduction overwrites it
+    __syncthreads();
+    return result;
+}
+
+// Block-level max, valid in every thread
+__device__ inline double svi_block_reduce_max(double val, volatile double* s_warp_buf) {
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmax(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    if (lane == 0) s_warp_buf[warp_id] = val;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double m = s_warp_buf[0];
+        for (int w = 1; w < SVI_WARP_COUNT; w++) m = fmax(m, s_warp_buf[w]);
+        s_warp_buf[0] = m;
+    }
+    __syncthreads();
+    double result = s_warp_buf[0];
+    __syncthreads();
+    return result;
+}
+
+// Log-likelihood of one observation, with its derivatives with respect to the
+// prediction and to log sigma_extra.
+__device__ inline double svi_obs_loglik(
+    double flux, double obs_var, int is_upper, double upper_flux, double pred, double se_sq,
+    double* dll_dpred, double* dll_dlse)
+{
+    double total_var = obs_var + se_sq;
+    double sigma_total = sqrt(total_var);
+    double inv_total = 1.0 / total_var;
+    if (is_upper) {
+        double z = (upper_flux - pred) / sigma_total;
+        double phi_z = exp(-0.5 * z * z) / sqrt(2.0 * M_PI);
+        double cdf_z = fmax(0.5 * (1.0 + lc_erf_approx(z * M_SQRT1_2)), 1e-300);
+        *dll_dpred = -phi_z / (cdf_z * sigma_total);
+        *dll_dlse = (phi_z / cdf_z) * (-(upper_flux - pred) * se_sq / (sigma_total * total_var));
+        return lc_log_normal_cdf_d(z);
+    }
+    double residual = flux - pred;
+    double r2 = residual * residual;
+    *dll_dpred = residual * inv_total;
+    *dll_dlse = (r2 * inv_total * inv_total - inv_total) * se_sq;
+    return -0.5 * (r2 * inv_total + log(2.0 * M_PI * total_var));
 }
 
 // ===========================================================================
@@ -184,6 +230,13 @@ extern "C" __global__ void batch_svi_fit(
     const double* obs_uf = use_cache ? s_upper_flux : (all_upper_flux + obs_start);
     const int*    obs_u  = use_cache ? s_is_upper   : (all_is_upper + obs_start);
 
+    // MetzgerKN grids run out to the source's latest observation.
+    double t_max = -INFINITY;
+    if (model_id == 7) {
+        for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) t_max = fmax(t_max, all_times[obs_start + i]);
+        t_max = svi_block_reduce_max(t_max, s_warp_buf);
+    }
+
     // Thread 0 initializes shared variational state
     if (tid == 0) {
         for (int j = 0; j < np; j++) {
@@ -294,61 +347,95 @@ extern "C" __global__ void batch_svi_fit(
             double local_dll[SVI_MAX_PARAMS];
             for (int j = 0; j < np; j++) local_dll[j] = 0.0;
 
-            for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) {
-                double t_val = obs_t[i];
-
-                // Fused eval+grad
-                bool ok;
-                double pred = lc_eval_model_at_and_grad(model_id, theta, t_val, model_grad, &ok);
-                if (!ok) {
-                    // MetzgerKN finite-diff fallback
-                    pred = lc_eval_model_at(model_id, theta, t_val);
-                    if (!isfinite(pred)) continue;
-                    double theta_pert[SVI_MAX_PARAMS];
-                    for (int k = 0; k < np; k++) theta_pert[k] = theta[k];
-                    for (int j = 0; j < np; j++) {
-                        if (j == se_idx) { model_grad[j] = 0.0; continue; }
-                        double h = fmax(1e-5, 1e-5 * fabs(theta[j]));
-                        theta_pert[j] = theta[j] + h;
-                        double pred_pert = lc_eval_model_at(model_id, theta_pert, t_val);
-                        theta_pert[j] = theta[j];
-                        model_grad[j] = isfinite(pred_pert) ? (pred_pert - pred) / h : 0.0;
-                    }
-                    model_grad[se_idx] = 0.0;
-                } else {
-                    if (!isfinite(pred)) continue;
+            if (model_id == 7) {
+                // Rescaled as in svi_fit on the CPU: the scale is held fixed in
+                // the gradient, and samples where the clamp moves it by more
+                // than half are skipped. kn_scale is block-uniform, so every
+                // thread takes the same branch.
+                LcKnGrid kn;
+                lc_metzger_kn_grid(theta, t_max - theta[3], &kn);
+                double max_pred = -INFINITY;
+                for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) {
+                    if (!obs_u[i])
+                        max_pred = fmax(max_pred, lc_metzger_kn_interp(&kn, obs_t[i] - theta[3]));
+                }
+                max_pred = svi_block_reduce_max(max_pred, s_warp_buf);
+                double kn_scale = lc_metzger_kn_scale(max_pred);
+                if (max_pred > 1e-10 && isfinite(max_pred)
+                    && fabs(1.0 / max_pred - kn_scale) * max_pred > 0.5) {
+                    continue;
                 }
 
-                double total_var = obs_v[i] + se_sq;
-                double inv_sigma = 1.0 / sqrt(total_var);
-                double inv_total = inv_sigma * inv_sigma;
+                for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) {
+                    double pred = kn_scale * lc_metzger_kn_interp(&kn, obs_t[i] - theta[3]);
+                    if (!isfinite(pred)) continue;
+                    double dll_dpred, dll_dlse;
+                    local_log_lik += svi_obs_loglik(obs_f[i], obs_v[i], obs_u[i], obs_uf[i],
+                                                    pred, se_sq, &dll_dpred, &dll_dlse);
+                    local_dll[se_idx] += dll_dlse;
+                }
 
-                if (obs_u[i]) {
-                    double z = (obs_uf[i] - pred) * inv_sigma;
-                    local_log_lik += lc_log_normal_cdf_d(z);
-
-                    double phi_z = exp(-0.5 * z * z) / sqrt(2.0 * M_PI);
-                    double cdf_z = fmax(0.5 * (1.0 + lc_erf_approx(z * M_SQRT1_2)), 1e-300);
-                    double dll_dpred = -phi_z * inv_sigma / cdf_z;
-
-                    for (int j = 0; j < np; j++) {
-                        if (j != se_idx && isfinite(model_grad[j]))
-                            local_dll[j] += dll_dpred * model_grad[j];
+                double theta_pert[SVI_MAX_PARAMS];
+                for (int k = 0; k < np; k++) theta_pert[k] = theta[k];
+                for (int j = 0; j < np; j++) {
+                    if (j == se_idx) continue;
+                    double h = fmax(1e-5, 1e-5 * fabs(theta[j]));
+                    theta_pert[j] = theta[j] + h;
+                    LcKnGrid kn_pert;
+                    lc_metzger_kn_grid(theta_pert, t_max - theta_pert[3], &kn_pert);
+                    for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) {
+                        double base = lc_metzger_kn_interp(&kn, obs_t[i] - theta[3]);
+                        double pred = kn_scale * base;
+                        if (!isfinite(pred)) continue;
+                        double grad = kn_scale * (lc_metzger_kn_interp(&kn_pert, obs_t[i] - theta_pert[3]) - base) / h;
+                        if (!isfinite(grad)) continue;
+                        double dll_dpred, dll_dlse;
+                        svi_obs_loglik(obs_f[i], obs_v[i], obs_u[i], obs_uf[i],
+                                       pred, se_sq, &dll_dpred, &dll_dlse);
+                        local_dll[j] += dll_dpred * grad;
                     }
+                    theta_pert[j] = theta[j];
+                }
+            } else {
+                for (int i = tid; i < n_obs; i += SVI_BLOCK_SIZE) {
+                    double t_val = obs_t[i];
 
-                    double dz_dlse = -(obs_uf[i] - pred) * se_sq * inv_sigma * inv_total;
-                    local_dll[se_idx] += (phi_z / cdf_z) * dz_dlse;
-                } else {
-                    double residual = obs_f[i] - pred;
-                    double r2 = residual * residual;
-                    local_log_lik += -0.5 * (r2 * inv_total + log(2.0 * M_PI * total_var));
+                    // Fused eval+grad (analytic models)
+                    bool ok;
+                    double pred = lc_eval_model_at_and_grad(model_id, theta, t_val, model_grad, &ok);
+                    if (!isfinite(pred)) continue;
 
-                    for (int j = 0; j < np; j++) {
-                        if (j != se_idx && isfinite(model_grad[j]))
-                            local_dll[j] += residual * inv_total * model_grad[j];
+                    double total_var = obs_v[i] + se_sq;
+                    double inv_sigma = 1.0 / sqrt(total_var);
+                    double inv_total = inv_sigma * inv_sigma;
+
+                    if (obs_u[i]) {
+                        double z = (obs_uf[i] - pred) * inv_sigma;
+                        local_log_lik += lc_log_normal_cdf_d(z);
+
+                        double phi_z = exp(-0.5 * z * z) / sqrt(2.0 * M_PI);
+                        double cdf_z = fmax(0.5 * (1.0 + lc_erf_approx(z * M_SQRT1_2)), 1e-300);
+                        double dll_dpred = -phi_z * inv_sigma / cdf_z;
+
+                        for (int j = 0; j < np; j++) {
+                            if (j != se_idx && isfinite(model_grad[j]))
+                                local_dll[j] += dll_dpred * model_grad[j];
+                        }
+
+                        double dz_dlse = -(obs_uf[i] - pred) * se_sq * inv_sigma * inv_total;
+                        local_dll[se_idx] += (phi_z / cdf_z) * dz_dlse;
+                    } else {
+                        double residual = obs_f[i] - pred;
+                        double r2 = residual * residual;
+                        local_log_lik += -0.5 * (r2 * inv_total + log(2.0 * M_PI * total_var));
+
+                        for (int j = 0; j < np; j++) {
+                            if (j != se_idx && isfinite(model_grad[j]))
+                                local_dll[j] += residual * inv_total * model_grad[j];
+                        }
+
+                        local_dll[se_idx] += (r2 * inv_total * inv_total - inv_total) * se_sq;
                     }
-
-                    local_dll[se_idx] += (r2 * inv_total * inv_total - inv_total) * se_sq;
                 }
             }
 

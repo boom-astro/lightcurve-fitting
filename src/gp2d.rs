@@ -512,7 +512,7 @@ pub fn get_band_wavelength(band: &str) -> Option<f64> {
 ///
 /// Returns (Gp2dResult, Gp2dThermalResult) per source, or None for sources
 /// with insufficient data.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn fit_gp_2d_batch_gpu(
     gpu: &crate::gpu::GpuContext,
     sources: &[HashMap<String, BandData>],
