@@ -232,10 +232,12 @@ fn bazin_flux_grad(params: &[f64], t: f64, out: &mut [f64]) {
 
 #[inline]
 fn bazin_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
-    let a = params[0].exp();
-    let t0 = params[2];
-    let tau_rise = params[3].exp();
-    let tau_fall = params[4].exp();
+    bazin_eval_and_grad_with(params[0].exp(), params[1], params[2], params[3].exp(), params[4].exp(), t, out)
+}
+
+/// `bazin_flux_eval_and_grad` with exp(log_A), exp(log_tau_*) precomputed.
+#[inline]
+fn bazin_eval_and_grad_with(a: f64, b: f64, t0: f64, tau_rise: f64, tau_fall: f64, t: f64, out: &mut [f64]) -> f64 {
     let dt = t - t0;
     let e_fall = (-dt / tau_fall).exp();
     let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
@@ -246,7 +248,7 @@ fn bazin_flux_eval_and_grad(params: &[f64], t: f64, out: &mut [f64]) -> f64 {
     out[3] = -base * (1.0 - sig) * dt / tau_rise;
     out[4] = base * dt / tau_fall;
     out[5] = 0.0;
-    base + params[1]
+    base + b
 }
 
 #[inline]
@@ -1137,6 +1139,15 @@ fn eval_model_batch_into(model: SviModel, params: &[f64], times: &[f64], out: &m
     if model.is_sequential() {
         let batch = metzger_kn_eval_batch(params, times);
         out[..times.len()].copy_from_slice(&batch);
+    } else if model == SviModel::Bazin {
+        let (a, b, t0) = (params[0].exp(), params[1], params[2]);
+        let (tau_rise, tau_fall) = (params[3].exp(), params[4].exp());
+        for (i, &t) in times.iter().enumerate() {
+            let dt = t - t0;
+            let e_fall = (-dt / tau_fall).exp();
+            let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
+            out[i] = a * e_fall * sig + b;
+        }
     } else {
         for (i, &t) in times.iter().enumerate() {
             out[i] = eval_model(model, params, t);
@@ -1204,6 +1215,14 @@ fn log_normal_cdf(x: f64) -> f64 {
     (phi.max(1e-300)).ln()
 }
 
+/// phi(x)/Phi(x) = d/dx log Phi(x). Computed
+/// from `log_normal_cdf` so it stays finite deep in the lower tail, where
+/// `0.5 * (1 + erf(x/√2))` cancels to zero.
+#[inline]
+fn normal_pdf_over_cdf(x: f64) -> f64 {
+    (-0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln() - log_normal_cdf(x)).exp()
+}
+
 // ---------------------------------------------------------------------------
 // MultiBazin: variable-component sum of Bazin pulses
 // ---------------------------------------------------------------------------
@@ -1220,32 +1239,21 @@ const MULTI_BAZIN_MAX_K: usize = 4;
 /// Params per Bazin component (log_A, t0, log_tau_rise, log_tau_fall).
 const MULTI_BAZIN_COMP_PARAMS: usize = 4;
 
-/// Evaluate a single Bazin component (no baseline).
-#[inline]
-fn bazin_component_eval(log_a: f64, t0: f64, log_tau_rise: f64, log_tau_fall: f64, t: f64) -> f64 {
-    let a = log_a.exp();
-    let tau_rise = log_tau_rise.exp();
-    let tau_fall = log_tau_fall.exp();
-    let dt = t - t0;
-    let e_fall = (-dt / tau_fall).exp();
-    let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
-    a * e_fall * sig
-}
-
-/// Evaluate MultiBazin model: sum of K components + baseline B.
-fn multi_bazin_eval(params: &[f64], k: usize, t: f64) -> f64 {
-    let mut sum = 0.0;
+fn multi_bazin_eval_batch(params: &[f64], k: usize, times: &[f64], out: &mut [f64]) {
+    // exp(log_A), exp(log_tau_*) per component, hoisted out of the time loop
+    let mut comps = [(0.0, 0.0, 0.0, 0.0); MULTI_BAZIN_MAX_K];
     for c in 0..k {
         let off = c * MULTI_BAZIN_COMP_PARAMS;
-        sum += bazin_component_eval(params[off], params[off + 1], params[off + 2], params[off + 3], t);
+        comps[c] = (params[off].exp(), params[off + 1], params[off + 2].exp(), params[off + 3].exp());
     }
-    let b_idx = k * MULTI_BAZIN_COMP_PARAMS;
-    sum + params[b_idx] // B
-}
-
-fn multi_bazin_eval_batch(params: &[f64], k: usize, times: &[f64], out: &mut [f64]) {
+    let b = params[k * MULTI_BAZIN_COMP_PARAMS];
     for (i, &t) in times.iter().enumerate() {
-        out[i] = multi_bazin_eval(params, k, t);
+        let mut sum = 0.0;
+        for &(a, t0, tau_rise, tau_fall) in &comps[..k] {
+            let dt = t - t0;
+            sum += a * (-dt / tau_fall).exp() * (1.0 / (1.0 + (-dt / tau_rise).exp()));
+        }
+        out[i] = sum + b;
     }
 }
 
@@ -1307,9 +1315,157 @@ fn multi_bazin_cost(
     neg_ll / n
 }
 
+/// MultiBazin cost (same as `multi_bazin_cost`) with an analytic gradient,
+/// for the L-BFGS search paths.
+struct MultiBazinCost<'a> {
+    k: usize,
+    times: &'a [f64],
+    flux: &'a [f64],
+    obs_var: &'a [f64],
+    is_upper: &'a [bool],
+    upper_flux: &'a [f64],
+}
+
+impl LocalObjective for MultiBazinCost<'_> {
+    fn n_obs(&self) -> usize {
+        self.times.len()
+    }
+
+    fn value(&self, p: &[f64], buf: &mut [f64]) -> f64 {
+        multi_bazin_cost(p, self.k, self.times, self.flux, self.obs_var, self.is_upper, self.upper_flux, buf)
+    }
+
+    fn value_and_grad(&self, p: &[f64], grad: &mut [f64], dpred: &mut [f64]) -> f64 {
+        let k = self.k;
+        let b_idx = k * MULTI_BAZIN_COMP_PARAMS;
+        let se_idx = b_idx + 1;
+        let sigma_extra_sq = (2.0 * p[se_idx]).exp();
+        let n = self.times.len().max(1) as f64;
+        for g in grad.iter_mut() {
+            *g = 0.0;
+        }
+        let mut comps = [(0.0, 0.0, 0.0, 0.0); MULTI_BAZIN_MAX_K];
+        for c in 0..k {
+            let off = c * MULTI_BAZIN_COMP_PARAMS;
+            comps[c] = (p[off].exp(), p[off + 1], p[off + 2].exp(), p[off + 3].exp());
+        }
+        let mut neg_ll = 0.0;
+        for i in 0..self.times.len() {
+            let t = self.times[i];
+            // Prediction and d(pred)/d(component params)
+            let mut pred = p[b_idx];
+            for (c, &(a, t0, tau_rise, tau_fall)) in comps[..k].iter().enumerate() {
+                let off = c * MULTI_BAZIN_COMP_PARAMS;
+                let dt = t - t0;
+                let sig = 1.0 / (1.0 + (-dt / tau_rise).exp());
+                let f = a * (-dt / tau_fall).exp() * sig;
+                pred += f;
+                dpred[off] = f;
+                dpred[off + 1] = f * (1.0 / tau_fall - (1.0 - sig) / tau_rise);
+                dpred[off + 2] = -f * (1.0 - sig) * dt / tau_rise;
+                dpred[off + 3] = f * dt / tau_fall;
+            }
+            dpred[b_idx] = 1.0;
+            if !pred.is_finite() || dpred[..b_idx].iter().any(|d| !d.is_finite()) {
+                for g in grad.iter_mut() {
+                    *g = 0.0;
+                }
+                return 1e99;
+            }
+            let total_var = self.obs_var[i] + sigma_extra_sq;
+            let (scale, d_var) = if self.is_upper[i] {
+                let sqrt_var = total_var.sqrt();
+                let z = (self.upper_flux[i] - pred) / sqrt_var;
+                neg_ll -= log_normal_cdf(z);
+                let ratio = normal_pdf_over_cdf(z);
+                (ratio / sqrt_var, ratio * z / (2.0 * total_var))
+            } else {
+                let diff = pred - self.flux[i];
+                neg_ll += diff * diff / total_var + total_var.ln();
+                (2.0 * diff / total_var, -diff * diff / (total_var * total_var) + 1.0 / total_var)
+            };
+            for j in 0..=b_idx {
+                grad[j] += scale * dpred[j];
+            }
+            grad[se_idx] += d_var * 2.0 * sigma_extra_sq;
+        }
+        for g in grad.iter_mut() {
+            *g /= n;
+        }
+        neg_ll / n
+    }
+}
+
+/// Starting points for the L-BFGS MultiBazin search. K=1: the Bazin fit and
+/// pulses ending at the brightest detection; K>1: the greedy residual seed with a few
+/// rise/fall times for the new component.
+fn multi_bazin_seeds(data: &BandFitData, k: usize, init: Option<&[f64]>, bazin_fit: Option<&[f64]>, lo: &[f64], hi: &[f64]) -> Vec<Vec<f64>> {
+    let clamp = |mut v: Vec<f64>| {
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = x.clamp(lo[i], hi[i]);
+        }
+        v
+    };
+    let mut seeds = Vec::new();
+    if k == 1 {
+        if let Some(b) = bazin_fit {
+            // Bazin params are [log_A, B, t0, log_tau_rise, log_tau_fall, log_se]
+            seeds.push(clamp(vec![b[0], b[2], b[3], b[4], b[1], b[5]]));
+        }
+        let peak = (0..data.times.len())
+            .filter(|&i| !data.is_upper[i])
+            .max_by(|&a, &b| data.flux[a].partial_cmp(&data.flux[b]).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(pi) = peak {
+            let (t_peak, log_peak) = (data.times[pi], data.flux[pi].max(1e-3).ln());
+            for (dt, log_rise, log_fall) in [(-5.0, 0.5, 2.5), (-15.0, 1.5, 3.5), (0.0, 0.0, 1.5)] {
+                // Peak of exp(-dt/tf)·sigmoid(dt/tr) is ≈ the pulse amplitude; lift log_A by ~ln 2
+                seeds.push(clamp(vec![log_peak + 0.7, t_peak + dt, log_rise, log_fall, 0.0, -3.0]));
+            }
+        }
+    } else if let Some(init) = init {
+        let off = (k - 1) * MULTI_BAZIN_COMP_PARAMS;
+        seeds.push(init.to_vec());
+        for (log_rise, log_fall) in [(0.0, 2.0), (1.5, 3.0)] {
+            let mut s = init.to_vec();
+            s[off + 2] = log_rise;
+            s[off + 3] = log_fall;
+            // Bazin peaks ~one rise time after t0
+            s[off + 1] -= log_rise.exp();
+            seeds.push(clamp(s));
+        }
+    }
+    seeds
+}
+
+/// L-BFGS search for one K from every seed; PSO if there are no seeds
+/// (e.g. a band with no detections and no Bazin fit).
+fn multi_bazin_local_search(
+    problem: &MultiBazinCost<'_>,
+    lo: &[f64],
+    hi: &[f64],
+    seeds: &[Vec<f64>],
+) -> (Vec<f64>, f64) {
+    if seeds.is_empty() {
+        let mut buf = vec![0.0; problem.n_obs()];
+        return pso_minimize(|p: &[f64]| problem.value(p, &mut buf), lo, hi, 30, 60, 12, 42, None);
+    }
+    let mut best = (Vec::new(), f64::INFINITY);
+    for seed in seeds {
+        // Greedy seeds start near a fit; K>1 polishes are capped tighter
+        let max_iters = if problem.k == 1 { 100 } else { 60 };
+        let (x, c) = projected_lbfgs(problem, seed, lo, hi, max_iters);
+        if c < best.1 {
+            best = (x, c);
+        }
+    }
+    best
+}
+
 /// Greedy MultiBazin fit: fit K=1..max_k, each time initializing the new
 /// component from the residual of the previous best fit.
-fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
+/// `bazin_fit` (Bazin-model params, if the band was already fit with Bazin)
+/// seeds K=1.
+fn fit_multi_bazin(data: &BandFitData, bazin_fit: Option<&[f64]>) -> MultiBazinResult {
     let n_obs = data.times.len();
     if n_obs < 5 {
         return MultiBazinResult {
@@ -1388,43 +1544,16 @@ fn fit_multi_bazin(data: &BandFitData) -> MultiBazinResult {
             None
         };
 
-        // Run PSO restarts. Each closure needs its own pred_buf since
-        // pso_minimize takes ownership of the FnMut.
-        let mk_cost = |buf: &mut Vec<f64>| {
-            let times = &data.times;
-            let flux = &data.flux;
-            let obs_var = &data.obs_var;
-            let is_upper = &data.is_upper;
-            let upper_flux = &data.upper_flux;
-            let buf = buf as *mut Vec<f64>;
-            move |p: &[f64]| -> f64 {
-                multi_bazin_cost(
-                    p, k, times, flux, obs_var,
-                    is_upper, upper_flux, unsafe { &mut *buf },
-                )
-            }
+        let problem = MultiBazinCost {
+            k,
+            times: &data.times,
+            flux: &data.flux,
+            obs_var: &data.obs_var,
+            is_upper: &data.is_upper,
+            upper_flux: &data.upper_flux,
         };
-
-        // First run: standard PSO
-        let (mut params1, mut cost1) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 42, None);
-
-        // If we have a seed, run a second PSO restart with the seed injected
-        if let Some(ref seed) = init {
-            let (params2, cost2) = pso_minimize(
-                mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 137, Some(seed),
-            );
-            if cost2 < cost1 {
-                params1 = params2;
-                cost1 = cost2;
-            }
-        }
-
-        // Third restart
-        let (params3, cost3) = pso_minimize(mk_cost(&mut pred_buf), &lo, &hi, 30, 60, 12, 271, None);
-        if cost3 < cost1 {
-            params1 = params3;
-            cost1 = cost3;
-        }
+        let seeds = multi_bazin_seeds(data, k, init.as_deref(), bazin_fit, &lo, &hi);
+        let (params1, cost1) = multi_bazin_local_search(&problem, &lo, &hi, &seeds);
 
         let k_bic = 2.0 * cost1 * n_obs_f + (np as f64) * ln_n;
         per_k_cost.push(cost1);
@@ -1496,9 +1625,6 @@ impl PsoCost<'_> {
     /// reuses a prediction buffer.
     #[inline]
     fn cost_from_slice(&self, p: &[f64], pred_buf: &mut [f64]) -> f64 {
-        let se_idx = self.model.sigma_extra_idx();
-        let sigma_extra = p[se_idx].exp();
-        let sigma_extra_sq = sigma_extra * sigma_extra;
         eval_model_batch_into(self.model, p, self.times, pred_buf);
 
         if self.model == SviModel::MetzgerKN {
@@ -1515,10 +1641,19 @@ impl PsoCost<'_> {
             }
         }
 
+        self.cost_from_preds(p, pred_buf)
+    }
+
+    /// Cost given precomputed model predictions for `p`.
+    #[inline]
+    fn cost_from_preds(&self, p: &[f64], preds: &[f64]) -> f64 {
+        let se_idx = self.model.sigma_extra_idx();
+        let sigma_extra = p[se_idx].exp();
+        let sigma_extra_sq = sigma_extra * sigma_extra;
         let n = self.times.len().max(1) as f64;
         let mut neg_ll = 0.0;
         for i in 0..self.times.len() {
-            let pred = pred_buf[i];
+            let pred = preds[i];
             if !pred.is_finite() {
                 return 1e99;
             }
@@ -1532,8 +1667,12 @@ impl PsoCost<'_> {
             }
         }
 
-        // Population prior penalty (Gaussian, added to NLL/n so it scales
-        // with data size — prior influence decreases with more observations).
+        // Population prior penalty (Gaussian). Prior weight is equivalent to
+        // one data point: neg_lp is added before the /n averaging, so the
+        // prior has influence 1/n relative to per-point NLL (standard weak
+        // Bayesian regularization; prior dominates at n=1, data dominates
+        // as n grows). Previously the prior was divided by n twice — 1/n²
+        // scaling — which made it effectively vanish for any real lightcurve.
         if !self.pop_priors.is_empty() {
             let mut neg_lp = 0.0;
             for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
@@ -1542,7 +1681,7 @@ impl PsoCost<'_> {
                     neg_lp += 0.5 * z * z;
                 }
             }
-            neg_ll += neg_lp / n;
+            neg_ll += neg_lp;
         }
 
         neg_ll / n
@@ -1559,11 +1698,10 @@ impl CostFunction for PsoCost<'_> {
     }
 }
 
-impl Gradient for PsoCost<'_> {
-    type Param = Vec<f64>;
-    type Gradient = Vec<f64>;
-
-    fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, ArgminError> {
+impl PsoCost<'_> {
+    /// Cost and gradient in one pass over the data (analytic models only;
+    /// MetzgerKN's output rescaling is not differentiated here).
+    fn cost_and_grad(&self, p: &[f64], grad: &mut [f64], model_grad: &mut [f64]) -> f64 {
         let n_obs = self.times.len();
         let n_params = p.len();
         let n = n_obs.max(1) as f64;
@@ -1572,14 +1710,24 @@ impl Gradient for PsoCost<'_> {
         let sigma_extra = p[se_idx].exp();
         let sigma_extra_sq = sigma_extra * sigma_extra;
 
-        let mut grad = vec![0.0; n_params];
-        let mut model_grad = vec![0.0; n_params];
+        for g in grad.iter_mut() {
+            *g = 0.0;
+        }
+        // Per-call constants of the Bazin model, hoisted out of the obs loop
+        let bazin_consts = (self.model == SviModel::Bazin).then(|| (p[0].exp(), p[3].exp(), p[4].exp()));
+        let mut neg_ll = 0.0;
 
         for i in 0..n_obs {
-            let pred = eval_model_and_grad(self.model, p, self.times[i], &mut model_grad);
+            let pred = match bazin_consts {
+                Some((a, tau_rise, tau_fall)) => bazin_eval_and_grad_with(a, p[1], p[2], tau_rise, tau_fall, self.times[i], model_grad),
+                None => eval_model_and_grad(self.model, p, self.times[i], model_grad),
+            };
             if !pred.is_finite() {
-                // Return zero gradient for non-finite predictions
-                return Ok(vec![0.0; n_params]);
+                // Zero gradient for non-finite predictions
+                for g in grad.iter_mut() {
+                    *g = 0.0;
+                }
+                return 1e99;
             }
             let total_var = self.obs_var[i] + sigma_extra_sq;
 
@@ -1587,10 +1735,9 @@ impl Gradient for PsoCost<'_> {
                 // Gradient of -log(Phi(z)) where z = (upper - pred) / sqrt(total_var)
                 let sqrt_var = total_var.sqrt();
                 let z = (self.upper_flux[i] - pred) / sqrt_var;
+                neg_ll -= log_normal_cdf(z);
                 // d/dz [-log(Phi(z))] = -phi(z)/Phi(z)
-                let phi = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
-                let cdf = 0.5 * (1.0 + erf_approx(z / std::f64::consts::SQRT_2));
-                let ratio = phi / cdf.max(1e-300);
+                let ratio = normal_pdf_over_cdf(z);
                 // dz/dpred = -1/sqrt(total_var), dz/dse = z * sigma_extra_sq / total_var
                 for j in 0..n_params {
                     grad[j] += ratio * model_grad[j] / sqrt_var; // -(-1/sqrt_var) = +
@@ -1599,6 +1746,7 @@ impl Gradient for PsoCost<'_> {
                 grad[se_idx] += ratio * z * sigma_extra_sq / total_var;
             } else {
                 let diff = pred - self.flux[i];
+                neg_ll += diff * diff / total_var + total_var.ln();
                 // d/dp [diff²/total_var + ln(total_var)] = 2*diff/total_var * dpred/dp
                 let scale = 2.0 * diff / total_var;
                 for j in 0..n_params {
@@ -1612,11 +1760,205 @@ impl Gradient for PsoCost<'_> {
             }
         }
 
+        // Population prior penalty (matches cost_from_slice)
+        for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
+            if j < n_params && width > 0.0 {
+                let z = (p[j] - center) / width;
+                neg_ll += 0.5 * z * z;
+                grad[j] += z / width;
+            }
+        }
+
         for g in grad.iter_mut() {
             *g /= n;
         }
+        neg_ll / n
+    }
+}
+
+impl Gradient for PsoCost<'_> {
+    type Param = Vec<f64>;
+    type Gradient = Vec<f64>;
+
+    fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, ArgminError> {
+        let mut grad = vec![0.0; p.len()];
+        let mut model_grad = vec![0.0; p.len()];
+        self.cost_and_grad(p, &mut grad, &mut model_grad);
         Ok(grad)
     }
+}
+
+/// Objective for the box-bounded local and multi-start optimizers.
+trait LocalObjective {
+    /// Length of the scratch buffer `value` needs (number of observations).
+    fn n_obs(&self) -> usize;
+    /// Cost exactly as the global search sees it.
+    fn value(&self, p: &[f64], buf: &mut [f64]) -> f64;
+    /// Cost and gradient; `scratch` has the length of `p`.
+    fn value_and_grad(&self, p: &[f64], grad: &mut [f64], scratch: &mut [f64]) -> f64;
+}
+
+impl LocalObjective for PsoCost<'_> {
+    fn n_obs(&self) -> usize {
+        self.times.len()
+    }
+    fn value(&self, p: &[f64], buf: &mut [f64]) -> f64 {
+        self.cost_from_slice(p, buf)
+    }
+    fn value_and_grad(&self, p: &[f64], grad: &mut [f64], scratch: &mut [f64]) -> f64 {
+        self.cost_and_grad(p, grad, scratch)
+    }
+}
+
+/// Bounded L-BFGS with projection onto the box and Armijo backtracking.
+///
+/// Variables at a bound whose gradient points outward are frozen for the
+/// step; the search direction is the two-loop L-BFGS recursion on the rest.
+fn projected_lbfgs<P: LocalObjective>(
+    problem: &P,
+    x0: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+    max_iters: usize,
+) -> (Vec<f64>, f64) {
+    const M: usize = 6;
+    let dim = x0.len();
+    let mut x: Vec<f64> = (0..dim).map(|d| x0[d].clamp(lower[d], upper[d])).collect();
+    let mut g = vec![0.0; dim];
+    let mut model_grad = vec![0.0; dim];
+    let mut f = problem.value_and_grad(&x, &mut g, &mut model_grad);
+    if !f.is_finite() || f >= 1e99 {
+        return (x, f);
+    }
+
+    let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(M);
+    let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(M);
+    let mut free = vec![true; dim];
+    let mut dir = vec![0.0; dim];
+    let mut x_new = vec![0.0; dim];
+    let mut g_new = vec![0.0; dim];
+    let mut alpha_buf = [0.0; M];
+
+    for _ in 0..max_iters {
+        let mut pg_norm = 0.0f64;
+        for d in 0..dim {
+            free[d] = upper[d] > lower[d]
+                && !(x[d] <= lower[d] && g[d] > 0.0)
+                && !(x[d] >= upper[d] && g[d] < 0.0);
+            if free[d] {
+                pg_norm = pg_norm.max(g[d].abs());
+            }
+        }
+        if pg_norm < 1e-8 {
+            break;
+        }
+
+        // Two-loop recursion on free variables
+        for d in 0..dim {
+            dir[d] = if free[d] { -g[d] } else { 0.0 };
+        }
+        let k = s_hist.len();
+        for h in (0..k).rev() {
+            let (sh, yh) = (&s_hist[h], &y_hist[h]);
+            let sy: f64 = (0..dim).filter(|&d| free[d]).map(|d| sh[d] * yh[d]).sum();
+            if sy <= 1e-12 {
+                alpha_buf[h] = 0.0;
+                continue;
+            }
+            let a = (0..dim).filter(|&d| free[d]).map(|d| sh[d] * dir[d]).sum::<f64>() / sy;
+            alpha_buf[h] = a;
+            for d in 0..dim {
+                if free[d] {
+                    dir[d] -= a * yh[d];
+                }
+            }
+        }
+        let gamma = if k > 0 {
+            let (sh, yh) = (&s_hist[k - 1], &y_hist[k - 1]);
+            let sy: f64 = (0..dim).filter(|&d| free[d]).map(|d| sh[d] * yh[d]).sum();
+            let yy: f64 = (0..dim).filter(|&d| free[d]).map(|d| yh[d] * yh[d]).sum();
+            if sy > 1e-12 && yy > 0.0 { sy / yy } else { 1.0 }
+        } else {
+            // First step: move at most ~10% of the box along the steepest coordinate
+            let w = (0..dim).filter(|&d| free[d]).map(|d| upper[d] - lower[d]).fold(f64::INFINITY, f64::min);
+            (0.1 * w / pg_norm).min(1.0)
+        };
+        for d in 0..dim {
+            dir[d] *= gamma;
+        }
+        for h in 0..k {
+            let (sh, yh) = (&s_hist[h], &y_hist[h]);
+            let sy: f64 = (0..dim).filter(|&d| free[d]).map(|d| sh[d] * yh[d]).sum();
+            if sy <= 1e-12 {
+                continue;
+            }
+            let b = (0..dim).filter(|&d| free[d]).map(|d| yh[d] * dir[d]).sum::<f64>() / sy;
+            for d in 0..dim {
+                if free[d] {
+                    dir[d] += sh[d] * (alpha_buf[h] - b);
+                }
+            }
+        }
+
+        let gd: f64 = (0..dim).map(|d| g[d] * dir[d]).sum();
+        if gd >= 0.0 {
+            // Not a descent direction: drop curvature history, use steepest descent
+            s_hist.clear();
+            y_hist.clear();
+            for d in 0..dim {
+                dir[d] = if free[d] { -g[d] } else { 0.0 };
+            }
+        }
+
+        // Projected Armijo backtracking
+        let mut step = 1.0;
+        let mut accepted = false;
+        let mut f_new = f;
+        for _ in 0..30 {
+            for d in 0..dim {
+                x_new[d] = (x[d] + step * dir[d]).clamp(lower[d], upper[d]);
+            }
+            f_new = problem.value_and_grad(&x_new, &mut g_new, &mut model_grad);
+            let decrease: f64 = (0..dim).map(|d| g[d] * (x_new[d] - x[d])).sum();
+            if f_new.is_finite() && f_new <= f + 1e-4 * decrease {
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !accepted {
+            if s_hist.is_empty() {
+                break;
+            }
+            s_hist.clear();
+            y_hist.clear();
+            continue;
+        }
+
+        let s_vec: Vec<f64> = (0..dim).map(|d| x_new[d] - x[d]).collect();
+        let y_vec: Vec<f64> = (0..dim).map(|d| g_new[d] - g[d]).collect();
+        if s_vec.iter().zip(y_vec.iter()).map(|(a, b)| a * b).sum::<f64>() > 1e-12 {
+            if s_hist.len() == M {
+                s_hist.remove(0);
+                y_hist.remove(0);
+            }
+            s_hist.push(s_vec);
+            y_hist.push(y_vec);
+        }
+
+        let rel_change = (f - f_new).abs() / f.abs().max(1.0);
+        x.copy_from_slice(&x_new);
+        g.copy_from_slice(&g_new);
+        f = f_new;
+        if rel_change < 1e-10 {
+            break;
+        }
+    }
+
+    // Report the cost exactly as the global search sees it
+    let mut pred_buf = vec![0.0; problem.n_obs()];
+    let f_check = problem.value(&x, &mut pred_buf);
+    (x, f_check)
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,7 +2061,7 @@ fn pso_bounds(model: SviModel) -> (Vec<f64>, Vec<f64>) {
             vec![3.0, 0.3, 100.0, 5.0, 6.0, 0.0],
         ),
         SviModel::Villar => (
-            vec![-3.0, -0.05, -3.0, -100.0, -2.0, -2.0, -5.0],
+            vec![-3.0, -0.05, -3.0, -100.0, -2.0, -2.0, -3.0],
             vec![3.0, 0.1, 5.0, 100.0, 5.0, 7.0, 0.0],
         ),
         SviModel::MetzgerKN => (
@@ -1791,10 +2133,44 @@ fn population_priors(model: SviModel) -> Vec<(f64, f64)> {
     }
 }
 
+/// Population priors as used in the fitting cost.
+///
+/// The t0 entry is disabled (width 0): t0 is in band time (days since the
+/// source's first observation), so a fixed-center prior would pull it toward
+/// t = 0. t0 is constrained by `data_t0_window` instead.
+fn population_priors_for_fit(model: SviModel) -> Vec<(f64, f64)> {
+    let mut priors = population_priors(model);
+    priors[model.t0_idx()].1 = 0.0;
+    priors
+}
+
 /// Public accessor for GPU PSO to use population priors.
 #[cfg(feature = "cuda")]
 pub fn population_priors_for_gpu(model: crate::gpu::GpuModelName) -> Vec<(f64, f64)> {
     population_priors(SviModel::from_name(&model.to_svi_name()))
+}
+
+/// Data-informed t0 bounds for one band.
+///
+/// t0 may be up to 30 days before the first observation (rise not observed)
+/// but no more than 100 days before the peak, and at most 10 days after the
+/// peak (peak may be noisy). Band times are offset from the source's first
+/// observation in any band, so they can start well past 100 days; this window
+/// replaces the static t0 range in `pso_bounds` rather than intersecting it.
+fn data_t0_window(times: &[f64], flux: &[f64], is_upper: &[bool]) -> Option<(f64, f64)> {
+    if times.is_empty() {
+        return None;
+    }
+    let mut peak_time = times[0];
+    let mut peak_flux = f64::NEG_INFINITY;
+    for i in 0..times.len() {
+        if !is_upper[i] && flux[i] > peak_flux {
+            peak_flux = flux[i];
+            peak_time = times[i];
+        }
+    }
+    let t_first = times.iter().cloned().fold(f64::INFINITY, f64::min);
+    Some(((t_first - 30.0).max(peak_time - 100.0), peak_time + 10.0))
 }
 
 fn pso_bounds_no_t0(model: SviModel) -> (Vec<f64>, Vec<f64>) {
@@ -1941,6 +2317,259 @@ fn pso_minimize(
     (gbest_pos, gbest_cost)
 }
 
+// ---------------------------------------------------------------------------
+// Multi-start L-BFGS (alternative to PSO)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Profiled-amplitude t0 grid
+// ---------------------------------------------------------------------------
+
+// Search sizes for `profile_grid_fit`, tuned on real ZTF bands against a
+// heavy-search reference optimum.
+/// Number of t0 grid points across the t0 bounds.
+const PG_N_T0: usize = 8;
+/// Shape-parameter screen points per t0, per shape dimension.
+const PG_N_SHAPE: usize = 8;
+/// Number of t0 bins refined with L-BFGS.
+const PG_N_STARTS: usize = 4;
+/// Best shapes so far, re-evaluated at every later t0.
+const PG_N_CARRY: usize = 2;
+/// Best bins whose t0 is re-scanned at ±1/3 grid spacing before refinement.
+const PG_N_ZOOM: usize = 2;
+/// Distinct shape candidates kept per t0 (separate shape basins).
+const PG_PER_BIN: usize = 2;
+
+/// Index of the linear baseline parameter, for models that have one.
+fn baseline_idx(model: SviModel) -> Option<usize> {
+    match model {
+        SviModel::Bazin | SviModel::Tde => Some(1),
+        _ => None,
+    }
+}
+
+/// Set log_A (index 0), the baseline and log_sigma_extra of `p` to their
+/// best values given unit-amplitude shape predictions, and return the cost.
+///
+/// Every analytic model is `exp(log_A) * shape(t) (+ B)`, so for fixed shape
+/// the amplitude and baseline are a weighted least-squares solve over the
+/// detections. sigma_extra is set from the excess residual variance, and the
+/// weights are updated once with it. Upper limits and priors enter only via
+/// the final exact cost.
+fn profile_linear_params(
+    problem: &PsoCost<'_>,
+    p: &mut [f64],
+    shape: &[f64],
+    preds: &mut [f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> f64 {
+    let model = problem.model;
+    let se_idx = model.sigma_extra_idx();
+    let b_idx = baseline_idx(model);
+    let n_obs = problem.times.len();
+    if shape.iter().any(|v| !v.is_finite()) {
+        return 1e99;
+    }
+
+    let mut se_sq = 0.0;
+    let (mut amp, mut base) = (1.0, 0.0);
+    for _ in 0..2 {
+        // Weighted normal equations for flux ≈ amp * shape + base
+        let (mut sw, mut ss, mut s1, mut sy, mut s1y) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..n_obs {
+            if problem.is_upper[i] {
+                continue;
+            }
+            let w = 1.0 / (problem.obs_var[i] + se_sq);
+            let (x, y) = (shape[i], problem.flux[i]);
+            sw += w;
+            ss += w * x * x;
+            s1 += w * x;
+            sy += w * x * y;
+            s1y += w * y;
+        }
+        if ss <= 0.0 {
+            return 1e99;
+        }
+        amp = sy / ss;
+        base = 0.0;
+        if let Some(bi) = b_idx {
+            let det = ss * sw - s1 * s1;
+            if det > 1e-12 * ss * sw {
+                base = ((ss * s1y - s1 * sy) / det).clamp(lower[bi], upper[bi]);
+            }
+            amp = (sy - base * s1) / ss;
+        }
+        let log_a = if amp > 0.0 { amp.ln() } else { lower[0] };
+        amp = log_a.clamp(lower[0], upper[0]).exp();
+
+        // Excess scatter beyond the quoted errors
+        let (mut excess, mut n_det) = (0.0, 0usize);
+        for i in 0..n_obs {
+            if !problem.is_upper[i] {
+                let r = problem.flux[i] - (amp * shape[i] + base);
+                excess += r * r - problem.obs_var[i];
+                n_det += 1;
+            }
+        }
+        se_sq = (excess / n_det.max(1) as f64).max(1e-12);
+        se_sq = (0.5 * se_sq.ln()).clamp(lower[se_idx], upper[se_idx]).exp().powi(2);
+    }
+
+    p[0] = amp.ln();
+    if let Some(bi) = b_idx {
+        p[bi] = base;
+    }
+    p[se_idx] = 0.5 * se_sq.ln();
+    for i in 0..n_obs {
+        preds[i] = amp * shape[i] + base;
+    }
+    problem.cost_from_preds(p, preds)
+}
+
+/// Global search exploiting model structure (analytic models only):
+/// - Amplitude, baseline and sigma_extra are never sampled: each candidate
+///   gets its best values from `profile_linear_params`;
+/// - t0 (the main source of multimodality) is scanned on a regular grid, and
+///   the remaining shape parameters are Latin-hypercube screened at each t0;
+/// - Bounded L-BFGS on all parameters from the best `PG_N_STARTS` t0 bins.
+fn profile_grid_fit(
+    problem: &PsoCost<'_>,
+    lower: &[f64],
+    upper: &[f64],
+    seed_points: &[&[f64]],
+    seed: u64,
+) -> (Vec<f64>, f64) {
+    let model = problem.model;
+    let dim = lower.len();
+    let t0_idx = model.t0_idx();
+    let se_idx = model.sigma_extra_idx();
+    let b_idx = baseline_idx(model);
+    let shape_dims: Vec<usize> = (1..dim)
+        .filter(|&d| d != t0_idx && d != se_idx && Some(d) != b_idx)
+        .collect();
+    let n_obs = problem.times.len();
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut shape = vec![0.0; n_obs];
+    let mut preds = vec![0.0; n_obs];
+
+    // Evaluate unit-amplitude shape, then profile the linear parameters
+    let mut score = |p: &mut Vec<f64>| -> f64 {
+        p[0] = 0.0;
+        if let Some(bi) = b_idx {
+            p[bi] = 0.0;
+        }
+        eval_model_batch_into(model, p, problem.times, &mut shape);
+        profile_linear_params(problem, p, &shape, &mut preds, lower, upper)
+    };
+
+    // Best candidate per t0 bin (runner-up shapes go to `extra`, which is
+    // not zoomed); seed points form extra bins
+    let (t0_lo, t0_hi) = (lower[t0_idx], upper[t0_idx]);
+    let n_t0 = if t0_hi - t0_lo > 1e-9 { PG_N_T0 } else { 1 };
+    let mut bins: Vec<(Vec<f64>, f64)> = Vec::with_capacity(n_t0 + seed_points.len());
+    for sp in seed_points {
+        let mut x: Vec<f64> = (0..dim).map(|d| sp[d].clamp(lower[d], upper[d])).collect();
+        let c = score(&mut x);
+        bins.push((x, c));
+    }
+    let n_shape = (PG_N_SHAPE * shape_dims.len()).max(1);
+    let spacing = (t0_hi - t0_lo) / n_t0 as f64;
+    // Best shape-parameter vectors so far (cost, values over shape_dims)
+    let mut elite: Vec<(f64, Vec<f64>)> = Vec::with_capacity(PG_N_CARRY + 1);
+    let mut extra: Vec<(Vec<f64>, f64)> = Vec::new();
+    for k in 0..n_t0 {
+        let t0 = t0_lo + spacing * (k as f64 + 0.5);
+        // Latin hypercube over the shape dimensions at this t0
+        let strata: Vec<Vec<usize>> = shape_dims
+            .iter()
+            .map(|_| {
+                let mut perm: Vec<usize> = (0..n_shape).collect();
+                for i in (1..n_shape).rev() {
+                    let j = rng.random_range(0..=i);
+                    perm.swap(i, j);
+                }
+                perm
+            })
+            .collect();
+        let mut screened: Vec<(Vec<f64>, f64)> = Vec::with_capacity(n_shape + elite.len());
+        let mut x = vec![0.0; dim];
+        x[t0_idx] = t0;
+        for i in 0..n_shape {
+            for (si, &d) in shape_dims.iter().enumerate() {
+                let u = (strata[si][i] as f64 + rng.random::<f64>()) / n_shape as f64;
+                x[d] = lower[d] + u * (upper[d] - lower[d]);
+            }
+            let c = score(&mut x);
+            screened.push((x.clone(), c));
+        }
+        for (_, sh) in &elite {
+            for (si, &d) in shape_dims.iter().enumerate() {
+                x[d] = sh[si];
+            }
+            let c = score(&mut x);
+            screened.push((x.clone(), c));
+        }
+        screened.retain(|c| c.1.is_finite());
+        screened.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Up to `per_bin` candidates whose shapes differ by >25% of the box
+        let mut kept: Vec<(Vec<f64>, f64)> = Vec::with_capacity(PG_PER_BIN);
+        for cand in screened {
+            if kept.len() >= PG_PER_BIN {
+                break;
+            }
+            let distinct = kept.iter().all(|k| {
+                shape_dims.iter().any(|&d| (cand.0[d] - k.0[d]).abs() / (upper[d] - lower[d]).max(1e-12) > 0.25)
+            });
+            if distinct {
+                kept.push(cand);
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        let sh: Vec<f64> = shape_dims.iter().map(|&d| kept[0].0[d]).collect();
+        elite.push((kept[0].1, sh));
+        elite.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        elite.truncate(PG_N_CARRY);
+        let mut kept = kept.into_iter();
+        bins.extend(kept.next());
+        extra.extend(kept);
+    }
+
+    // Zoom: re-scan t0 at ±1/3 spacing around the best bins, keeping their shape
+    if n_t0 > 1 {
+        bins.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for bin in bins.iter_mut().take(PG_N_ZOOM) {
+            let center = bin.0.clone();
+            for off in [-spacing / 3.0, spacing / 3.0] {
+                let mut x = center.clone();
+                x[t0_idx] = (center[t0_idx] + off).clamp(t0_lo, t0_hi);
+                let cost = score(&mut x);
+                if cost < bin.1 {
+                    *bin = (x, cost);
+                }
+            }
+        }
+    }
+    bins.extend(extra);
+    if bins.is_empty() {
+        return (lower.iter().zip(upper).map(|(l, u)| 0.5 * (l + u)).collect(), 1e99);
+    }
+    bins.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut best = bins[0].clone();
+    for (x0, _) in bins.iter().take(PG_N_STARTS) {
+        let (x, c) = projected_lbfgs(problem, x0, lower, upper, 100);
+        if c < best.1 {
+            best = (x, c);
+        }
+    }
+    best
+}
+
 fn linspace(start: f64, end: f64, n: usize) -> Vec<f64> {
     if n <= 1 {
         return vec![start];
@@ -1962,6 +2591,25 @@ fn profile_t0_search(
     let t0_max = pilot_t0 + 5.0;
 
     let run_at_t0 = |t0: f64| -> (Vec<f64>, f64) {
+        if model != SviModel::MetzgerKN {
+            // Pin t0 by collapsing its bounds; polish from the pilot fit
+            let (mut lower, mut upper) = pso_bounds(model);
+            lower[t0_idx] = t0;
+            upper[t0_idx] = t0;
+            let problem = PsoCost {
+                times: &data.times,
+                flux: &data.flux,
+                flux_err: &data.flux_err,
+                obs_var: &data.obs_var,
+                is_upper: &data.is_upper,
+                upper_flux: &data.upper_flux,
+                model,
+                pop_priors: Vec::new(),
+            };
+            let mut warm = pilot_params.to_vec();
+            warm[t0_idx] = t0;
+            return projected_lbfgs(&problem, &warm, &lower, &upper, 100);
+        }
         let (lower, upper) = pso_bounds_no_t0(model);
         let problem = PsoCost {
             times: &data.times,
@@ -2056,39 +2704,15 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
         is_upper: &data.is_upper,
         upper_flux: &data.upper_flux,
         model,
-        pop_priors: population_priors(model),
+        pop_priors: population_priors_for_fit(model),
     };
 
     // --- Data-informed t0 bounds ---
-    // Find the time of peak observed flux. The model's t0 should be near or
-    // before this time. Constrain t0 to [t_peak - margin, t_peak + small],
-    // which eliminates degenerate solutions where t0 is far from the data.
     let t0_idx = model.t0_idx();
     let n_obs = data.times.len();
-    if n_obs > 0 {
-        // Find time of peak flux (excluding upper limits)
-        let mut peak_time = data.times[0];
-        let mut peak_flux = f64::NEG_INFINITY;
-        for i in 0..n_obs {
-            if !data.is_upper[i] && data.flux[i] > peak_flux {
-                peak_flux = data.flux[i];
-                peak_time = data.times[i];
-            }
-        }
-
-        let t_first = data.times.iter().cloned().fold(f64::INFINITY, f64::min);
-
-        // t0 should be near or before the peak. For the Villar model,
-        // t0 is roughly the time of peak brightness.
-        // Allow t0 to be up to 30 days before first observation (rise not observed)
-        // but at most 10 days after the peak flux (peak may be noisy).
-        let t0_lo = (t_first - 30.0).max(lower[t0_idx]);
-        let t0_hi = (peak_time + 10.0).min(upper[t0_idx]);
-
-        if t0_lo < t0_hi {
-            lower[t0_idx] = t0_lo;
-            upper[t0_idx] = t0_hi;
-        }
+    if let Some((t0_lo, t0_hi)) = data_t0_window(&data.times, &data.flux, &data.is_upper) {
+        lower[t0_idx] = t0_lo;
+        upper[t0_idx] = t0_hi;
     }
 
     // clamp t0 to ±1 day around reference band if provided
@@ -2100,13 +2724,6 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
             upper[t0_idx] = clamped_hi;
         }
     }
-
-    // --- Multi-restart PSO with data-informed seeding ---
-    // Restart 0: standard random init
-    // Restart 1: seed one particle at estimated t0 = peak_time - small_offset
-    let seeds: &[u64] = &[42, 137];
-    let mut best_params = Vec::new();
-    let mut best_chi2 = f64::INFINITY;
 
     // Build seed particles with informed initial guesses
     let pop_prior = population_priors(model);
@@ -2136,6 +2753,22 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
     } else {
         None
     };
+
+    let seed_points: Vec<&[f64]> = seed_at_peak.iter().map(|v| v.as_slice()).collect();
+
+    // Analytic models: profiled-amplitude t0 grid + L-BFGS. MetzgerKN (ODE,
+    // no analytic gradient) uses PSO.
+    if model != SviModel::MetzgerKN {
+        let (params, cost) = profile_grid_fit(&problem, &lower, &upper, &seed_points, 42);
+        return (model, params, cost);
+    }
+
+    // --- Multi-restart PSO with data-informed seeding ---
+    // Restart 0: standard random init
+    // Restart 1: seed one particle at estimated t0 = peak_time - small_offset
+    let seeds: &[u64] = &[42, 137];
+    let mut best_params = Vec::new();
+    let mut best_chi2 = f64::INFINITY;
 
     // MetzgerKN uses numerical ODE so keep more particles; analytic models use fewer
     let n_particles = if matches!(model, SviModel::MetzgerKN) { 30 } else { 20 };
@@ -2246,7 +2879,7 @@ fn pso_model_select_t0(data: &BandFitData, fit_all_models: bool, ref_t0: Option<
 fn prior_params(model: SviModel) -> Vec<(f64, f64)> {
     match model {
         SviModel::Bazin => vec![(0.0, 2.0); 6],
-        SviModel::Villar => vec![(0.0, 2.0); 7],
+        SviModel::Villar => vec![(0.0, 1.0); 7],
         SviModel::MetzgerKN => {
             vec![
                 (-1.75, 1.25),
@@ -2522,6 +3155,8 @@ fn svi_fit(
             for j in 0..n_params {
                 dll_dtheta[j] = 0.0;
             }
+            // Per-sample constants of the Bazin model, hoisted out of the obs loop
+            let bazin_consts = (model == SviModel::Bazin).then(|| (theta[0].exp(), theta[3].exp(), theta[4].exp()));
 
             for i in 0..n_obs {
                 let pred;
@@ -2529,6 +3164,8 @@ fn svi_fit(
                     pred = preds[i];
                     let base_off = i * n_params;
                     grad_buf.copy_from_slice(&kn_grads_flat[base_off..base_off + n_params]);
+                } else if let Some((a, tau_rise, tau_fall)) = bazin_consts {
+                    pred = bazin_eval_and_grad_with(a, theta[1], theta[2], tau_rise, tau_fall, data.times[i], &mut grad_buf);
                 } else {
                     pred = eval_model_and_grad(model, &theta, data.times[i], &mut grad_buf);
                 }
@@ -2578,8 +3215,8 @@ fn svi_fit(
             // sigma_extra keeps original prior center since PSO pins it at -5.
             let mut log_prior = 0.0;
             for j in 0..n_params {
-                let (orig_center, width) = priors[j];
-                let center = if j == se_idx { orig_center } else { init_mu[j] };
+                let (_orig_center, width) = priors[j];
+                let center = init_mu[j];
                 let var = width * width;
                 log_prior += -0.5 * (theta[j] - center).powi(2) / var;
                 let dlp = -(theta[j] - center) / var;
@@ -2920,7 +3557,12 @@ fn profile_refine_all(result: &mut SviFitResult, data: &BandFitData) {
     }
 
     let threshold = map_ll - 0.5; // 1-sigma contour
-    let (lower, upper) = pso_bounds(model);
+    let (mut lower, mut upper) = pso_bounds(model);
+    if let Some((t0_lo, t0_hi)) = data_t0_window(&data.times, &data.flux, &data.is_upper) {
+        let t0_idx = model.t0_idx();
+        lower[t0_idx] = t0_lo;
+        upper[t0_idx] = t0_hi;
+    }
 
     for j in 0..n_params {
         // Skip sigma_extra — already handled by prior width
@@ -3010,6 +3652,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
     let n_obs = data.times.len();
     let mut params = result.mu.clone();
     let mut best_t0 = mu_t0;
+    let mut best_params = result.mu.clone();
     let mut best_ll = f64::NEG_INFINITY;
 
     let log_a_idx = 0;
@@ -3133,6 +3776,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
         if ll > best_ll {
             best_ll = ll;
             best_t0 = t0;
+            best_params = params.clone();
         }
     }
 
@@ -3202,7 +3846,7 @@ fn profile_t0_refine(result: &mut SviFitResult, data: &BandFitData) {
 
     let profile_sigma = ((t0_hi_1sig - t0_lo_1sig) / 2.0).max(0.1);
 
-    result.mu[t0_idx] = best_t0;
+    result.mu = best_params;
     result.log_sigma[t0_idx] = profile_sigma.ln();
 }
 
@@ -3332,9 +3976,9 @@ pub fn finalize_parametric_from_gpu(
     }
 
     let snr_threshold = 3.0;
-    let svi_lr = 0.01;
+    let svi_lr = 0.005;
     let svi_n_steps = 500;
-    let svi_n_samples = 4;
+    let svi_n_samples = 16;
     let zp = 23.9;
 
     // Build BandFitData for each unique band
@@ -3763,14 +4407,16 @@ pub fn finalize_all_models_with_gpu_svi(
     results
 }
 
+/// Normalise one band to peak flux and flag upper limits for fitting.
 /// Fit parametric lightcurve models to all bands.
 ///
 /// `bands` maps band names to `BandData` containing flux values.
-/// Uses PSO for model selection, then the chosen `method` for uncertainty estimation.
+/// Model selection fits each analytic model with a profiled-amplitude t0 grid
+/// plus L-BFGS (MetzgerKN with PSO), then the chosen `method` estimates uncertainty.
 /// Fit parametric models to per-band flux data.
 ///
 /// If `forced_model` is `Some`, only that model is fit (no model selection).
-/// Otherwise, PSO model selection chooses the best model by BIC.
+/// Otherwise, model selection chooses the best model by AICc/BIC.
 pub fn fit_parametric_model(
     bands: &HashMap<String, BandData>,
     fit_all_models: bool,
@@ -3782,9 +4428,9 @@ pub fn fit_parametric_model(
     }
 
     let snr_threshold = 3.0;
-    let svi_lr = 0.01;
+    let svi_lr = 0.005;
     let svi_n_steps = 500;
-    let svi_n_samples = 4;
+    let svi_n_samples = 16;
     let zp = 23.9;
 
     let mut band_entries: Vec<(String, BandFitData, Vec<f64>)> = Vec::new();
@@ -3931,7 +4577,8 @@ pub fn fit_parametric_model(
 
         // MultiBazin: run on the first (most-populated) band
         let multi_bazin = if band_idx == 0 {
-            let mb = fit_multi_bazin(data);
+            let bazin_fit = (pso_model == SviModel::Bazin).then_some(pso_params.as_slice());
+            let mb = fit_multi_bazin(data, bazin_fit);
             if mb.params.is_empty() { None } else { Some(mb) }
         } else {
             None
@@ -4224,9 +4871,9 @@ pub fn fit_parametric_multiband(
 
     // Extract per-band results
     let ref_params = &best_params[..n_model_params];
-    let svi_lr = 0.01;
+    let svi_lr = 0.005;
     let svi_n_steps = 500;
-    let svi_n_samples = 4;
+    let svi_n_samples = 16;
 
     let mut results = Vec::new();
     for (b, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
@@ -4287,3 +4934,63 @@ pub fn fit_parametric_multiband(
 
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Worst relative error of the MultiBazin analytic gradient vs central differences.
+    fn multi_bazin_worst_grad_error(with_upper_limits: bool) -> f64 {
+        // Two pulses on a baseline, noise-free
+        let times: Vec<f64> = (0..30).map(|i| i as f64 * 3.0).collect();
+        let truth = [0.0, 10.0, 0.5, 2.5, -0.7, 45.0, 1.0, 3.0, 0.02, -3.0];
+        let mut flux = vec![0.0; times.len()];
+        multi_bazin_eval_batch(&truth, 2, &times, &mut flux);
+        let n = times.len();
+        let mut is_upper = vec![false; n];
+        if with_upper_limits {
+            is_upper[0] = true;
+            is_upper[n - 1] = true;
+        }
+        let obs_var = vec![0.01f64.powi(2) + 1e-10; n];
+        let upper_flux = vec![0.05; n];
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        let (mut buf, mut worst) = (vec![0.0; n], 0.0f64);
+        for k in 1..=3 {
+            let problem = MultiBazinCost { k, times: &times, flux: &flux, obs_var: &obs_var, is_upper: &is_upper, upper_flux: &upper_flux };
+            let (lo, hi) = multi_bazin_bounds(k, (0.0, 87.0));
+            for _ in 0..20 {
+                let p: Vec<f64> = (0..lo.len()).map(|j| lo[j] + (hi[j] - lo[j]) * (0.3 + 0.4 * rng.random::<f64>())).collect();
+                let (mut g, mut scratch) = (vec![0.0; p.len()], vec![0.0; p.len()]);
+                let f = problem.value_and_grad(&p, &mut g, &mut scratch);
+                if f > 1e3 {
+                    continue; // finite differences lose precision at absurd costs
+                }
+                assert!((f - problem.value(&p, &mut buf)).abs() < 1e-9 * f.abs().max(1.0));
+                for j in 0..p.len() {
+                    let h = 1e-6 * (hi[j] - lo[j]);
+                    let (mut a, mut b) = (p.clone(), p.clone());
+                    a[j] += h;
+                    b[j] -= h;
+                    let fd = (problem.value(&a, &mut buf) - problem.value(&b, &mut buf)) / (2.0 * h);
+                    worst = worst.max((fd - g[j]).abs() / fd.abs().max(g[j].abs()).max(1e-4));
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn multi_bazin_gradient_matches_finite_differences() {
+        let worst = multi_bazin_worst_grad_error(false);
+        assert!(worst < 1e-4, "worst relative gradient error {worst:e}");
+        // Deep-tail upper limits: phi/Phi is not the exact derivative of the
+        // erf approximation there, but must stay close (and finite)
+        let worst = multi_bazin_worst_grad_error(true);
+        assert!(worst < 5e-2, "worst relative gradient error with upper limits {worst:e}");
+    }
+}
+
+
+
