@@ -2754,16 +2754,6 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
         upper[t0_idx] = t0_hi;
     }
 
-    // clamp t0 to ±1 day around reference band if provided
-    if let Some(t0_ref) = ref_t0 {
-        let clamped_lo = (t0_ref - 1.0).max(lower[t0_idx]);
-        let clamped_hi = (t0_ref + 1.0).min(upper[t0_idx]);
-        if clamped_lo < clamped_hi {
-            lower[t0_idx] = clamped_lo;
-            upper[t0_idx] = clamped_hi;
-        }
-    }
-
     // Build seed particles with informed initial guesses
     let pop_prior = population_priors(model);
     let dim = lower.len();
@@ -2793,7 +2783,13 @@ fn pso_fit_single_model_t0(data: &BandFitData, model: SviModel, ref_t0: Option<f
         None
     };
 
-    let seed_points: Vec<&[f64]> = seed_at_peak.iter().map(|v| v.as_slice()).collect();
+    // Seed B (non-reference bands): Seed A with t0 at the reference band's.
+    // A hint only: t0 is not clamped to it, since bands peak days apart.
+    let seed_at_ref: Option<Vec<f64>> = ref_t0.zip(seed_at_peak.clone()).map(|(t0_ref, mut s)| {
+        s[t0_idx] = t0_ref.clamp(lower[t0_idx], upper[t0_idx]);
+        s
+    });
+    let seed_points: Vec<&[f64]> = seed_at_peak.iter().chain(seed_at_ref.iter()).map(|v| v.as_slice()).collect();
 
     // Analytic models: profiled-amplitude t0 grid + L-BFGS. MetzgerKN (ODE,
     // no analytic gradient) uses PSO.
@@ -4533,14 +4529,16 @@ pub fn fit_parametric_model(
         band_entries.push((band_name.clone(), fit_data, mags_obs));
     }
 
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+    // Most observations first; ties broken by name so the reference band
+    // does not depend on HashMap order
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()).then_with(|| a.0.cmp(&b.0)));
 
     let mut results: Vec<ParametricBandResult> = Vec::new();
     let mut ref_t0: Option<f64> = None; // set after reference band fit
 
     for (band_idx, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
         // Step 1: PSO model selection (or forced single model)
-        // non-reference bands get t0 clamped to ±1 day of reference
+        // non-reference bands are seeded at the reference band's t0
         let t0_hint = if band_idx > 0 { ref_t0 } else { None };
         let (pso_model, pso_params, pso_chi2, per_model_chi2, per_model_params) = if let Some(model) = forced_model {
             let (_, params, chi2) = pso_fit_single_model_t0(data, SviModel::from_name(&model), t0_hint);
@@ -4709,6 +4707,280 @@ fn villar_constraint(log_gamma: f64, beta: f64, log_tau_rise: f64, log_tau_fall:
     c1 + c2 + c3
 }
 
+/// Joint multi-band Villar cost: band-balanced NLL + physical constraints +
+/// priors (JAX-calibrated, Sushant/villar-pso). Parameters are the reference
+/// band's 7 Villar params followed by 7 additive offsets per other band.
+struct JointVillarCost<'a> {
+    bands: Vec<&'a BandFitData>,
+    /// Per-band NLL weight `(n_total / n_bands) / n_band`, so each band
+    /// contributes equally.
+    weights: Vec<f64>,
+    ref_priors: Vec<(f64, f64)>,
+    rel_priors: Vec<(f64, f64, bool)>,
+    n_total: f64,
+}
+
+const VILLAR_N: usize = 7;
+/// Joint multi-band start screening: t0 bins, shape samples per bin, and how
+/// many of the best bins L-BFGS polishes.
+const MB_N_T0: usize = 16;
+const MB_N_SHAPE: usize = 32;
+const MB_N_POLISH: usize = 6;
+/// Joint multi-band PSO restarts (one per seed, run in parallel).
+const MB_PSO_SEEDS: [u64; 3] = [42, 137, 271];
+const MB_PSO_PARTICLES: usize = 100;
+const MB_PSO_ITERS: usize = 400;
+const MB_PSO_STALL: usize = 40;
+/// Best joint candidates whose band slices start the per-band polish.
+const MB_N_BAND_CANDS: usize = 4;
+
+impl JointVillarCost<'_> {
+    /// Band `b`'s Villar params (reference + offsets), or the constraint
+    /// penalty if they violate it.
+    #[inline]
+    fn band_params(&self, p: &[f64], b: usize) -> Result<[f64; VILLAR_N], f64> {
+        let mut bp = [0.0; VILLAR_N];
+        bp.copy_from_slice(&p[..VILLAR_N]);
+        if b > 0 {
+            let off = VILLAR_N * b;
+            for j in 0..VILLAR_N {
+                bp[j] += p[off + j];
+            }
+        }
+        let constraint = villar_constraint(bp[2], bp[1], bp[4], bp[5]);
+        if constraint > 0.0 { Err(1e12 + 10_000.0 * constraint) } else { Ok(bp) }
+    }
+
+    /// Prior terms (before the final 1/n_total); adds their gradient if given.
+    fn neg_log_prior(&self, p: &[f64], mut grad: Option<&mut [f64]>) -> f64 {
+        let mut neg_lp = 0.0;
+        for (j, &(center, width)) in self.ref_priors.iter().enumerate() {
+            if j < VILLAR_N && width > 0.0 {
+                let z = (p[j] - center) / width;
+                neg_lp += 0.5 * z * z;
+                if let Some(g) = grad.as_deref_mut() {
+                    g[j] += z / width;
+                }
+            }
+        }
+        for b in 1..self.bands.len() {
+            let off = VILLAR_N * b;
+            for (j, &(mean, sigma, _is_add)) in self.rel_priors.iter().enumerate() {
+                if sigma > 0.0 {
+                    let z = (p[off + j] - mean) / sigma;
+                    neg_lp += 0.5 * z * z;
+                    if let Some(g) = grad.as_deref_mut() {
+                        g[off + j] += z / sigma;
+                    }
+                }
+            }
+        }
+        neg_lp
+    }
+}
+
+impl LocalObjective for JointVillarCost<'_> {
+    fn n_obs(&self) -> usize {
+        self.bands.iter().map(|d| d.times.len()).max().unwrap_or(0)
+    }
+
+    fn value(&self, p: &[f64], buf: &mut [f64]) -> f64 {
+        let mut balanced_nll = 0.0;
+        for (b, data) in self.bands.iter().enumerate() {
+            let bp = match self.band_params(p, b) {
+                Ok(bp) => bp,
+                Err(penalty) => return penalty,
+            };
+            let n = data.times.len();
+            let sigma_extra_sq = (2.0 * bp[VILLAR_N - 1]).exp();
+            let preds = &mut buf[..n];
+            eval_model_batch_into(SviModel::Villar, &bp, &data.times, preds);
+            let mut band_nll = 0.0;
+            for i in 0..n {
+                if !preds[i].is_finite() { return 1e99; }
+                let tv = data.obs_var[i] + sigma_extra_sq;
+                if data.is_upper[i] {
+                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                } else {
+                    let diff = preds[i] - data.flux[i];
+                    band_nll += diff * diff / tv + tv.ln();
+                }
+            }
+            balanced_nll += self.weights[b] * band_nll;
+        }
+        (balanced_nll + self.neg_log_prior(p, None)) / self.n_total
+    }
+
+    fn value_and_grad(&self, p: &[f64], grad: &mut [f64], _scratch: &mut [f64]) -> f64 {
+        grad.fill(0.0);
+        let se_idx = VILLAR_N - 1;
+        let mut model_grad = [0.0; VILLAR_N];
+        let mut balanced_nll = 0.0;
+        for (b, data) in self.bands.iter().enumerate() {
+            let bp = match self.band_params(p, b) {
+                Ok(bp) => bp,
+                Err(penalty) => {
+                    grad.fill(0.0);
+                    return penalty;
+                }
+            };
+            let sigma_extra_sq = (2.0 * bp[se_idx]).exp();
+            // Same per-observation terms as PsoCost::cost_and_grad
+            let mut band_nll = 0.0;
+            let mut band_grad = [0.0; VILLAR_N];
+            for i in 0..data.times.len() {
+                let pred = villar_flux_eval_and_grad(&bp, data.times[i], &mut model_grad);
+                if !pred.is_finite() {
+                    grad.fill(0.0);
+                    return 1e99;
+                }
+                let tv = data.obs_var[i] + sigma_extra_sq;
+                if data.is_upper[i] {
+                    let sqrt_var = tv.sqrt();
+                    let z = (data.upper_flux[i] - pred) / sqrt_var;
+                    band_nll -= log_normal_cdf(z);
+                    let ratio = normal_pdf_over_cdf(z);
+                    for j in 0..VILLAR_N {
+                        band_grad[j] += ratio * model_grad[j] / sqrt_var;
+                    }
+                    band_grad[se_idx] += ratio * z * sigma_extra_sq / tv;
+                } else {
+                    let diff = pred - data.flux[i];
+                    band_nll += diff * diff / tv + tv.ln();
+                    let scale = 2.0 * diff / tv;
+                    for j in 0..VILLAR_N {
+                        band_grad[j] += scale * model_grad[j];
+                    }
+                    band_grad[se_idx] += (-diff * diff / (tv * tv) + 1.0 / tv) * 2.0 * sigma_extra_sq;
+                }
+            }
+            // Band params are reference + offsets, so the band gradient
+            // flows into both
+            let w = self.weights[b];
+            balanced_nll += w * band_nll;
+            for j in 0..VILLAR_N {
+                grad[j] += w * band_grad[j];
+                if b > 0 {
+                    grad[VILLAR_N * b + j] += w * band_grad[j];
+                }
+            }
+        }
+        let neg_lp = self.neg_log_prior(p, Some(grad));
+        for g in grad.iter_mut() {
+            *g /= self.n_total;
+        }
+        (balanced_nll + neg_lp) / self.n_total
+    }
+}
+
+/// Polish a band's parameters to the MAP of its own single-band cost (the
+/// per-band fitter's: population priors, data-informed t0 window) by L-BFGS
+/// from each start, within the box widened by `widen` (the joint fit's offset
+/// range, so a non-reference band can reach everything the joint fit can).
+/// Returns the lowest-cost point, the first start itself if nothing beats it.
+fn polish_band_map(model: SviModel, data: &BandFitData, starts: &[&[f64]], widen: Option<(&[f64], &[f64])>) -> Vec<f64> {
+    let (mut lower, mut upper) = pso_bounds(model);
+    if let Some((lo, hi)) = widen {
+        for j in 0..lower.len() {
+            lower[j] += lo[j];
+            upper[j] += hi[j];
+        }
+    }
+    if let Some((t0_lo, t0_hi)) = data_t0_window(&data.times, &data.flux, &data.is_upper) {
+        lower[model.t0_idx()] = t0_lo;
+        upper[model.t0_idx()] = t0_hi;
+    }
+    let problem = PsoCost {
+        times: &data.times,
+        flux: &data.flux,
+        flux_err: &data.flux_err,
+        obs_var: &data.obs_var,
+        is_upper: &data.is_upper,
+        upper_flux: &data.upper_flux,
+        model,
+        pop_priors: population_priors_for_fit(model),
+    };
+    let mut buf = vec![0.0; data.times.len()];
+    let mut best = (starts[0].to_vec(), problem.value(starts[0], &mut buf));
+    for x0 in starts {
+        let polished = projected_lbfgs(&problem, x0, &lower, &upper, 200);
+        if polished.1 < best.1 {
+            best = polished;
+        }
+    }
+    best.0
+}
+
+/// Screen a t0 grid x Latin hypercube over the Villar shape params (beta,
+/// log_gamma, log_tau_rise, log_tau_fall) for joint L-BFGS starts. Other
+/// params come from `base`, except the reference amplitude, which is profiled
+/// by weighted least squares over all bands. Returns the best candidate of
+/// each of the `MB_N_POLISH` best t0 bins.
+fn screen_joint_villar_starts(
+    problem: &JointVillarCost<'_>,
+    base: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Vec<Vec<f64>> {
+    let model = SviModel::Villar;
+    let t0_idx = model.t0_idx();
+    let (t0_lo, t0_hi) = (lower[t0_idx], upper[t0_idx]);
+    let shape_dims = [1usize, 2, 4, 5];
+    let mut rng = SmallRng::seed_from_u64(42);
+    let mut buf = vec![0.0; problem.n_obs()];
+    let mut bp = [0.0; VILLAR_N];
+    let mut x = base.to_vec();
+    let mut bins: Vec<(Vec<f64>, f64)> = Vec::with_capacity(MB_N_T0);
+    for k in 0..MB_N_T0 {
+        x[t0_idx] = t0_lo + (t0_hi - t0_lo) * (k as f64 + 0.5) / MB_N_T0 as f64;
+        let strata: Vec<Vec<usize>> = shape_dims.iter().map(|_| {
+            let mut perm: Vec<usize> = (0..MB_N_SHAPE).collect();
+            for i in (1..MB_N_SHAPE).rev() {
+                perm.swap(i, rng.random_range(0..=i));
+            }
+            perm
+        }).collect();
+        let mut best: Option<(Vec<f64>, f64)> = None;
+        for i in 0..MB_N_SHAPE {
+            for (si, &d) in shape_dims.iter().enumerate() {
+                let u = (strata[si][i] as f64 + rng.random::<f64>()) / MB_N_SHAPE as f64;
+                x[d] = lower[d] + u * (upper[d] - lower[d]);
+            }
+            // Unit-amplitude predictions, then the best common amplitude
+            x[0] = 0.0;
+            let (mut sy, mut ss) = (0.0, 0.0);
+            for (b, data) in problem.bands.iter().enumerate() {
+                bp.copy_from_slice(&x[..VILLAR_N]);
+                if b > 0 {
+                    for j in 0..VILLAR_N {
+                        bp[j] += x[VILLAR_N * b + j];
+                    }
+                }
+                let n = data.times.len();
+                eval_model_batch_into(model, &bp, &data.times, &mut buf[..n]);
+                for i in 0..n {
+                    if !data.is_upper[i] && buf[i].is_finite() {
+                        let w = problem.weights[b] / data.obs_var[i];
+                        sy += w * buf[i] * data.flux[i];
+                        ss += w * buf[i] * buf[i];
+                    }
+                }
+            }
+            if ss <= 0.0 || sy <= 0.0 {
+                continue;
+            }
+            x[0] = (sy / ss).ln().clamp(lower[0], upper[0]);
+            let c = problem.value(&x, &mut buf);
+            if best.as_ref().map_or(true, |b| c < b.1) {
+                best = Some((x.clone(), c));
+            }
+        }
+        bins.extend(best);
+    }
+    bins.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    bins.into_iter().take(MB_N_POLISH).map(|b| b.0).collect()
+}
+
 /// Joint multi-band Villar fit with relative priors between bands.
 ///
 /// Fits all bands simultaneously by parameterizing the reference band with
@@ -4761,7 +5033,9 @@ pub fn fit_parametric_multiband(
             obs_var, is_upper, upper_flux, noise_frac_median, peak_flux_obs: peak_flux,
         }, mags_obs));
     }
-    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+    // Most observations first; ties broken by name so the reference band
+    // does not depend on HashMap order
+    band_entries.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()).then_with(|| a.0.cmp(&b.0)));
 
     if band_entries.is_empty() {
         return Vec::new();
@@ -4785,204 +5059,162 @@ pub fn fit_parametric_multiband(
         }
     }
 
-    // Data-informed t0 bounds for reference band
+    // Data-informed t0 bounds for reference band. A reference band starting
+    // after the fixed Villar t0 range leaves no window: return nothing so
+    // fit_parametric falls back to per-band fits.
     let ref_data = &band_entries[0].1;
     let t0_idx = model.t0_idx();
-    {
-        let mut peak_time = ref_data.times[0];
-        let mut peak_flux = f64::NEG_INFINITY;
-        for i in 0..ref_data.times.len() {
-            if !ref_data.is_upper[i] && ref_data.flux[i] > peak_flux {
-                peak_flux = ref_data.flux[i];
-                peak_time = ref_data.times[i];
-            }
+    let mut peak_time = ref_data.times[0];
+    let mut peak_flux = f64::NEG_INFINITY;
+    for i in 0..ref_data.times.len() {
+        if !ref_data.is_upper[i] && ref_data.flux[i] > peak_flux {
+            peak_flux = ref_data.flux[i];
+            peak_time = ref_data.times[i];
         }
+    }
+    {
         let t_first = ref_data.times.iter().cloned().fold(f64::INFINITY, f64::min);
         joint_lower[t0_idx] = (t_first - 30.0).max(joint_lower[t0_idx]);
         joint_upper[t0_idx] = (peak_time + 10.0).min(joint_upper[t0_idx]);
+        if joint_lower[t0_idx] > joint_upper[t0_idx] {
+            return Vec::new();
+        }
     }
 
-    // Joint cost function: band-balanced NLL + physical constraints + priors
-    // (JAX-calibrated, Sushant/villar-pso)
-    let se_idx = model.sigma_extra_idx();
-    let pop_prior_ref = population_priors(model);
-
-    // Pre-compute band sizes for band-balanced weighting
     let band_n_obs: Vec<usize> = band_entries.iter().map(|e| e.1.times.len()).collect();
     let n_total_obs: usize = band_n_obs.iter().sum();
-
-    let joint_cost = |p: &[f64]| -> f64 {
-        let ref_params = &p[..n_model_params];
-
-        // Physical constraint on reference band
-        // Villar params: [log_A, beta, log_gamma, t0, log_tau_rise, log_tau_fall, log_sigma_extra]
-        let ref_constraint = villar_constraint(ref_params[2], ref_params[1], ref_params[4], ref_params[5]);
-        if ref_constraint > 0.0 {
-            return 1e12 + 10_000.0 * ref_constraint;
-        }
-
-        // Band-balanced likelihood: each band contributes equally
-        // NLL_band / n_band * (n_total / n_bands)
-        let mut balanced_nll = 0.0;
-
-        // Reference band
-        {
-            let data = &band_entries[0].1;
-            let n = data.times.len();
-            let sigma_extra = ref_params[se_idx].exp();
-            let sigma_extra_sq = sigma_extra * sigma_extra;
-            let mut preds = vec![0.0; n];
-            eval_model_batch_into(model, ref_params, &data.times, &mut preds);
-            let mut band_nll = 0.0;
-            for i in 0..n {
-                if !preds[i].is_finite() { return 1e99; }
-                let tv = data.obs_var[i] + sigma_extra_sq;
-                if data.is_upper[i] {
-                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
-                } else {
-                    let diff = preds[i] - data.flux[i];
-                    band_nll += diff * diff / tv + tv.ln();
-                }
-            }
-            // Band-balanced: normalize by band size, weight equally
-            if n > 0 {
-                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
-            }
-        }
-
-        // Non-reference bands
-        for b in 1..n_bands {
-            let data = &band_entries[b].1;
-            let n = data.times.len();
-            let off_start = n_model_params + (b - 1) * n_model_params;
-            let offsets = &p[off_start..off_start + n_model_params];
-
-            // Reconstruct band params from reference + offsets
-            let mut band_params = vec![0.0; n_model_params];
-            for j in 0..n_model_params {
-                band_params[j] = ref_params[j] + offsets[j];
-            }
-
-            // Physical constraint on this band
-            let band_constraint = villar_constraint(band_params[2], band_params[1], band_params[4], band_params[5]);
-            if band_constraint > 0.0 {
-                return 1e12 + 10_000.0 * band_constraint;
-            }
-
-            let sigma_extra = band_params[se_idx].exp();
-            let sigma_extra_sq = sigma_extra * sigma_extra;
-            let mut preds = vec![0.0; n];
-            eval_model_batch_into(model, &band_params, &data.times, &mut preds);
-            let mut band_nll = 0.0;
-            for i in 0..n {
-                if !preds[i].is_finite() { return 1e99; }
-                let tv = data.obs_var[i] + sigma_extra_sq;
-                if data.is_upper[i] {
-                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
-                } else {
-                    let diff = preds[i] - data.flux[i];
-                    band_nll += diff * diff / tv + tv.ln();
-                }
-            }
-            if n > 0 {
-                balanced_nll += (band_nll / n as f64) * (n_total_obs as f64 / n_bands as f64);
-            }
-        }
-
-        let n_total = n_total_obs.max(1) as f64;
-
-        // Reference band population prior
-        let mut neg_lp = 0.0;
-        for (j, &(center, width)) in pop_prior_ref.iter().enumerate() {
-            if j < n_model_params && width > 0.0 {
-                let z = (ref_params[j] - center) / width;
-                neg_lp += 0.5 * z * z;
-            }
-        }
-
-        // Relative priors on band offsets
-        for b in 1..n_bands {
-            let off_start = n_model_params + (b - 1) * n_model_params;
-            for (j, &(mean, sigma, _is_add)) in rel_priors.iter().enumerate() {
-                if sigma > 0.0 {
-                    let z = (p[off_start + j] - mean) / sigma;
-                    neg_lp += 0.5 * z * z;
-                }
-            }
-        }
-
-        (balanced_nll + neg_lp) / n_total
+    let problem = JointVillarCost {
+        bands: band_entries.iter().map(|e| &e.1).collect(),
+        weights: band_n_obs.iter()
+            .map(|&n| if n > 0 { n_total_obs as f64 / n_bands as f64 / n as f64 } else { 0.0 })
+            .collect(),
+        ref_priors: population_priors(model),
+        rel_priors: rel_priors.clone(),
+        n_total: n_total_obs.max(1) as f64,
     };
 
-    // Run PSO on the joint space
-    let (best_params, best_cost) = {
-        let seeds: &[u64] = &[42, 137, 271];
-        let mut best = Vec::new();
-        let mut best_c = f64::INFINITY;
-
-        // Build a seeded particle with prior means
-        let mut seed_particle = vec![0.0; n_joint];
-        for j in 0..n_model_params {
-            seed_particle[j] = pop_prior_ref[j].0.clamp(joint_lower[j], joint_upper[j]);
+    // Starting points for L-BFGS on the joint cost, all with offsets at the
+    // relative-prior means unless noted:
+    // - reference at the population prior means, t0 just before peak
+    //   (always feasible);
+    // - the best of a screened t0 grid x shape sample per t0 bin;
+    // - the reference band's fast single-band fit, and that fit with each
+    //   other band's own fit (seeded at the reference t0) as its offsets.
+    let clamp_to_box = |x: &mut [f64]| {
+        for d in 0..x.len() {
+            x[d] = x[d].clamp(joint_lower[d], joint_upper[d]);
         }
-        // Set t0 near peak of reference band
-        {
-            let ref_data = &band_entries[0].1;
-            let mut peak_time = ref_data.times[0];
-            let mut peak_flux = f64::NEG_INFINITY;
-            for i in 0..ref_data.times.len() {
-                if !ref_data.is_upper[i] && ref_data.flux[i] > peak_flux {
-                    peak_flux = ref_data.flux[i];
-                    peak_time = ref_data.times[i];
-                }
-            }
-            seed_particle[t0_idx] = (peak_time - 5.0).clamp(joint_lower[t0_idx], joint_upper[t0_idx]);
-        }
-        // Offsets at prior means
-        for b in 1..n_bands {
-            let off = n_model_params + (b - 1) * n_model_params;
-            for (j, &(mean, _sigma, _is_add)) in rel_priors.iter().enumerate() {
-                seed_particle[off + j] = mean.clamp(joint_lower[off + j], joint_upper[off + j]);
-            }
-        }
-
-        for (i, &seed) in seeds.iter().enumerate() {
-            // JAX-calibrated PSO config (Sushant/villar-pso):
-            // 200 particles, 1500 max iters, 60 stall iters
-            let (params, cost) = pso_minimize(|p| joint_cost(p), &joint_lower, &joint_upper,
-                200, 1500, 60, seed, (i == 1).then_some(seed_particle.as_slice()));
-            if cost < best_c {
-                best_c = cost;
-                best = params;
-            }
-        }
-        (best, best_c)
     };
+    let mut prior_start = vec![0.0; n_joint];
+    let pop_prior_ref = population_priors(model);
+    for j in 0..n_model_params {
+        prior_start[j] = pop_prior_ref[j].0;
+    }
+    for b in 1..n_bands {
+        for (j, &(mean, _sigma, _is_add)) in rel_priors.iter().enumerate() {
+            prior_start[n_model_params * b + j] = mean;
+        }
+    }
+    prior_start[t0_idx] = peak_time - 5.0;
+    clamp_to_box(&mut prior_start);
 
+    let mut starts = vec![prior_start.clone()];
+    starts.extend(screen_joint_villar_starts(&problem, &prior_start, &joint_lower, &joint_upper));
+    // Each band's own single-band fit (reference first), also a start for the
+    // per-band polish below
+    let mut own_fits: Vec<Option<Vec<f64>>> = vec![None; n_bands];
+    let (_, ref_fit, _) = pso_fit_single_model_t0(ref_data, model, None);
+    if ref_fit.len() == n_model_params {
+        own_fits[0] = Some(ref_fit.clone());
+        let mut x = prior_start.clone();
+        x[..n_model_params].copy_from_slice(&ref_fit);
+        clamp_to_box(&mut x);
+        starts.push(x.clone());
+
+        let ref_t0 = x[t0_idx];
+        for b in 1..n_bands {
+            let (_, band_fit, _) = pso_fit_single_model_t0(&band_entries[b].1, model, Some(ref_t0));
+            if band_fit.len() == n_model_params {
+                for j in 0..n_model_params {
+                    x[n_model_params * b + j] = band_fit[j] - x[j];
+                }
+                own_fits[b] = Some(band_fit);
+            }
+        }
+        clamp_to_box(&mut x);
+        starts.push(x);
+    }
+
+    let by_cost = |a: &(Vec<f64>, f64), b: &(Vec<f64>, f64)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+    let mut cands: Vec<(Vec<f64>, f64)> = starts.par_iter()
+        .map(|x0| projected_lbfgs(&problem, x0, &joint_lower, &joint_upper, 200))
+        .collect();
+    cands.sort_by(by_cost);
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    // The joint cost is multimodal, so local polishing alone misses the
+    // global minimum: a few small PSO restarts (the first seeded with the
+    // best polished start), each polished with L-BFGS.
+    let best_start = cands[0].0.clone();
+    cands.par_extend(MB_PSO_SEEDS.par_iter()
+        .enumerate()
+        .map(|(r, &seed)| {
+            let mut buf = vec![0.0; problem.n_obs()];
+            let (swarm, _) = pso_minimize(|p| problem.value(p, &mut buf), &joint_lower, &joint_upper,
+                MB_PSO_PARTICLES, MB_PSO_ITERS, MB_PSO_STALL, seed, (r == 0).then_some(best_start.as_slice()));
+            projected_lbfgs(&problem, &swarm, &joint_lower, &joint_upper, 200)
+        }));
+    cands.sort_by(by_cost);
+    let (best_params, best_cost) = cands[0].clone();
     if best_params.is_empty() {
         return Vec::new();
     }
 
     // Extract per-band results
-    let ref_params = &best_params[..n_model_params];
     let svi_lr = 0.005;
     let svi_n_steps = 500;
     let svi_n_samples = 16;
 
+    let band_params_all: Vec<Vec<f64>> = (0..n_bands).map(|b| {
+        (0..n_model_params).map(|j| best_params[j] + if b > 0 { best_params[n_model_params * b + j] } else { 0.0 }).collect()
+    }).collect();
+
+    // Polish each band to its own MAP (per-band Laplace takes its curvature
+    // there). Starts: the band's slice of the best joint candidates, its own
+    // single-band fit, and the reference band's polished shape.
+    let mut band_maps: Vec<Vec<f64>> = Vec::with_capacity(n_bands);
+    for (b, (_, data, _)) in band_entries.iter().enumerate() {
+        let cand_params: Vec<Vec<f64>> = cands.iter().skip(1).take(MB_N_BAND_CANDS - 1).map(|(x, _)| {
+            (0..n_model_params).map(|j| x[j] + if b > 0 { x[n_model_params * b + j] } else { 0.0 }).collect()
+        }).collect();
+        let mut polish_starts: Vec<&[f64]> = vec![&band_params_all[b]];
+        polish_starts.extend(cand_params.iter().map(|v| v.as_slice()));
+        polish_starts.extend(own_fits[b].as_deref());
+        if b > 0 {
+            polish_starts.push(&band_maps[0]);
+        }
+        let widen = (b > 0).then(|| {
+            let off = n_model_params * b;
+            (&joint_lower[off..off + n_model_params], &joint_upper[off..off + n_model_params])
+        });
+        band_maps.push(polish_band_map(model, data, &polish_starts, widen));
+    }
+    // Shape information also flows back: the other bands' maps start the
+    // reference band's polish
+    if n_bands > 1 {
+        let starts: Vec<&[f64]> = band_maps.iter().map(|m| m.as_slice()).collect();
+        band_maps[0] = polish_band_map(model, &band_entries[0].1, &starts, None);
+    }
+
     let mut results = Vec::new();
     for (b, (band_name, data, mags_obs)) in band_entries.iter().enumerate() {
-        let band_params: Vec<f64> = if b == 0 {
-            ref_params.to_vec()
-        } else {
-            let off_start = n_model_params + (b - 1) * n_model_params;
-            let offsets = &best_params[off_start..off_start + n_model_params];
-            (0..n_model_params).map(|j| ref_params[j] + offsets[j]).collect()
-        };
-
-        // Run per-band SVI/Laplace from the joint solution
+        let band_params = band_params_all[b].clone();
+        let band_map = &band_maps[b];
         let mut svi_result = match method {
-            UncertaintyMethod::Svi => svi_fit(model, data, svi_n_steps, svi_n_samples, svi_lr, Some(&band_params)),
-            UncertaintyMethod::Laplace => laplace_fit(model, data, &band_params),
+            UncertaintyMethod::Svi => svi_fit(model, data, svi_n_steps, svi_n_samples, svi_lr, Some(band_map)),
+            UncertaintyMethod::Laplace => laplace_fit(model, data, band_map),
         };
         profile_t0_refine(&mut svi_result, data);
         profile_refine_all(&mut svi_result, data);
@@ -5094,6 +5326,47 @@ mod tests {
         // erf approximation there, but must stay close (and finite)
         let worst = multi_bazin_worst_grad_error(true);
         assert!(worst < 5e-2, "worst relative gradient error with upper limits {worst:e}");
+    }
+
+    #[test]
+    fn joint_villar_gradient_matches_finite_differences() {
+        let mk = |times: Vec<f64>, truth: &[f64], upper: &[usize]| {
+            let mut flux = vec![0.0; times.len()];
+            eval_model_batch_into(SviModel::Villar, truth, &times, &mut flux);
+            let n = times.len();
+            let mut is_upper = vec![false; n];
+            for &i in upper {
+                is_upper[i] = true;
+            }
+            BandFitData {
+                flux_err: vec![0.02; n], obs_var: vec![0.02f64.powi(2) + 1e-10; n],
+                is_upper, upper_flux: vec![0.06; n], noise_frac_median: 0.0, peak_flux_obs: 1.0,
+                times, flux,
+            }
+        };
+        let truth = [0.0, 0.01, 2.5, -5.0, 1.0, 3.0, -3.0];
+        let d0 = mk((0..40).map(|i| -20.0 + i as f64 * 2.0).collect(), &truth, &[0, 1]);
+        let d1 = mk((0..15).map(|i| -15.0 + i as f64 * 4.0).collect(), &truth, &[]);
+        let problem = JointVillarCost {
+            bands: vec![&d0, &d1],
+            weights: vec![55.0 / 2.0 / 40.0, 55.0 / 2.0 / 15.0],
+            ref_priors: population_priors_for_fit(SviModel::Villar),
+            rel_priors: relative_band_priors(),
+            n_total: 55.0,
+        };
+        let p = [0.1, 0.012, 2.4, -4.0, 1.1, 2.9, -2.5, 0.05, -0.001, -0.1, -0.5, 0.1, -0.1, 0.2];
+        let (mut g, mut scratch, mut buf) = (vec![0.0; p.len()], vec![0.0; p.len()], vec![0.0; 40]);
+        let f = problem.value_and_grad(&p, &mut g, &mut scratch);
+        assert!((f - problem.value(&p, &mut buf)).abs() < 1e-9 * f.abs().max(1.0));
+        for j in 0..p.len() {
+            let h = 1e-6;
+            let (mut a, mut b) = (p.to_vec(), p.to_vec());
+            a[j] += h;
+            b[j] -= h;
+            let fd = (problem.value(&a, &mut buf) - problem.value(&b, &mut buf)) / (2.0 * h);
+            let err = (fd - g[j]).abs() / fd.abs().max(g[j].abs()).max(1e-4);
+            assert!(err < 1e-4, "param {j}: analytic {} vs finite difference {fd}", g[j]);
+        }
     }
 
     #[test]
