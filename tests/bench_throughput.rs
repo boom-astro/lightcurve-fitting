@@ -260,7 +260,7 @@ fn parametric_point_scaling() {
             if !batch_sources.is_empty() {
                 let data = GpuBatchData::new(&batch_sources).expect("GPU upload");
                 let wall = bench_best_of(N_WARMUP, N_REPEAT, || {
-                    let _ = ctx.batch_model_select(&data, 30, 50, 10, 2.0).unwrap();
+                    let _ = ctx.batch_model_select(&data, &batch_sources, 30, 50, 10, 2.0).unwrap();
                 });
                 print_row("GPU", FIXED_SOURCES, n_pts, wall);
                 csv.add_row("parametric", "GPU", FIXED_SOURCES, n_pts, wall);
@@ -317,7 +317,7 @@ fn parametric_source_scaling() {
             if !batch_sources.is_empty() {
                 let data = GpuBatchData::new(&batch_sources).expect("GPU upload");
                 let wall = bench_best_of(N_WARMUP, N_REPEAT, || {
-                    let _ = ctx.batch_model_select(&data, 30, 50, 10, 2.0).unwrap();
+                    let _ = ctx.batch_model_select(&data, &batch_sources, 30, 50, 10, 2.0).unwrap();
                 });
                 print_row("GPU", n_src, FIXED_POINTS, wall);
                 csv.add_row("parametric", "GPU", n_src, FIXED_POINTS, wall);

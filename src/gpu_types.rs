@@ -47,6 +47,20 @@ impl GpuModelName {
         }
     }
 
+    /// Index of the t0 parameter in the parameter vector (matches SviModel::t0_idx).
+    pub fn t0_idx(self) -> usize {
+        match self {
+            GpuModelName::Bazin => 2,
+            GpuModelName::Villar => 3,
+            GpuModelName::Tde => 2,
+            GpuModelName::Arnett => 1,
+            GpuModelName::Magnetar => 1,
+            GpuModelName::ShockCooling => 1,
+            GpuModelName::Afterglow => 1,
+            GpuModelName::MetzgerKN => 3,
+        }
+    }
+
     /// Integer model ID matching the GPU kernel's switch statement.
     pub fn model_id(self) -> c_int {
         match self {

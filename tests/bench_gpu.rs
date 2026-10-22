@@ -121,7 +121,7 @@ fn bench_gpu_vs_cpu() {
     let data = GpuBatchData::new(&batch_sources).expect("GPU upload failed");
 
     let gpu_t0 = std::time::Instant::now();
-    let gpu_results = ctx.batch_model_select(&data, 40, 50, 10, 2.0)
+    let gpu_results = ctx.batch_model_select(&data, &batch_sources, 40, 50, 10, 2.0)
         .expect("GPU batch model select failed");
     let gpu_ms = gpu_t0.elapsed().as_millis();
 
