@@ -1255,7 +1255,7 @@ impl PsoCost<'_> {
             let total_var = self.obs_var[i] + sigma_extra_sq;
             if self.is_upper[i] {
                 let z = (self.upper_flux[i] - pred) / total_var.sqrt();
-                neg_ll -= log_normal_cdf(z);
+                neg_ll -= 2.0 * log_normal_cdf(z);
             } else {
                 let diff = pred - self.flux[i];
                 neg_ll += diff * diff / total_var + total_var.ln();
@@ -1269,7 +1269,7 @@ impl PsoCost<'_> {
             for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
                 if j < p.len() && width > 0.0 {
                     let z = (p[j] - center) / width;
-                    neg_lp += 0.5 * z * z;
+                    neg_lp += z * z;
                 }
             }
             neg_ll += neg_lp / n;
@@ -1317,13 +1317,13 @@ impl Gradient for PsoCost<'_> {
             let total_var = self.obs_var[i] + sigma_extra_sq;
 
             if self.is_upper[i] {
-                // Gradient of -log(Phi(z)) where z = (upper - pred) / sqrt(total_var)
+                // Gradient of -2 log(Phi(z)) where z = (upper - pred) / sqrt(total_var)
                 let sqrt_var = total_var.sqrt();
                 let z = (self.upper_flux[i] - pred) / sqrt_var;
-                // d/dz [-log(Phi(z))] = -phi(z)/Phi(z)
+                // d/dz [-2 log(Phi(z))] = -2 phi(z)/Phi(z)
                 let phi = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
                 let cdf = 0.5 * (1.0 + erf_approx(z / std::f64::consts::SQRT_2));
-                let ratio = phi / cdf.max(1e-300);
+                let ratio = 2.0 * phi / cdf.max(1e-300);
                 // dz/dpred = -1/sqrt(total_var), dz/dse = z * sigma_extra_sq / total_var
                 eval_model_grad(self.model, p, self.times[i], &mut model_grad);
                 for j in 0..n_params {
@@ -1344,6 +1344,13 @@ impl Gradient for PsoCost<'_> {
                 // multiply by se for d/d(log_se)
                 let dvar_dlse = 2.0 * sigma_extra_sq; // d(sigma_extra²)/d(log_sigma_extra)
                 grad[se_idx] += (-diff * diff / (total_var * total_var) + 1.0 / total_var) * dvar_dlse;
+            }
+        }
+
+        // Population prior: d/dp [z^2 / n] with z = (p - center) / width
+        for (j, &(center, width)) in self.pop_priors.iter().enumerate() {
+            if j < n_params && width > 0.0 {
+                grad[j] += 2.0 * (p[j] - center) / (width * width) / n;
             }
         }
 
@@ -3856,7 +3863,7 @@ pub fn fit_parametric_multiband(
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= 2.0 * log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
                     band_nll += diff * diff / tv + tv.ln();
@@ -3896,7 +3903,7 @@ pub fn fit_parametric_multiband(
                 if !preds[i].is_finite() { return 1e99; }
                 let tv = data.obs_var[i] + sigma_extra_sq;
                 if data.is_upper[i] {
-                    band_nll -= log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
+                    band_nll -= 2.0 * log_normal_cdf((data.upper_flux[i] - preds[i]) / tv.sqrt());
                 } else {
                     let diff = preds[i] - data.flux[i];
                     band_nll += diff * diff / tv + tv.ln();
@@ -3914,7 +3921,7 @@ pub fn fit_parametric_multiband(
         for (j, &(center, width)) in pop_prior_ref.iter().enumerate() {
             if j < n_model_params && width > 0.0 {
                 let z = (ref_params[j] - center) / width;
-                neg_lp += 0.5 * z * z;
+                neg_lp += z * z;
             }
         }
 
@@ -3924,7 +3931,7 @@ pub fn fit_parametric_multiband(
             for (j, &(mean, sigma, _is_add)) in rel_priors.iter().enumerate() {
                 if sigma > 0.0 {
                     let z = (p[off_start + j] - mean) / sigma;
-                    neg_lp += 0.5 * z * z;
+                    neg_lp += z * z;
                 }
             }
         }
@@ -4075,5 +4082,115 @@ mod tests {
         let sigma: Vec<f64> = log_sigma_from_hessian(&hessian, 2).iter().map(|l| l.exp()).collect();
         assert!(sigma[0] > 100.0, "unmeasured parameter should get the wide fallback, got {}", sigma[0]);
         assert!((sigma[1] - 1.0 / 3.0).abs() < 1e-9, "coupled parameter's sigma changed: {}", sigma[1]);
+    }
+
+    /// One band of noiseless `model` flux at `truth`. The first four points are
+    /// upper limits placed close to the model at `near`, so their terms in the
+    /// cost are not saturated there.
+    fn pso_test_band(model: SviModel, truth: &[f64], near: &[f64]) -> BandFitData {
+        let times: Vec<f64> = (0..40).map(|i| -10.0 + 2.5 * i as f64).collect();
+        let flux = eval_model_batch(model, truth, &times);
+        let near_flux = eval_model_batch(model, near, &times);
+        let flux_err = vec![0.02; times.len()];
+        let obs_var: Vec<f64> = flux_err.iter().map(|e| e * e + 1e-10).collect();
+        let mut is_upper = vec![false; times.len()];
+        let mut upper_flux: Vec<f64> = flux_err.iter().map(|e| 3.0 * e).collect();
+        for (i, shift) in [-0.02, 0.005, 0.01, 0.03].iter().enumerate() {
+            is_upper[i] = true;
+            upper_flux[i] = near_flux[i] + shift;
+        }
+        BandFitData {
+            times,
+            flux,
+            flux_err,
+            obs_var,
+            is_upper,
+            upper_flux,
+            noise_frac_median: 0.0,
+            peak_flux_obs: 1.0,
+        }
+    }
+
+    fn pso_test_cost(model: SviModel, data: &BandFitData) -> PsoCost<'_> {
+        PsoCost {
+            times: &data.times,
+            flux: &data.flux,
+            flux_err: &data.flux_err,
+            obs_var: &data.obs_var,
+            is_upper: &data.is_upper,
+            upper_flux: &data.upper_flux,
+            model,
+            pop_priors: population_priors(model),
+        }
+    }
+
+    #[test]
+    fn pso_cost_is_minus_two_log_posterior() {
+        let model = SviModel::Bazin;
+        let p = [0.1, 0.01, 6.0, 1.1, 2.4, -3.5];
+        let data = pso_test_band(model, &[0.0, 0.0, 5.0, 1.0, 2.5, -4.0], &p);
+        let problem = pso_test_cost(model, &data);
+        let n = data.times.len() as f64;
+        let n_det = data.is_upper.iter().filter(|&&u| !u).count() as f64;
+        let cost = problem.cost_from_slice(&p, &mut vec![0.0; data.times.len()]);
+
+        // -ln L as computed by neg_log_posterior, without its prior and its
+        // 2 pi constant for detections.
+        let svi_neg_lp: f64 = prior_params(model)
+            .iter()
+            .zip(&p)
+            .map(|(&(c, w), &x)| 0.5 * ((x - c) / w).powi(2))
+            .sum();
+        let neg_ll = neg_log_posterior(model, &data, &p)
+            - svi_neg_lp
+            - 0.5 * n_det * (2.0 * std::f64::consts::PI).ln();
+        let z_sq: f64 = population_priors(model)
+            .iter()
+            .zip(&p)
+            .map(|(&(c, w), &x)| ((x - c) / w).powi(2))
+            .sum();
+
+        let expected = (2.0 * neg_ll + z_sq / n) / n;
+        assert!(
+            (cost - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+            "PSO cost {cost} vs -2 ln posterior {expected}"
+        );
+    }
+
+    #[test]
+    fn pso_cost_gradient_matches_finite_differences() {
+        let cases = [
+            (
+                SviModel::Bazin,
+                vec![0.0, 0.0, 5.0, 1.0, 2.5, -4.0],
+                vec![0.1, 0.01, 6.0, 1.1, 2.4, -3.5],
+            ),
+            (
+                SviModel::Villar,
+                vec![0.0, 0.01, 20f64.ln(), 10.0, 3f64.ln(), 30f64.ln(), -4.0],
+                vec![0.05, 0.012, 2.9, 10.5, 1.0, 3.3, -3.5],
+            ),
+        ];
+        for (model, truth, p) in cases {
+            let data = pso_test_band(model, &truth, &p);
+            let problem = pso_test_cost(model, &data);
+            let mut buf = vec![0.0; data.times.len()];
+            assert!(problem.cost_from_slice(&p, &mut buf) < 1e12, "{model:?} test point violates the Villar constraint");
+
+            let grad = problem.gradient(&p).unwrap();
+            for j in 0..p.len() {
+                let h = 1e-6 * p[j].abs().max(1.0);
+                let mut p_hi = p.clone();
+                let mut p_lo = p.clone();
+                p_hi[j] += h;
+                p_lo[j] -= h;
+                let fd = (problem.cost_from_slice(&p_hi, &mut buf) - problem.cost_from_slice(&p_lo, &mut buf)) / (2.0 * h);
+                assert!(
+                    (grad[j] - fd).abs() <= 1e-6 + 1e-5 * fd.abs(),
+                    "{model:?} param {j}: analytic gradient {} vs finite difference {fd}",
+                    grad[j]
+                );
+            }
+        }
     }
 }

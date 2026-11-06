@@ -475,7 +475,7 @@ extern "C" __global__ void batch_pso_cost(
 
             if (all_is_upper[i]) {
                 double z = (all_upper_flux[i] - pred) / sqrt(total_var);
-                neg_ll -= log_normal_cdf_d(z);
+                neg_ll -= 2.0 * log_normal_cdf_d(z);
             } else {
                 double diff = pred - all_flux[i];
                 neg_ll += diff * diff / total_var + log(total_var);
@@ -490,7 +490,7 @@ extern "C" __global__ void batch_pso_cost(
 
             if (all_is_upper[i]) {
                 double z = (all_upper_flux[i] - pred) / sqrt(total_var);
-                neg_ll -= log_normal_cdf_d(z);
+                neg_ll -= 2.0 * log_normal_cdf_d(z);
             } else {
                 double diff = pred - all_flux[i];
                 neg_ll += diff * diff / total_var + log(total_var);

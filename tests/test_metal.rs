@@ -314,7 +314,7 @@ mod metal_gpu {
         let r = &ctx.batch_pso(GpuModelName::MetzgerKN, &data, 40, 40, 10, 7).unwrap()[0];
 
         // CPU recomputation of the kernel's cost: peak-1 rescale over detections,
-        // then sum((pred - f)^2 / var + ln var) and -ln Phi(z) for upper limits.
+        // then sum((pred - f)^2 / var + ln var) and -2 ln Phi(z) for upper limits.
         let mut preds = eval_model_flux(SviModelName::MetzgerKN, &r.params, &times);
         let max_det = preds
             .iter()
@@ -330,7 +330,7 @@ mod metal_gpu {
             let var = noise_level * noise_level + 1e-10 + se_sq;
             if is_upper[i] {
                 let z = (3.0 * noise_level - preds[i]) / var.sqrt();
-                cost -= (0.5 * libm_erfc(-z / std::f64::consts::SQRT_2)).max(1e-300).ln();
+                cost -= 2.0 * (0.5 * libm_erfc(-z / std::f64::consts::SQRT_2)).max(1e-300).ln();
             } else {
                 cost += (preds[i] - flux[i]).powi(2) / var + var.ln();
             }
