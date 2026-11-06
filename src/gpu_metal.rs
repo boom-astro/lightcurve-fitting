@@ -387,7 +387,7 @@ impl GpuContext {
                     for (j, &(center, width)) in pop_priors.iter().enumerate() {
                         if j < dim && width > 0.0 {
                             let z = (positions[base + j] - center) / width;
-                            neg_lp += 0.5 * z * z;
+                            neg_lp += z * z;
                         }
                     }
                     h_costs[idx] += neg_lp / (n_obs * n_obs);
