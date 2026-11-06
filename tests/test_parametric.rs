@@ -1,7 +1,7 @@
 mod synthetic;
 
 use lightcurve_fitting::parametric::SviModelName;
-use lightcurve_fitting::{build_flux_bands, fit_parametric, UncertaintyMethod};
+use lightcurve_fitting::{build_flux_bands, fit_parametric, fit_parametric_multiband, UncertaintyMethod};
 
 #[test]
 fn parametric_returns_results() {
@@ -316,4 +316,19 @@ fn gpu_finalize_rejects_mismatched_band_names() {
     let svi = (vec![0.0; 6], vec![0.0; 6], 0.0);
     // Two results, one name.
     finalize_parametric_with_gpu_svi(&flux_bands, &[gpu.clone(), gpu], &[svi.clone(), svi], &["g".to_string()]);
+}
+
+#[test]
+fn multiband_returns_finite_results_for_every_band() {
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 400);
+    let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+    let results = fit_parametric_multiband(&flux_bands, UncertaintyMethod::Laplace);
+
+    assert_eq!(results.len(), 3, "one result per band");
+    let joint_cost = results[0].pso_chi2.expect("joint cost should be finite");
+    for result in &results {
+        assert_eq!(result.model, SviModelName::Villar);
+        assert_eq!(result.pso_chi2, Some(joint_cost), "every band reports the same joint cost");
+        assert!(result.pso_params.iter().all(|v| v.is_finite()), "non-finite params in band {}", result.band);
+    }
 }
