@@ -96,4 +96,4 @@ Two GitHub Actions workflows are included:
 
 ## License
 
-GPL-3.0
+MIT
