@@ -687,11 +687,9 @@ pub fn fit_gp_2d_batch_gpu(
     }
 
     // Hyperparameter candidates
-    let amp_candidates = [0.3, 1.0, 3.0, 10.0];
-    let w_range = all_wavs.last().unwrap() - all_wavs.first().unwrap();
-    let w_range = w_range.max(0.01);
-    let lst_candidates = [global_duration / 4.0, global_duration / 8.0, global_duration / 16.0, global_duration / 32.0];
-    let lsw_candidates = [w_range * 2.0, w_range, w_range / 2.0, w_range / 4.0];
+    let amp_candidates = [0.01, 0.1, 1.0, 10.0];
+    let lst_candidates = GP2D_LS_TIME_STARTS;
+    let lsw_candidates = [0.05, 0.15, 0.5, 2.0];
     // 4 × 4 × 4 = 64 combos, fits in GP2D_MAX_HP
 
     let inputs: Vec<Gp2dInput> = valid_sources.iter().map(|(_, p)| {
