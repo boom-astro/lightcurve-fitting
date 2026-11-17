@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use argmin::core::{CostFunction, Error as ArgminError, Executor};
+use argmin::solver::neldermead::NelderMead;
 use serde::{Deserialize, Serialize};
 
 use crate::common::BandData;
@@ -118,6 +120,7 @@ pub struct DenseGP2D {
     inv_2lt2: f64,
     inv_2lw2: f64,
     y_mean: f64,
+    log_marginal_likelihood: f64,
 }
 
 impl DenseGP2D {
@@ -162,10 +165,15 @@ impl DenseGP2D {
         solve_l(&l, &y_centered, &mut tmp, n);
         solve_lt(&l, &tmp, &mut alpha, n);
 
+        let data_fit: f64 = y_centered.iter().zip(&alpha).map(|(y, a)| y * a).sum();
+        let log_det: f64 = (0..n).map(|i| l[i * n + i].ln()).sum();
+        let log_marginal_likelihood =
+            -0.5 * data_fit - log_det - 0.5 * n as f64 * (2.0 * std::f64::consts::PI).ln();
+
         Some(DenseGP2D {
             t: times.to_vec(),
             w: log_wavelengths.to_vec(),
-            l, alpha, n, amp, inv_2lt2, inv_2lw2, y_mean,
+            l, alpha, n, amp, inv_2lt2, inv_2lw2, y_mean, log_marginal_likelihood,
         })
     }
 
@@ -218,6 +226,10 @@ impl DenseGP2D {
             .map(|(p, v)| (p - v) * (p - v)).sum();
         (rss / n).sqrt()
     }
+
+    pub fn log_marginal_likelihood(&self) -> f64 {
+        self.log_marginal_likelihood
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +245,7 @@ pub struct Gp2dResult {
     pub ls_wave: f64,
     /// Train RMS.
     pub train_rms: f64,
+    pub log_likelihood: f64,
     /// Number of training points.
     pub n_train: usize,
     /// Number of bands used.
@@ -327,10 +340,55 @@ fn fit_bb_temperature(
 // Public API
 // ---------------------------------------------------------------------------
 
+const GP2D_BOUNDS: [(f64, f64); 3] = [(1e-4, 1e2), (0.5, 1e3), (1e-2, 10.0)];
+const GP2D_LS_TIME_STARTS: [f64; 4] = [3.0, 10.0, 30.0, 100.0];
+const GP2D_LS_WAVE_STARTS: [f64; 3] = [0.05, 0.3, 2.0];
+const GP2D_MAX_ITERS: u64 = 80;
+
+#[derive(Clone, Copy)]
+struct Gp2dCost<'a> {
+    t: &'a [f64],
+    w: &'a [f64],
+    y: &'a [f64],
+    noise_var: &'a [f64],
+}
+
+impl Gp2dCost<'_> {
+    fn hyperparameters(x: &[f64]) -> (f64, f64, f64) {
+        let p: Vec<f64> = x
+            .iter()
+            .zip(GP2D_BOUNDS)
+            .map(|(v, (lo, hi))| v.exp().clamp(lo, hi))
+            .collect();
+        (p[0], p[1], p[2])
+    }
+
+    fn fit(&self, x: &[f64]) -> Option<DenseGP2D> {
+        let (amp, ls_time, ls_wave) = Self::hyperparameters(x);
+        DenseGP2D::fit(self.t, self.w, self.y, self.noise_var, amp, ls_time, ls_wave)
+    }
+
+    fn negative_log_likelihood(&self, x: &[f64]) -> f64 {
+        self.fit(x)
+            .map(|gp| -gp.log_marginal_likelihood())
+            .filter(|c| c.is_finite())
+            .unwrap_or(f64::INFINITY)
+    }
+}
+
+impl CostFunction for Gp2dCost<'_> {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, x: &Self::Param) -> Result<Self::Output, ArgminError> {
+        Ok(self.negative_log_likelihood(x))
+    }
+}
+
 /// Fit a 2D GP to multi-band magnitude data.
 ///
 /// Concatenates all bands into a single training set with (time, log10_wavelength)
-/// inputs. Performs grid search over hyperparameters.
+/// inputs.
 ///
 /// Returns the fitted GP and a result struct, or None if insufficient data.
 pub fn fit_gp_2d(
@@ -387,48 +445,54 @@ pub fn fit_gp_2d(
         (st, sw, sm, sn)
     };
 
-    // Time extent
-    let t_min = sub_t.iter().cloned().fold(f64::INFINITY, f64::min);
-    let t_max = sub_t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let duration = (t_max - t_min).max(1.0);
+    let cost = Gp2dCost { t: &sub_t, w: &sub_w, y: &sub_m, noise_var: &sub_nv };
+    let mean = sub_m.iter().sum::<f64>() / sub_m.len() as f64;
+    let variance = sub_m.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / sub_m.len() as f64;
+    let ln_amp = variance.max(GP2D_BOUNDS[0].0).ln();
 
-    // Wavelength extent (in log10 space)
-    let w_min = sub_w.iter().cloned().fold(f64::INFINITY, f64::min);
-    let w_max = sub_w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let w_range = (w_max - w_min).max(0.01);
+    let start = GP2D_LS_TIME_STARTS
+        .iter()
+        .flat_map(|&ls_t| {
+            GP2D_LS_WAVE_STARTS
+                .iter()
+                .map(move |&ls_w| vec![ln_amp, ls_t.ln(), ls_w.ln()])
+        })
+        .map(|x| {
+            let c = cost.negative_log_likelihood(&x);
+            (x, c)
+        })
+        .filter(|(_, c)| c.is_finite())
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
 
-    // Grid search over hyperparameters
-    let amp_candidates = [0.3, 1.0, 3.0, 10.0];
-    let ls_time_candidates = [duration / 4.0, duration / 8.0, duration / 16.0];
-    // Wavelength lengthscale: the range in log10(Å) between bands is ~0.2
-    // (g=3.678, i=3.882). Try a range of scales.
-    let ls_wave_candidates = [w_range * 2.0, w_range, w_range / 2.0];
+    let simplex: Vec<Vec<f64>> = std::iter::once(start.0.clone())
+        .chain((0..start.0.len()).map(|i| {
+            let mut x = start.0.clone();
+            x[i] += 0.5;
+            x
+        }))
+        .collect();
 
-    let mut best_rms = f64::INFINITY;
-    let mut best_gp: Option<DenseGP2D> = None;
-    let mut best_hp = (0.3, duration / 8.0, w_range);
+    let (best_x, _) = NelderMead::<Vec<f64>, f64>::new(simplex)
+        .with_sd_tolerance(1e-4)
+        .ok()
+        .and_then(|solver| {
+            Executor::new(cost, solver)
+                .configure(|state| state.max_iters(GP2D_MAX_ITERS))
+                .run()
+                .ok()
+        })
+        .and_then(|res| Some((res.state().best_param.clone()?, res.state().best_cost)))
+        .filter(|(_, c)| *c < start.1)
+        .unwrap_or(start);
 
-    for &amp in &amp_candidates {
-        for &ls_t in &ls_time_candidates {
-            for &ls_w in &ls_wave_candidates {
-                if let Some(gp) = DenseGP2D::fit(&sub_t, &sub_w, &sub_m, &sub_nv, amp, ls_t, ls_w) {
-                    let rms = gp.train_rms(&sub_m);
-                    if rms < best_rms {
-                        best_rms = rms;
-                        best_gp = Some(gp);
-                        best_hp = (amp, ls_t, ls_w);
-                    }
-                }
-            }
-        }
-    }
-
-    let gp = best_gp?;
+    let gp = cost.fit(&best_x)?;
+    let (amp, ls_time, ls_wave) = Gp2dCost::hyperparameters(&best_x);
     let result = Gp2dResult {
-        amp: best_hp.0,
-        ls_time: best_hp.1,
-        ls_wave: best_hp.2,
-        train_rms: best_rms,
+        amp,
+        ls_time,
+        ls_wave,
+        train_rms: gp.train_rms(&sub_m),
+        log_likelihood: gp.log_marginal_likelihood(),
         n_train: sub_t.len(),
         n_bands: band_names.len(),
         bands: band_names,
@@ -667,6 +731,7 @@ pub fn fit_gp_2d_batch_gpu(
             ls_time: gout.ls_time,
             ls_wave: gout.ls_wave,
             train_rms: gout.train_rms,
+            log_likelihood: f64::NAN,
             n_train: gout.n_train,
             n_bands: prep.band_names.len(),
             bands: prep.band_names.clone(),
