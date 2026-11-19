@@ -1,0 +1,73 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so the `cuda`
+# job in gpu.yml only compiles the kernels. This builds them as PTX and runs
+# `cargo test --features cuda` (including tests/test_gpu.rs, the GPU against
+# CPU comparisons) on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "cuda/**"
+      - "tests/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cuda-tests:
+    name: CUDA tests (simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and the CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@68edfd58c091361dd6baf060b63de412e544d858 # v0.1.7
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The simulator runs PTX, not SASS, and needs the shared CUDA runtime.
+      # build.rs asks for SASS for sm_60 to sm_90 and the cc crate links the
+      # static runtime by default, so this changes build.rs in the runner's
+      # checkout only: one PTX target (compute_90) and cudart("shared").
+      # The cc crate builds the kernels with relocatable device code; with PTX
+      # only, the device link also registers libcudadevrt, which then has to
+      # be linked in (a real GPU needs it too for a PTX-only build).
+      - name: Adjust build.rs for the simulator
+        run: |
+          sed -i -E '/arch=compute_(60|70|80|89),/d;
+                     s/arch=compute_90,code=sm_90/arch=compute_90,code=compute_90/;
+                     s/\.cuda\(true\)$/.cuda(true)\n        .cudart("shared")/' build.rs
+          git diff
+          # The nvcc on PATH is the simulator's drop-in, so find the toolkit's
+          # libraries directly.
+          cuda_lib=$(dirname "$(ls /usr/local/cuda-13.0/targets/*/lib/libcudadevrt.a | head -n1)")
+          echo "RUSTFLAGS=-L native=$cuda_lib -C link-arg=-lcudadevrt" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo test --release --features cuda --no-run
+
+      - name: Test
+        run: vgpu run cargo test --release --features cuda
