@@ -429,7 +429,7 @@ kernel void batch_pso_cost(
 
         if (all_is_upper[i]) {
             float z = (all_upper_flux[i] - pred) / sqrt(total_var);
-            neg_ll -= lc_log_normal_cdf_d(z);
+            neg_ll -= 2.0f * lc_log_normal_cdf_d(z);
         } else {
             float diff = pred - all_flux[i];
             neg_ll += diff * diff / total_var + log(total_var);
