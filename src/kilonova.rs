@@ -1,4 +1,4 @@
-//! Chromatic blackbody kilonova model with a prior trained on POSSIS models.
+//! Chromatic blackbody kilonova model with a prior trained on kilonova model grids.
 //!
 //! The photosphere is a single blackbody whose luminosity and temperature evolve
 //! as low-order polynomials in x = log10(t − t_exp), with t in days:
@@ -6,21 +6,22 @@
 //!   log10 L = log_l1 + a1·x + a2·x²        log10 T = log_t1 − β·x
 //!
 //! so `log_l1` and `log_t1` are the luminosity (erg/s) and temperature (K) one
-//! day after the explosion. Each band's AB magnitude is the blackbody evaluated
-//! at the band's effective wavelength plus a fixed offset c0 + c1·x, which
-//! absorbs the departure of kilonova spectra from a blackbody (mostly an r-band
-//! deficit). The offsets and a multivariate-normal prior on the five parameters
-//! come from fits to 1,420 POSSIS Bu2019 models (Bulla 2019) in g, r and i over
-//! 0.3 to 6 days.
+//! day after the explosion. Each band's AB magnitude is the blackbody integrated
+//! through the band's transmission curve plus a fixed offset c0 + c1·x, which
+//! absorbs the departure of kilonova spectra from a blackbody. The bandpass
+//! tables, the offsets and a Gaussian prior on the five parameters are generated
+//! by `scripts/train_kilonova_prior.py`; the built-in ones come from POSSIS Bu2019
+//! models (Bulla 2019). A prior trained on other grids, with its own offsets and
+//! any number of mixture components, can be passed in `KilonovaOptions::prior`.
 //!
 //! In magnitude space `log_l1` adds the same constant to every band, so it is
 //! solved exactly at each trial point. The four shape parameters are fit by
 //! Levenberg–Marquardt; a free explosion time is searched on a grid and then
 //! refined jointly.
 //!
-//! `fit_kilonova` fits each light curve twice, once unconstrained and once held
-//! to the prior, and reports the χ² increase from the prior (`prior_cost`). The
-//! cost is small for kilonovae and approximates a log Bayes factor for a
+//! `fit_kilonova` fits each light curve once unconstrained and once held to each
+//! prior component, and reports the χ² increase from the prior (`prior_cost`).
+//! The cost is small for kilonovae and approximates a log Bayes factor for a
 //! kilonova against an arbitrary blackbody.
 
 use std::collections::HashMap;
@@ -29,42 +30,17 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::BandData;
+use crate::kilonova_tables::{
+    BANDPASS_TABLES, LOGT_MIN, LOGT_STEP, N_LOGT, PRIOR_COVS, PRIOR_MEANS, PRIOR_WEIGHTS, SED_OFFSETS,
+};
 
 pub const KILONOVA_PARAM_NAMES: [&str; 5] = ["log_l1", "a1", "a2", "log_t1", "beta"];
 
-/// Prior mean of (log_l1, a1, a2, log_t1, beta) over the POSSIS Bu2019 fits.
-pub const KILONOVA_PRIOR_MEAN: [f64; 5] = [
-    41.629614091444985,
-    0.2808372156230851,
-    -1.8793073325847935,
-    3.770662925560441,
-    0.38540599767451444,
-];
-
-/// Prior covariance matching `KILONOVA_PRIOR_MEAN`.
-pub const KILONOVA_PRIOR_COV: [[f64; 5]; 5] = [
-    [0.09341350435990478, -0.04272435872584099, -0.048376214009666026, 0.012745890395985476, 0.007388732897827619],
-    [-0.04272435872584099, 0.2840884226143154, -0.12962772396549263, -0.014552316187450474, -0.03176777343702196],
-    [-0.048376214009666026, -0.12962772396549263, 0.3803867498941516, 0.015340811932543465, 0.023590717404701207],
-    [0.012745890395985476, -0.014552316187450474, 0.015340811932543465, 0.015672997350381596, 0.01482290743854647],
-    [0.007388732897827619, -0.03176777343702196, 0.023590717404701207, 0.01482290743854647, 0.018418533349995304],
-];
-
 const SHAPE_LO: [f64; 4] = [-5.0, -8.0, 3.0, -1.5];
 const SHAPE_HI: [f64; 4] = [5.0, 3.0, 4.7, 2.5];
-const SHAPE_STARTS: [[f64; 4]; 2] = [
-    [0.2808372156230851, -1.8793073325847935, 3.770662925560441, 0.38540599767451444],
-    [0.0, -1.5, 3.75, 0.4],
-];
 const N_TEXP_GRID: usize = 10;
 /// Latest allowed explosion time, in days before the first observation.
 const TEXP_MIN_LEAD: f64 = 0.05;
-
-const H_PLANCK: f64 = 6.62607015e-27;
-const C_LIGHT: f64 = 2.99792458e10;
-const SIGMA_SB: f64 = 5.670374e-5;
-const PC10_CM: f64 = 3.0857e19;
-const HC_OVER_K_ANG: f64 = 1.4387769e8;
 
 // ---------------------------------------------------------------------------
 // Bands
@@ -72,104 +48,178 @@ const HC_OVER_K_ANG: f64 = 1.4387769e8;
 
 #[derive(Debug, Clone, Copy)]
 struct BandInfo {
-    lambda: f64,
+    table: &'static [f64; N_LOGT],
     c0: f64,
     c1: f64,
 }
 
-/// Per-band offsets from a blackbody, c0 + c1·log10(t), for the POSSIS grid bands.
-fn sed_offset(canonical: char) -> (f64, f64) {
-    match canonical {
-        'g' => (0.054718108384186476, -0.20783429761199412),
-        'r' => (0.0564331058022488, 0.21325317910577474),
-        'i' => (-0.0777315084946671, 0.15201701017236538),
-        'z' => (-0.1314659912859724, 0.10817219745392252),
-        'y' => (-0.07760097418505162, -0.13455795294380155),
-        'J' => (0.023550516501264218, 0.00023857388670880928),
-        'H' => (0.03547043573416041, 0.03658645520399672),
-        'K' => (0.11881926136352475, -0.1965302990556245),
-        _ => (0.0, 0.0),
-    }
+/// Bandpass (sncosmo name) and grid band for a band name, or None if unsupported.
+///
+/// Bare names (`g`, `r`, `i`, `z`, `y`, `J`, `H`, `K`) mean the filters the model
+/// grids were synthesised in: SDSS griz, Swope Y, J and H, and CSP K. u band is
+/// excluded because kilonova spectra depart from a blackbody there by more than
+/// a magnitude, differently in every model.
+fn band_lookup(band: &str) -> Option<(&'static str, char)> {
+    Some(match band {
+        "ztfg" => ("ztfg", 'g'),
+        "ztfr" => ("ztfr", 'r'),
+        "ztfi" => ("ztfi", 'i'),
+        "lsstg" => ("lsstg", 'g'),
+        "lsstr" => ("lsstr", 'r'),
+        "lssti" => ("lssti", 'i'),
+        "lsstz" => ("lsstz", 'z'),
+        "lssty" => ("lssty", 'y'),
+        "ps1::g" => ("ps1::g", 'g'),
+        "ps1::r" => ("ps1::r", 'r'),
+        "ps1::i" => ("ps1::i", 'i'),
+        "ps1::z" => ("ps1::z", 'z'),
+        "ps1::y" => ("ps1::y", 'y'),
+        "g" | "sdssg" => ("sdssg", 'g'),
+        "r" | "sdssr" => ("sdssr", 'r'),
+        "i" | "sdssi" => ("sdssi", 'i'),
+        "z" | "sdssz" => ("sdssz", 'z'),
+        "y" | "swope2::y" => ("swope2::y", 'y'),
+        "J" | "swope2::j" => ("swope2::j", 'J'),
+        "H" | "swope2::h" => ("swope2::h", 'H'),
+        "K" | "Ks" | "cspk" => ("cspk", 'K'),
+        "2massj" => ("2massj", 'J'),
+        "2massh" => ("2massh", 'H'),
+        "2massks" | "2massk" => ("2massks", 'K'),
+        _ => return None,
+    })
 }
 
-/// Effective wavelength (Å) and offsets for a band name, or None if unsupported.
-/// u band is excluded: its offset scatters by 1.1 mag across the grid.
-fn band_info(band: &str) -> Option<BandInfo> {
-    let (lambda, canonical) = match band {
-        "ztfg" => (4746.0, 'g'),
-        "ztfr" => (6366.0, 'r'),
-        "ztfi" => (7829.0, 'i'),
-        "lsstg" => (4827.0, 'g'),
-        "lsstr" => (6223.0, 'r'),
-        "lssti" => (7546.0, 'i'),
-        "lsstz" => (8691.0, 'z'),
-        "lssty" => (9712.0, 'y'),
-        "ps1::g" => (4810.0, 'g'),
-        "ps1::r" => (6170.0, 'r'),
-        "ps1::i" => (7520.0, 'i'),
-        "ps1::z" => (8660.0, 'z'),
-        "ps1::y" => (9620.0, 'y'),
-        "g" | "sdssg" => (4686.0, 'g'),
-        "r" | "sdssr" => (6166.0, 'r'),
-        "i" | "sdssi" => (7480.0, 'i'),
-        "z" | "sdssz" => (8932.0, 'z'),
-        "y" => (9620.0, 'y'),
-        "J" | "2massj" => (12350.0, 'J'),
-        "H" | "2massh" => (16620.0, 'H'),
-        "K" | "Ks" | "2massks" | "2massk" => (21590.0, 'K'),
-        _ => return None,
+fn band_info(band: &str, offsets: Option<&HashMap<String, (f64, f64)>>) -> Option<BandInfo> {
+    let (bandpass, canonical) = band_lookup(band)?;
+    let table = &BANDPASS_TABLES.iter().find(|(n, _)| *n == bandpass)?.1;
+    let (c0, c1) = match offsets {
+        Some(map) => *map.get(&canonical.to_string())?,
+        None => {
+            let (_, c0, c1) = *SED_OFFSETS.iter().find(|(c, _, _)| *c == canonical)?;
+            (c0, c1)
+        }
     };
-    let (c0, c1) = sed_offset(canonical);
-    Some(BandInfo { lambda, c0, c1 })
+    Some(BandInfo { table, c0, c1 })
 }
 
 /// True if `fit_kilonova` uses this band name.
 pub fn kilonova_band_supported(band: &str) -> bool {
-    band_info(band).is_some()
+    band_info(band, None).is_some()
 }
 
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
-/// log10 of the frequency-dependent constants in F_ν = L·B_ν(T) / (4σT⁴D²) at D = 10 pc.
+/// Bandpass-integrated AB magnitude of a blackbody with L = 1 erg/s at 10 pc.
+/// Linear interpolation in log10 T, held constant beyond the table.
 #[inline]
-fn log_fnu_const(lambda_ang: f64) -> f64 {
-    let nu = C_LIGHT / (lambda_ang * 1e-8);
-    (2.0 * H_PLANCK * nu.powi(3) / (C_LIGHT * C_LIGHT)).log10()
-        - (4.0 * SIGMA_SB).log10()
-        - 2.0 * PC10_CM.log10()
+fn unit_lum_mag(table: &[f64; N_LOGT], log_t: f64) -> f64 {
+    let u = ((log_t - LOGT_MIN) / LOGT_STEP).clamp(0.0, (N_LOGT - 1) as f64);
+    let k = (u as usize).min(N_LOGT - 2);
+    let f = u - k as f64;
+    table[k] * (1.0 - f) + table[k + 1] * f
 }
 
-/// Absolute AB magnitude of the blackbody part with log_l = 0; add −2.5·log_l for luminosity.
+/// Model magnitude with log_l1 = 0; the full magnitude subtracts 2.5·log_l1.
 #[inline]
-fn bb_mag_unit_lum(lambda_ang: f64, k_lambda: f64, log_t: f64) -> f64 {
-    let x = (HC_OVER_K_ANG / (lambda_ang * 10f64.powf(log_t))).clamp(1e-8, 700.0);
-    // log10 B_ν minus its constant part; ln(1 − e^−x) stays finite for large x.
-    let log_planck = -(x + (-(-x).exp()).ln_1p()) / std::f64::consts::LN_10;
-    -2.5 * (k_lambda - 4.0 * log_t + log_planck) - 48.6
-}
-
-#[inline]
-fn mag_unit_lum(info: &BandInfo, k_lambda: f64, shape: &[f64], t_since: f64) -> f64 {
+fn mag_unit_lum(info: &BandInfo, shape: &[f64], t_since: f64) -> f64 {
     let x = t_since.max(1e-3).log10();
     let log_l_rel = shape[0] * x + shape[1] * x * x;
     let log_t = shape[2] - shape[3] * x;
-    bb_mag_unit_lum(info.lambda, k_lambda, log_t) - 2.5 * log_l_rel + info.c0 + info.c1 * x
+    unit_lum_mag(info.table, log_t) - 2.5 * log_l_rel + info.c0 + info.c1 * x
 }
 
 /// Absolute AB magnitudes of the model at `times_since_explosion` (days) in `band`.
 ///
-/// `params` is (log_l1, a1, a2, log_t1, beta). Returns None for an unsupported band.
+/// `params` is (log_l1, a1, a2, log_t1, beta). Uses the built-in offsets; returns None
+/// for an unsupported band.
 pub fn kilonova_mags(params: &[f64], times_since_explosion: &[f64], band: &str) -> Option<Vec<f64>> {
-    let info = band_info(band)?;
-    let k = log_fnu_const(info.lambda);
+    let info = band_info(band, None)?;
     Some(
         times_since_explosion
             .iter()
-            .map(|&t| mag_unit_lum(&info, k, &params[1..5], t) - 2.5 * params[0])
+            .map(|&t| mag_unit_lum(&info, &params[1..5], t) - 2.5 * params[0])
             .collect(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Prior
+// ---------------------------------------------------------------------------
+
+/// Gaussian-mixture prior on (log_l1, a1, a2, log_t1, beta), with the per-band
+/// offsets it was trained with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KilonovaPrior {
+    pub weights: Vec<f64>,
+    pub means: Vec<Vec<f64>>,
+    pub covs: Vec<Vec<Vec<f64>>>,
+    /// (c0, c1) per grid band ("g", "r", "i", "z", "y", "J", "H", "K"); None uses the
+    /// built-in offsets. A band missing from the map is skipped.
+    #[serde(default)]
+    pub offsets: Option<HashMap<String, (f64, f64)>>,
+}
+
+impl Default for KilonovaPrior {
+    /// The prior trained by `scripts/train_kilonova_prior.py`.
+    fn default() -> Self {
+        Self {
+            weights: PRIOR_WEIGHTS.to_vec(),
+            means: PRIOR_MEANS.iter().map(|m| m.to_vec()).collect(),
+            covs: PRIOR_COVS.iter().map(|c| c.iter().map(|r| r.to_vec()).collect()).collect(),
+            offsets: None,
+        }
+    }
+}
+
+impl KilonovaPrior {
+    /// Mean of the highest-weight component.
+    pub fn dominant_mean(&self) -> Vec<f64> {
+        let k = (0..self.weights.len())
+            .max_by(|&a, &b| self.weights[a].partial_cmp(&self.weights[b]).unwrap())
+            .unwrap_or(0);
+        self.means[k].clone()
+    }
+}
+
+/// One mixture component restricted to `idx`, ready to whiten parameter vectors.
+struct PriorComponent {
+    idx: Vec<usize>,
+    mean: Vec<f64>,
+    chol: Vec<Vec<f64>>,
+    /// −2 ln w + ln det Σ, so that comparing components compares −2 ln of their densities.
+    log_norm: f64,
+}
+
+impl PriorComponent {
+    fn new(prior: &KilonovaPrior, k: usize, idx: &[usize], inflate: f64) -> Option<Self> {
+        let (w, mean, cov) = (prior.weights.get(k)?, prior.means.get(k)?, prior.covs.get(k)?);
+        if mean.len() != 5 || cov.len() != 5 || cov.iter().any(|r| r.len() != 5) || !(*w > 0.0) {
+            return None;
+        }
+        let n = idx.len();
+        let mut sub = vec![vec![0.0; n]; n];
+        for (a, &i) in idx.iter().enumerate() {
+            for (b, &j) in idx.iter().enumerate() {
+                sub[a][b] = cov[i][j] * inflate * inflate;
+            }
+        }
+        let chol = cholesky(&sub)?;
+        let log_det: f64 = 2.0 * (0..n).map(|i| chol[i][i].ln()).sum::<f64>();
+        Some(Self {
+            idx: idx.to_vec(),
+            mean: idx.iter().map(|&i| mean[i]).collect(),
+            chol,
+            log_norm: -2.0 * w.ln() + log_det,
+        })
+    }
+
+    /// Whitened residuals L⁻¹(θ_idx − μ).
+    fn whiten(&self, theta: &[f64]) -> Vec<f64> {
+        let d: Vec<f64> = self.idx.iter().zip(&self.mean).map(|(&i, m)| theta[i] - m).collect();
+        forward_sub(&self.chol, &d)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -193,11 +243,21 @@ pub struct KilonovaOptions {
     pub sys_err: f64,
     /// Factor applied to the prior standard deviations.
     pub prior_inflate: f64,
+    /// Prior to use in place of the built-in one, e.g. retrained on other model grids.
+    pub prior: Option<KilonovaPrior>,
 }
 
 impl Default for KilonovaOptions {
     fn default() -> Self {
-        Self { t_exp: None, t_exp_window: 3.0, t_last_nondet: None, distance_modulus: None, sys_err: 0.1, prior_inflate: 1.5 }
+        Self {
+            t_exp: None,
+            t_exp_window: 3.0,
+            t_last_nondet: None,
+            distance_modulus: None,
+            sys_err: 0.1,
+            prior_inflate: 1.5,
+            prior: None,
+        }
     }
 }
 
@@ -210,7 +270,7 @@ pub struct KilonovaFit {
     pub t_exp: f64,
     /// χ² of the data alone.
     pub chi2: f64,
-    /// χ² plus the prior's Mahalanobis distance squared (equal to chi2 for the free fit).
+    /// χ² plus the prior penalty (equal to chi2 for the free fit).
     pub objective: f64,
     /// RMS magnitude residual.
     pub rms: f64,
@@ -220,8 +280,10 @@ pub struct KilonovaFit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KilonovaResult {
     pub param_names: Vec<String>,
-    /// Fit held to the kilonova prior.
+    /// Fit held to the prior component that gives the lowest objective.
     pub kn_prior: KilonovaFit,
+    /// Index of that prior component.
+    pub prior_component: usize,
     /// Fit with the same bounds and no prior.
     pub free: KilonovaFit,
     /// kn_prior.objective − free.chi2; small for kilonova-like light curves.
@@ -245,54 +307,24 @@ struct Obs {
     mag: f64,
     w: f64,
     info: BandInfo,
-    k: f64,
-}
-
-struct Prior {
-    idx: Vec<usize>,
-    mean: Vec<f64>,
-    chol: Vec<Vec<f64>>,
-}
-
-impl Prior {
-    fn new(idx: Vec<usize>, inflate: f64) -> Option<Self> {
-        let n = idx.len();
-        let mut cov = vec![vec![0.0; n]; n];
-        for (a, &i) in idx.iter().enumerate() {
-            for (b, &j) in idx.iter().enumerate() {
-                cov[a][b] = KILONOVA_PRIOR_COV[i][j] * inflate * inflate;
-            }
-        }
-        let chol = cholesky(&cov)?;
-        let mean = idx.iter().map(|&i| KILONOVA_PRIOR_MEAN[i]).collect();
-        Some(Self { idx, mean, chol })
-    }
-
-    /// Whitened residuals L⁻¹(θ_idx − μ).
-    fn whiten(&self, theta: &[f64]) -> Vec<f64> {
-        let d: Vec<f64> = self.idx.iter().zip(&self.mean).map(|(&i, m)| theta[i] - m).collect();
-        forward_sub(&self.chol, &d)
-    }
 }
 
 /// Residual vector with log_l1 solved exactly, plus that log_l1.
 ///
 /// Every residual is affine in log_l1 (data: −2.5·w; prior: a fixed whitened
 /// column), so the optimum is a one-dimensional linear least-squares solution.
-fn profiled_residuals(obs: &[Obs], prior: Option<&Prior>, shape: &[f64], t_exp: f64) -> (Vec<f64>, f64) {
+fn profiled_residuals(obs: &[Obs], prior: Option<&PriorComponent>, shape: &[f64], t_exp: f64) -> (Vec<f64>, f64) {
     let mut r: Vec<f64> = Vec::with_capacity(obs.len() + 5);
     let mut g: Vec<f64> = Vec::with_capacity(obs.len() + 5);
     for o in obs {
-        r.push((mag_unit_lum(&o.info, o.k, shape, o.t - t_exp) - o.mag) * o.w);
+        r.push((mag_unit_lum(&o.info, shape, o.t - t_exp) - o.mag) * o.w);
         g.push(-2.5 * o.w);
     }
     if let Some(p) = prior {
-        let theta0 = [0.0, shape[0], shape[1], shape[2], shape[3]];
-        let z0 = p.whiten(&theta0);
-        let unit = [1.0, 0.0, 0.0, 0.0, 0.0];
+        let z0 = p.whiten(&[0.0, shape[0], shape[1], shape[2], shape[3]]);
         let dz: Vec<f64> = if p.idx.contains(&0) {
             let base = p.whiten(&[0.0; 5]);
-            p.whiten(&unit).iter().zip(&base).map(|(a, b)| a - b).collect()
+            p.whiten(&[1.0, 0.0, 0.0, 0.0, 0.0]).iter().zip(&base).map(|(a, b)| a - b).collect()
         } else {
             vec![0.0; z0.len()]
         };
@@ -357,12 +389,9 @@ fn levenberg_marquardt<F: Fn(&[f64]) -> Vec<f64>>(f: F, x0: &[f64], lo: &[f64], 
             for p in 0..n {
                 damped[p][p] += lambda * a[p][p].max(1e-12);
             }
-            let step = match solve_spd(&damped, &g.iter().map(|v| -v).collect::<Vec<_>>()) {
-                Some(s) => s,
-                None => {
-                    lambda *= 4.0;
-                    continue;
-                }
+            let Some(step) = solve_spd(&damped, &g.iter().map(|v| -v).collect::<Vec<_>>()) else {
+                lambda *= 4.0;
+                continue;
             };
             let mut xn: Vec<f64> = x.iter().zip(&step).map(|(a, b)| a + b).collect();
             clamp(&mut xn);
@@ -390,7 +419,13 @@ fn levenberg_marquardt<F: Fn(&[f64]) -> Vec<f64>>(f: F, x0: &[f64], lo: &[f64], 
     (x, cost)
 }
 
-fn fit_once(obs: &[Obs], prior: Option<&Prior>, t_exp_fixed: Option<f64>, t_exp_range: (f64, f64)) -> KilonovaFit {
+fn fit_once(
+    obs: &[Obs],
+    prior: Option<&PriorComponent>,
+    starts: &[[f64; 4]],
+    t_exp_fixed: Option<f64>,
+    t_exp_range: (f64, f64),
+) -> KilonovaFit {
     let mut best: Option<(Vec<f64>, f64, f64)> = None; // (shape, t_exp, cost)
     let texp_grid: Vec<f64> = match t_exp_fixed {
         Some(t) => vec![t],
@@ -399,14 +434,9 @@ fn fit_once(obs: &[Obs], prior: Option<&Prior>, t_exp_fixed: Option<f64>, t_exp_
             .collect(),
     };
     for &te in &texp_grid {
-        for start in SHAPE_STARTS.iter() {
-            let (shape, cost) = levenberg_marquardt(
-                |s| profiled_residuals(obs, prior, s, te).0,
-                start,
-                &SHAPE_LO,
-                &SHAPE_HI,
-                60,
-            );
+        for start in starts {
+            let (shape, cost) =
+                levenberg_marquardt(|s| profiled_residuals(obs, prior, s, te).0, start, &SHAPE_LO, &SHAPE_HI, 60);
             if best.as_ref().map_or(true, |b| cost < b.2) {
                 best = Some((shape, te, cost));
             }
@@ -426,28 +456,25 @@ fn fit_once(obs: &[Obs], prior: Option<&Prior>, t_exp_fixed: Option<f64>, t_exp_
     }
     let (r, log_l1) = profiled_residuals(obs, prior, &shape, t_exp);
     let chi2: f64 = r[..obs.len()].iter().map(|v| v * v).sum();
-    let rms = (obs
-        .iter()
-        .zip(&r)
-        .map(|(o, ri)| (ri / o.w).powi(2))
-        .sum::<f64>()
-        / obs.len() as f64)
-        .sqrt();
-    KilonovaFit {
-        params: vec![log_l1, shape[0], shape[1], shape[2], shape[3]],
-        t_exp,
-        chi2,
-        objective: cost,
-        rms,
-    }
+    let rms = (obs.iter().zip(&r).map(|(o, ri)| (ri / o.w).powi(2)).sum::<f64>() / obs.len() as f64).sqrt();
+    KilonovaFit { params: vec![log_l1, shape[0], shape[1], shape[2], shape[3]], t_exp, chi2, objective: cost, rms }
 }
 
 /// Fit the chromatic blackbody kilonova model to magnitude photometry.
 ///
 /// `bands` holds AB magnitudes per band (as from `build_mag_bands`); unsupported
 /// band names are skipped and listed in `bands_skipped`. Returns None with fewer
-/// than three usable points or a non-positive explosion-time window.
+/// than three usable points, a non-positive explosion-time window, or an invalid
+/// prior (mismatched lengths or a covariance that is not positive definite).
 pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -> Option<KilonovaResult> {
+    let default_prior;
+    let prior = match &opts.prior {
+        Some(p) => p,
+        None => {
+            default_prior = KilonovaPrior::default();
+            &default_prior
+        }
+    };
     let mut names: Vec<&String> = bands.keys().collect();
     names.sort();
     let dm = opts.distance_modulus.unwrap_or(0.0);
@@ -455,11 +482,10 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
     let (mut used, mut skipped) = (Vec::new(), Vec::new());
     for name in names {
         let bd = &bands[name];
-        let Some(info) = band_info(name) else {
+        let Some(info) = band_info(name, prior.offsets.as_ref()) else {
             skipped.push(name.clone());
             continue;
         };
-        let k = log_fnu_const(info.lambda);
         let mut any = false;
         for i in 0..bd.times.len() {
             let (t, m, e) = (bd.times[i], bd.values[i], bd.errors[i]);
@@ -470,7 +496,7 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
             if err <= 0.0 {
                 continue;
             }
-            obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info, k });
+            obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info });
             any = true;
         }
         if any {
@@ -495,11 +521,32 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
             return None;
         }
     }
-    let idx = if opts.distance_modulus.is_some() { vec![0, 1, 2, 3, 4] } else { vec![1, 2, 3, 4] };
-    let prior = Prior::new(idx, opts.prior_inflate)?;
 
-    let free = fit_once(&obs, None, opts.t_exp, t_exp_range);
-    let kn_prior = fit_once(&obs, Some(&prior), opts.t_exp, t_exp_range);
+    if prior.weights.is_empty() || prior.means.len() != prior.weights.len() || prior.covs.len() != prior.weights.len() {
+        return None;
+    }
+    let idx: &[usize] = if opts.distance_modulus.is_some() { &[0, 1, 2, 3, 4] } else { &[1, 2, 3, 4] };
+    let components: Vec<PriorComponent> = (0..prior.weights.len())
+        .map(|k| PriorComponent::new(prior, k, idx, opts.prior_inflate))
+        .collect::<Option<_>>()?;
+    let norm_min = components.iter().map(|c| c.log_norm).fold(f64::INFINITY, f64::min);
+
+    let mut starts: Vec<[f64; 4]> = vec![[0.0, -1.5, 3.75, 0.4]];
+    let dom = prior.dominant_mean();
+    starts.push([dom[1], dom[2], dom[3], dom[4]]);
+    let free = fit_once(&obs, None, &starts, opts.t_exp, t_exp_range);
+
+    let mut best: Option<(KilonovaFit, usize)> = None;
+    for (k, comp) in components.iter().enumerate() {
+        let m = &prior.means[k];
+        let comp_starts = [[m[1], m[2], m[3], m[4]], starts[0]];
+        let mut fit = fit_once(&obs, Some(comp), &comp_starts, opts.t_exp, t_exp_range);
+        fit.objective += comp.log_norm - norm_min;
+        if best.as_ref().map_or(true, |(b, _)| fit.objective < b.objective) {
+            best = Some((fit, k));
+        }
+    }
+    let (kn_prior, prior_component) = best?;
     let p = &kn_prior.params;
     let t_peak_bol = (p[2] < 0.0).then(|| 10f64.powf(-p[1] / (2.0 * p[2])));
     Some(KilonovaResult {
@@ -511,6 +558,7 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
         bands_used: used,
         bands_skipped: skipped,
         t_exp_fixed: opts.t_exp.is_some(),
+        prior_component,
         kn_prior,
         free,
     })

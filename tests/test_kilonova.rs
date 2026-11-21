@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use lightcurve_fitting::{
-    fit_kilonova, fit_kilonova_batch, kilonova_mags, BandData, KilonovaOptions, KILONOVA_PRIOR_MEAN,
-};
+use lightcurve_fitting::{fit_kilonova, fit_kilonova_batch, kilonova_mags, BandData, KilonovaOptions, KilonovaPrior};
+
+/// A kilonova-like parameter set: (log_l1, a1, a2, log_t1, beta).
+const KN: [f64; 5] = [41.6296, 0.2808, -1.8793, 3.7707, 0.3854];
 
 fn band(times: Vec<f64>, mags: Vec<f64>, err: f64) -> BandData {
     let errors = vec![err; times.len()];
@@ -67,15 +68,16 @@ fn at2017gfo() -> HashMap<String, BandData> {
 }
 
 #[test]
-fn model_matches_python_prototype() {
+fn model_matches_python_reference() {
+    // SciPy/numpy evaluation of the same tables and offsets.
     let expected = [
-        (1.0, [-14.92723, -15.40666, -15.67002]),
-        (2.0, [-14.22141, -14.99759, -15.50344]),
-        (4.0, [-12.14461, -13.35757, -14.18525]),
+        (1.0, [-14.93534, -15.38464, -15.65777]),
+        (2.0, [-14.25063, -15.0068, -15.51447]),
+        (4.0, [-12.22948, -13.41137, -14.22499]),
     ];
     for (t, mags) in expected {
         for (b, m) in ["ztfg", "ztfr", "ztfi"].iter().zip(mags) {
-            let got = kilonova_mags(&KILONOVA_PRIOR_MEAN, &[t], b).unwrap()[0];
+            let got = kilonova_mags(&KN, &[t], b).unwrap()[0];
             assert!((got - m).abs() < 1e-3, "{b} at {t} d: {got} vs {m}");
         }
     }
@@ -97,10 +99,10 @@ fn recovers_parameters_with_known_merger_time() {
 
 #[test]
 fn recovers_free_merger_time() {
-    let data = synthetic(&KILONOVA_PRIOR_MEAN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
+    let data = synthetic(&KN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
     let res = fit_kilonova(&data, &KilonovaOptions::default()).unwrap();
     assert!((res.free.t_exp + 0.7).abs() < 0.05, "t_exp {}", res.free.t_exp);
-    assert!((res.free.params[0] - (KILONOVA_PRIOR_MEAN[0] - 0.4 * 36.0)).abs() < 0.01);
+    assert!((res.free.params[0] - (KN[0] - 0.4 * 36.0)).abs() < 0.01);
     assert!(res.prior_cost < 1.0, "prior cost {}", res.prior_cost);
 }
 
@@ -131,8 +133,8 @@ fn power_law_afterglow_has_large_prior_cost() {
 }
 
 #[test]
-fn at2017gfo_full_fit_matches_prototype() {
-    // Python demo (kn-parametric/at2017gfo_demo.py): free fit, merger time known, 0.4-10 d.
+fn at2017gfo_full_fit_matches_reference() {
+    // Independent SciPy fit of the same model: free fit, merger time known, 0.4-10 d.
     let mut data = at2017gfo();
     for bd in data.values_mut() {
         let keep: Vec<usize> = (0..bd.times.len()).filter(|&i| bd.times[i] > 0.4 && bd.times[i] < 10.0).collect();
@@ -145,15 +147,15 @@ fn at2017gfo_full_fit_matches_prototype() {
     let opts = KilonovaOptions { t_exp: Some(0.0), distance_modulus: Some(0.0), sys_err: 0.05, ..Default::default() };
     let res = fit_kilonova(&data, &opts).unwrap();
     assert_eq!(res.n_obs, 112);
-    let want = [41.685, -0.560, -0.431, 3.749, 0.395];
+    let want = [41.6839, -0.5698, -0.3994, 3.7509, 0.4084];
     for (got, w) in res.free.params.iter().zip(want) {
         assert!((got - w).abs() < 0.01, "free params {:?} vs {:?}", res.free.params, want);
     }
-    assert!((res.free.rms - 0.33).abs() < 0.01, "rms {}", res.free.rms);
+    assert!((res.free.rms - 0.3192).abs() < 0.005, "rms {}", res.free.rms);
 }
 
 #[test]
-fn at2017gfo_ztf_like_subset_matches_prototype() {
+fn at2017gfo_ztf_like_subset_matches_reference() {
     // g and r, first point per night over the first 3.5 days, merger time free.
     let full = at2017gfo();
     let mut data = HashMap::new();
@@ -178,8 +180,8 @@ fn at2017gfo_ztf_like_subset_matches_prototype() {
     }
     let res = fit_kilonova(&data, &KilonovaOptions::default()).unwrap();
     assert_eq!(res.n_obs, 8);
-    assert!((res.prior_cost - 5.00).abs() < 0.3, "prior cost {}", res.prior_cost);
-    assert!((res.kn_prior.t_exp - 0.25).abs() < 0.1, "t_exp {}", res.kn_prior.t_exp);
+    assert!((res.prior_cost - 4.91).abs() < 0.1, "prior cost {}", res.prior_cost);
+    assert!((res.kn_prior.t_exp - 0.371).abs() < 0.02, "t_exp {}", res.kn_prior.t_exp);
 }
 
 #[test]
@@ -192,12 +194,12 @@ fn too_few_points_or_unknown_bands() {
     let res = fit_kilonova(&data, &KilonovaOptions::default()).unwrap();
     assert_eq!(res.bands_skipped, vec!["foo".to_string()]);
     assert_eq!(res.bands_used, vec!["ztfg".to_string(), "ztfr".to_string()]);
-    assert!(kilonova_mags(&KILONOVA_PRIOR_MEAN, &[1.0], "u").is_none());
+    assert!(kilonova_mags(&KN, &[1.0], "u").is_none());
 }
 
 #[test]
 fn batch_matches_single() {
-    let a = synthetic(&KILONOVA_PRIOR_MEAN, -0.5, 0.0, 4, &["ztfg", "ztfr"], 36.0);
+    let a = synthetic(&KN, -0.5, 0.0, 4, &["ztfg", "ztfr"], 36.0);
     let b = synthetic(&[41.0, -0.3, 0.0, 4.08, 0.0], -1.0, 0.0, 4, &["ztfg", "ztfr"], 36.0);
     let opts = KilonovaOptions::default();
     let batch = fit_kilonova_batch(&[a.clone(), b.clone()], &opts);
@@ -209,7 +211,7 @@ fn batch_matches_single() {
 
 #[test]
 fn last_nondetection_bounds_free_merger_time() {
-    let data = synthetic(&KILONOVA_PRIOR_MEAN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
+    let data = synthetic(&KN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
     let opts = KilonovaOptions { t_last_nondet: Some(-0.4), ..Default::default() };
     let res = fit_kilonova(&data, &opts).unwrap();
     for fit in [&res.free, &res.kn_prior] {
@@ -223,4 +225,36 @@ fn last_nondetection_bounds_free_merger_time() {
     let opts = KilonovaOptions { t_last_nondet: Some(-0.02), ..Default::default() };
     let res = fit_kilonova(&data, &opts).unwrap();
     assert!(res.free.t_exp >= -0.02 - 1e-9 && res.free.t_exp < 0.0);
+}
+
+#[test]
+fn runtime_prior_and_offsets() {
+    let data = synthetic(&KN, -0.7, 0.0, 5, &["ztfg", "ztfr", "ztfi"], 36.0);
+    let base = fit_kilonova(&data, &KilonovaOptions::default()).unwrap();
+
+    // Passing the built-in prior explicitly changes nothing.
+    let explicit = KilonovaOptions { prior: Some(KilonovaPrior::default()), ..Default::default() };
+    let same = fit_kilonova(&data, &explicit).unwrap();
+    assert!((same.prior_cost - base.prior_cost).abs() < 1e-12);
+
+    // Two identical components give the same prior cost as one.
+    let mut two = KilonovaPrior::default();
+    two.weights = vec![0.5, 0.5];
+    two.means.push(two.means[0].clone());
+    two.covs.push(two.covs[0].clone());
+    let res = fit_kilonova(&data, &KilonovaOptions { prior: Some(two), ..Default::default() }).unwrap();
+    assert!((res.prior_cost - base.prior_cost).abs() < 1e-9, "{} vs {}", res.prior_cost, base.prior_cost);
+
+    // An offsets map without i skips ztfi.
+    let mut offsets = std::collections::HashMap::new();
+    offsets.insert("g".to_string(), (0.0, 0.0));
+    offsets.insert("r".to_string(), (0.0, 0.0));
+    let custom = KilonovaPrior { offsets: Some(offsets), ..KilonovaPrior::default() };
+    let res = fit_kilonova(&data, &KilonovaOptions { prior: Some(custom), ..Default::default() }).unwrap();
+    assert_eq!(res.bands_skipped, vec!["ztfi".to_string()]);
+
+    // A covariance that is not positive definite is rejected.
+    let mut bad = KilonovaPrior::default();
+    bad.covs[0][1][1] = -1.0;
+    assert!(fit_kilonova(&data, &KilonovaOptions { prior: Some(bad), ..Default::default() }).is_none());
 }

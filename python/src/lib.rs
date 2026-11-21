@@ -447,6 +447,7 @@ fn metzger_kn_mags(
 }
 
 /// Options shared by `fit_kilonova` and `fit_kilonova_batch`.
+#[allow(clippy::too_many_arguments)]
 fn kilonova_options(
     t_exp: Option<f64>,
     t_exp_window: f64,
@@ -454,8 +455,13 @@ fn kilonova_options(
     distance_modulus: Option<f64>,
     sys_err: f64,
     prior_inflate: f64,
-) -> ::lightcurve_fitting::KilonovaOptions {
-    ::lightcurve_fitting::KilonovaOptions { t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate }
+    prior: Option<&Bound<'_, PyAny>>,
+) -> PyResult<::lightcurve_fitting::KilonovaOptions> {
+    let prior = match prior {
+        Some(p) => Some(pythonize::depythonize::<::lightcurve_fitting::KilonovaPrior>(p)?),
+        None => None,
+    };
+    Ok(::lightcurve_fitting::KilonovaOptions { t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior })
 }
 
 /// Fit the chromatic blackbody kilonova model to magnitude bands.
@@ -476,10 +482,13 @@ fn kilonova_options(
 ///         joins the prior.
 ///     sys_err: Systematic error (mag) added in quadrature.
 ///     prior_inflate: Factor on the prior standard deviations.
+///     prior: Optional dict with "weights", "means" (5-vectors) and "covs"
+///         (5x5) of a Gaussian mixture on (log_l1, a1, a2, log_t1, beta), used
+///         in place of the built-in prior (see `kilonova_default_prior`).
 ///
-/// Returns a dict, or None with fewer than three usable points.
+/// Returns a dict, or None with fewer than three usable points or an invalid prior.
 #[pyfunction]
-#[pyo3(signature = (bands, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5))]
+#[pyo3(signature = (bands, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None))]
 fn fit_kilonova(
     py: Python<'_>,
     bands: &PyBandDataMap,
@@ -489,16 +498,17 @@ fn fit_kilonova(
     distance_modulus: Option<f64>,
     sys_err: f64,
     prior_inflate: f64,
+    prior: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let inner = bands.inner.clone();
-    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate);
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior)?;
     let result = py.allow_threads(|| ::lightcurve_fitting::fit_kilonova(&inner, &opts));
     Ok(pythonize(py, &result)?.unbind())
 }
 
 /// `fit_kilonova` over a list of BandDataMap objects in parallel.
 #[pyfunction]
-#[pyo3(signature = (sources, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5))]
+#[pyo3(signature = (sources, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None))]
 fn fit_kilonova_batch(
     py: Python<'_>,
     sources: Vec<PyBandDataMap>,
@@ -508,11 +518,18 @@ fn fit_kilonova_batch(
     distance_modulus: Option<f64>,
     sys_err: f64,
     prior_inflate: f64,
+    prior: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let inner: Vec<HashMap<String, BandData>> = sources.into_iter().map(|s| s.inner).collect();
-    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate);
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior)?;
     let results = py.allow_threads(move || ::lightcurve_fitting::fit_kilonova_batch(&inner, &opts));
     Ok(pythonize(py, &results)?.unbind())
+}
+
+/// The built-in kilonova prior as a dict of "weights", "means" and "covs".
+#[pyfunction]
+fn kilonova_default_prior(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(pythonize(py, &::lightcurve_fitting::KilonovaPrior::default())?.unbind())
 }
 
 /// Absolute AB magnitudes of the chromatic blackbody kilonova model.
@@ -658,6 +675,7 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_kilonova, m)?)?;
     m.add_function(wrap_pyfunction!(fit_kilonova_batch, m)?)?;
     m.add_function(wrap_pyfunction!(kilonova_mags, m)?)?;
+    m.add_function(wrap_pyfunction!(kilonova_default_prior, m)?)?;
     m.add_function(wrap_pyfunction!(fit_gp_2d, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features_batch, m)?)?;

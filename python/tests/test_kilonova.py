@@ -1,10 +1,13 @@
+import json
 import math
+import pathlib
 
 import pytest
 
 import lightcurve_fitting as lcf
 
-PRIOR_MEAN = [41.629614091444985, 0.2808372156230851, -1.8793073325847935, 3.770662925560441, 0.38540599767451444]
+KN = [41.6296, 0.2808, -1.8793, 3.7707, 0.3854]
+PRIORS = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "kilonova_priors"
 
 
 def kn_bands(params, t_exp=-0.7, dm=36.0, nights=5):
@@ -19,19 +22,19 @@ def kn_bands(params, t_exp=-0.7, dm=36.0, nights=5):
     return lcf.build_mag_bands(times, mags, errs, bands)
 
 
-def test_kilonova_mags_matches_prototype():
-    m = lcf.kilonova_mags(PRIOR_MEAN, [1.0, 2.0], "ztfr")
-    assert m[0] == pytest.approx(-15.40666, abs=1e-3)
-    assert m[1] == pytest.approx(-14.99759, abs=1e-3)
+def test_kilonova_mags_matches_reference():
+    m = lcf.kilonova_mags(KN, [1.0, 2.0], "ztfr")
+    assert m[0] == pytest.approx(-15.38464, abs=1e-3)
+    assert m[1] == pytest.approx(-15.0068, abs=1e-3)
 
 
 def test_kilonova_mags_rejects_unknown_band():
     with pytest.raises(ValueError):
-        lcf.kilonova_mags(PRIOR_MEAN, [1.0], "u")
+        lcf.kilonova_mags(KN, [1.0], "u")
 
 
 def test_fit_kilonova_on_kilonova():
-    res = lcf.fit_kilonova(kn_bands(PRIOR_MEAN))
+    res = lcf.fit_kilonova(kn_bands(KN))
     assert set(res) >= {"kn_prior", "free", "prior_cost", "bands_used", "temperature_1d"}
     assert res["free"]["t_exp"] == pytest.approx(-0.7, abs=0.05)
     assert res["prior_cost"] < 1.0
@@ -50,7 +53,24 @@ def test_fit_kilonova_too_few_points():
 
 
 def test_fit_kilonova_batch():
-    sources = [kn_bands(PRIOR_MEAN), kn_bands([41.0, -0.3, 0.0, 4.08, 0.0], t_exp=-1.0)]
+    sources = [kn_bands(KN), kn_bands([41.0, -0.3, 0.0, 4.08, 0.0], t_exp=-1.0)]
     results = lcf.fit_kilonova_batch(sources)
     assert len(results) == 2
     assert results[0]["prior_cost"] < results[1]["prior_cost"]
+
+
+def test_fit_kilonova_with_runtime_prior():
+    bands = kn_bands(KN)
+    default = lcf.kilonova_default_prior()
+    assert set(default) >= {"weights", "means", "covs"}
+    base = lcf.fit_kilonova(bands)
+    same = lcf.fit_kilonova(bands, prior=default)
+    assert same["prior_cost"] == pytest.approx(base["prior_cost"], abs=1e-9)
+    broad = json.load(open(PRIORS / "possis_kasen.json"))
+    res = lcf.fit_kilonova(bands, prior=broad)
+    assert res["prior_cost"] < 3.0
+
+
+def test_fit_kilonova_last_nondetection():
+    res = lcf.fit_kilonova(kn_bands(KN, t_exp=-0.7), t_last_nondet=-0.4)
+    assert -0.4 - 1e-9 <= res["free"]["t_exp"] <= -0.05 + 1e-9
