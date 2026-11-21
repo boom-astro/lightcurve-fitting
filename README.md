@@ -9,6 +9,7 @@ Provides three complementary fitters that operate on multi-band photometry (ZTF 
 | **Nonparametric** | magnitudes | Gaussian-process interpolation | peak mag, t0, rise/decay timescales, FWHM, GP derivatives, von Neumann ratio, power-law decay index |
 | **Parametric** | fluxes | PSO model selection → SVI or Laplace uncertainty | best-fit model (Bazin, Villar, TDE, Arnett, Magnetar, …), posterior means & uncertainties |
 | **Thermal** | magnitudes | Blackbody color fitting via PSO | log temperature at peak, cooling rate |
+| **Kilonova** | magnitudes | Joint multi-band blackbody with a POSSIS-trained prior, Levenberg–Marquardt | luminosity and temperature evolution, merger time, kilonova-prior cost |
 
 ## Quick start
 
