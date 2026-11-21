@@ -1381,6 +1381,66 @@ impl GpuContext {
 
         Ok(results)
     }
+
+    // -----------------------------------------------------------------------
+    // batch_flare_fit
+    // -----------------------------------------------------------------------
+
+    /// Search flare components for every window (one simdgroup per window).
+    pub fn batch_flare_fit(&self, input: &FlareBatchInput) -> Result<Vec<FlareBatchOutput>, String> {
+        let n_windows = input.offsets.len().saturating_sub(1);
+        if n_windows == 0 {
+            return Ok(Vec::new());
+        }
+        let max_dim = 2 * FLARE_GPU_MAX_K;
+        let n_bic = FLARE_GPU_MAX_K + 1;
+
+        let d_t = MetalBuf::from_f64_as_f32(&self.device, &input.times)?;
+        let d_y = MetalBuf::from_f64_as_f32(&self.device, &input.flux)?;
+        let d_w = MetalBuf::from_f64_as_f32(&self.device, &input.weight)?;
+        let d_s = MetalBuf::from_f64_as_f32(&self.device, &input.support)?;
+        let d_off = MetalBuf::from_i32(&self.device, &input.offsets)?;
+        let d_wp = MetalBuf::from_f64_as_f32(&self.device, &input.window_params)?;
+        let d_theta = MetalBuf::alloc_f32(&self.device, n_windows * max_dim)?;
+        let d_k = MetalBuf::from_i32(&self.device, &vec![0; n_windows])?;
+        let d_bic = MetalBuf::alloc_f32(&self.device, n_windows * n_bic)?;
+        let d_nbic = MetalBuf::from_i32(&self.device, &vec![0; n_windows])?;
+        let cfg_i = [n_windows as i32, input.max_flares as i32, input.n_baseline as i32, 150];
+        // float32 χ² carries rounding noise of ~1e-6 relative, so the simplex
+        // spread tolerance scales with the cost; Δχ² ~ 1e-3 is still far below
+        // the Δχ² = 1 scale of a 1σ parameter change.
+        let cfg_f = [input.min_delta_bic, input.template_area, input.min_coverage, 1e-4, 1e-5];
+        let d_cfg_i = MetalBuf::from_i32(&self.device, &cfg_i)?;
+        let d_cfg_f = MetalBuf::from_f64_as_f32(&self.device, &cfg_f)?;
+
+        let pipeline = self.pipeline("batch_flare_fit")?;
+        let block: usize = 64;
+        let grid = (n_windows * 32 + block - 1) / block;
+        let (cmd_buf, encoder) = self.begin_compute()?;
+        let bufs = [&d_t, &d_y, &d_w, &d_s, &d_off, &d_wp, &d_theta, &d_k, &d_bic, &d_nbic, &d_cfg_i, &d_cfg_f];
+        for (i, b) in bufs.iter().enumerate() {
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&b.buffer), 0, i) };
+        }
+        self.dispatch_and_wait(&cmd_buf, &encoder, &pipeline, grid, block);
+
+        let mut theta = vec![0.0f64; n_windows * max_dim];
+        let mut bic = vec![0.0f64; n_windows * n_bic];
+        d_theta.download_as_f64(&mut theta)?;
+        d_bic.download_as_f64(&mut bic)?;
+        let read_i32 = |b: &MetalBuf| -> Vec<i32> {
+            let ptr = b.buffer.contents().as_ptr() as *const i32;
+            (0..n_windows).map(|i| unsafe { ptr.add(i).read() }).collect()
+        };
+        let ks = read_i32(&d_k);
+        let nbics = read_i32(&d_nbic);
+
+        Ok((0..n_windows)
+            .map(|i| FlareBatchOutput {
+                theta: theta[i * max_dim..i * max_dim + 2 * ks[i] as usize].to_vec(),
+                per_k_bic: bic[i * n_bic..i * n_bic + nbics[i] as usize].to_vec(),
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
