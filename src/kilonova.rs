@@ -183,6 +183,9 @@ pub struct KilonovaOptions {
     /// None leaves it free between `t_exp_window` days and 0.05 days before the first point.
     pub t_exp: Option<f64>,
     pub t_exp_window: f64,
+    /// Time of the last non-detection before the first point. A free explosion time is
+    /// kept after it (and after `t_exp_window` days before the first point).
+    pub t_last_nondet: Option<f64>,
     /// Distance modulus. When set, magnitudes become absolute and log_l1 joins the prior;
     /// otherwise log_l1 absorbs the distance and stays free.
     pub distance_modulus: Option<f64>,
@@ -194,7 +197,7 @@ pub struct KilonovaOptions {
 
 impl Default for KilonovaOptions {
     fn default() -> Self {
-        Self { t_exp: None, t_exp_window: 3.0, distance_modulus: None, sys_err: 0.1, prior_inflate: 1.5 }
+        Self { t_exp: None, t_exp_window: 3.0, t_last_nondet: None, distance_modulus: None, sys_err: 0.1, prior_inflate: 1.5 }
     }
 }
 
@@ -478,7 +481,12 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
         return None;
     }
     let t_first = obs.iter().map(|o| o.t).fold(f64::INFINITY, f64::min);
-    let t_exp_range = (t_first - opts.t_exp_window, t_first - TEXP_MIN_LEAD);
+    let mut t_lo = t_first - opts.t_exp_window;
+    if let Some(tn) = opts.t_last_nondet.filter(|tn| tn.is_finite() && *tn < t_first) {
+        t_lo = t_lo.max(tn);
+    }
+    // Keep at least half the window when a non-detection sits within TEXP_MIN_LEAD of the first point.
+    let t_exp_range = (t_lo, t_first - TEXP_MIN_LEAD.min(0.5 * (t_first - t_lo)));
     if opts.t_exp.is_none() && !(t_exp_range.1 > t_exp_range.0) {
         return None;
     }

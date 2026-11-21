@@ -206,3 +206,21 @@ fn batch_matches_single() {
         assert!((res.unwrap().prior_cost - single.prior_cost).abs() < 1e-12);
     }
 }
+
+#[test]
+fn last_nondetection_bounds_free_merger_time() {
+    let data = synthetic(&KILONOVA_PRIOR_MEAN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
+    let opts = KilonovaOptions { t_last_nondet: Some(-0.4), ..Default::default() };
+    let res = fit_kilonova(&data, &opts).unwrap();
+    for fit in [&res.free, &res.kn_prior] {
+        assert!(fit.t_exp >= -0.4 - 1e-9 && fit.t_exp <= -0.05 + 1e-9, "t_exp {}", fit.t_exp);
+    }
+    // A non-detection before the true merger time leaves the recovery intact.
+    let opts = KilonovaOptions { t_last_nondet: Some(-1.2), ..Default::default() };
+    let res = fit_kilonova(&data, &opts).unwrap();
+    assert!((res.free.t_exp + 0.7).abs() < 0.05, "t_exp {}", res.free.t_exp);
+    // One just before the first point keeps a short window.
+    let opts = KilonovaOptions { t_last_nondet: Some(-0.02), ..Default::default() };
+    let res = fit_kilonova(&data, &opts).unwrap();
+    assert!(res.free.t_exp >= -0.02 - 1e-9 && res.free.t_exp < 0.0);
+}
