@@ -37,4 +37,4 @@ pub use gp2d::fit_gp_2d_batch_gpu;
 pub use gpu::{Gp2dInput, Gp2dOutput};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use gpu::{SviBatchInput, SviBatchOutput};
-pub use features::{FeatureMap, extract_features, extract_features_from_results, extract_features_batch};
+pub use features::{FeatureMap, extract_features, extract_features_from_results, extract_features_batch, extract_kilonova_features, kilonova_feature_options};

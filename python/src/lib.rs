@@ -456,12 +456,13 @@ fn kilonova_options(
     sys_err: f64,
     prior_inflate: f64,
     prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
 ) -> PyResult<::lightcurve_fitting::KilonovaOptions> {
     let prior = match prior {
         Some(p) => Some(pythonize::depythonize::<::lightcurve_fitting::KilonovaPrior>(p)?),
         None => None,
     };
-    Ok(::lightcurve_fitting::KilonovaOptions { t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior })
+    Ok(::lightcurve_fitting::KilonovaOptions { t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days })
 }
 
 /// Fit the chromatic blackbody kilonova model to magnitude bands.
@@ -485,10 +486,11 @@ fn kilonova_options(
 ///     prior: Optional dict with "weights", "means" (5-vectors) and "covs"
 ///         (5x5) of a Gaussian mixture on (log_l1, a1, a2, log_t1, beta), used
 ///         in place of the built-in prior (see `kilonova_default_prior`).
+///     max_days: Use only points within this many days after the first point.
 ///
 /// Returns a dict, or None with fewer than three usable points or an invalid prior.
 #[pyfunction]
-#[pyo3(signature = (bands, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None))]
+#[pyo3(signature = (bands, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None, max_days=None))]
 fn fit_kilonova(
     py: Python<'_>,
     bands: &PyBandDataMap,
@@ -499,16 +501,17 @@ fn fit_kilonova(
     sys_err: f64,
     prior_inflate: f64,
     prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
 ) -> PyResult<PyObject> {
     let inner = bands.inner.clone();
-    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior)?;
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days)?;
     let result = py.allow_threads(|| ::lightcurve_fitting::fit_kilonova(&inner, &opts));
     Ok(pythonize(py, &result)?.unbind())
 }
 
 /// `fit_kilonova` over a list of BandDataMap objects in parallel.
 #[pyfunction]
-#[pyo3(signature = (sources, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None))]
+#[pyo3(signature = (sources, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None, max_days=None))]
 fn fit_kilonova_batch(
     py: Python<'_>,
     sources: Vec<PyBandDataMap>,
@@ -519,9 +522,10 @@ fn fit_kilonova_batch(
     sys_err: f64,
     prior_inflate: f64,
     prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
 ) -> PyResult<PyObject> {
     let inner: Vec<HashMap<String, BandData>> = sources.into_iter().map(|s| s.inner).collect();
-    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior)?;
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days)?;
     let results = py.allow_threads(move || ::lightcurve_fitting::fit_kilonova_batch(&inner, &opts));
     Ok(pythonize(py, &results)?.unbind())
 }

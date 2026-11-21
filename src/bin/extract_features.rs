@@ -24,7 +24,8 @@ use lightcurve_fitting::{
     fit_nonparametric_batch_gpu, fit_gp_2d_batch_gpu,
     finalize_all_models_with_gpu_svi, svi_prior_for_model, svi_model_meta,
     GpuPsoBandResult, SviBatchInput, SviModelName,
-    features::extract_features_from_results,
+    features::{extract_features_from_results, extract_kilonova_features, kilonova_feature_options},
+    fit_kilonova,
     gpu::{GpuContext, GpuModelName, BatchSource, GpuBatchData},
     thermal::fit_thermal,
 };
@@ -734,8 +735,9 @@ fn main() {
             // Thermal using trained GPs from nonparametric
             let (_, ref gps) = np_results[vi];
             let thermal = fit_thermal(mag, Some(gps));
+            let kilonova = fit_kilonova(mag, &kilonova_feature_options());
 
-            (param, thermal)
+            (param, thermal, kilonova)
         }).collect();
         eprintln!("  Step 4b (thermal + finalize): {:.2}s", t_step.elapsed().as_secs_f64());
 
@@ -743,7 +745,7 @@ fn main() {
         for (vi, &orig_idx) in valid_indices.iter().enumerate() {
             let source_id = source_ids[orig_idx];
             let (ref np_bands, _) = np_results[vi];
-            let (ref param_bands, ref thermal) = &final_results[vi];
+            let (ref param_bands, ref thermal, ref kilonova) = &final_results[vi];
 
             let (gp2d_result, gp2d_thermal) = match &gp2d_results[vi] {
                 Some((r, t)) => (Some(r.clone()), Some(t.clone())),
@@ -752,11 +754,12 @@ fn main() {
 
             let sbpl = fit_sbpl(&valid_flux_bands[vi]);
 
-            let features = extract_features_from_results(
+            let mut features = extract_features_from_results(
                 np_bands, param_bands, thermal, &sbpl,
                 &gp2d_result, &gp2d_thermal,
                 &cli.ref_band,
             );
+            features.extend(extract_kilonova_features(kilonova));
 
             let output = serde_json::json!({
                 "source_id": source_id,
@@ -765,6 +768,7 @@ fn main() {
                 "thermal": thermal,
                 "gp2d": gp2d_result,
                 "gp2d_thermal": gp2d_thermal,
+                "kilonova": kilonova,
                 "features": features,
             });
 

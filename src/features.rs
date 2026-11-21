@@ -18,6 +18,7 @@ use crate::parametric::{
 use crate::sparse_gp::DenseGP;
 use crate::thermal::{fit_thermal, ThermalResult};
 use crate::sbpl::{fit_sbpl, SbplResult};
+use crate::kilonova::{fit_kilonova, KilonovaOptions, KilonovaResult};
 
 /// Alias for the feature map type.
 pub type FeatureMap = HashMap<String, Option<f64>>;
@@ -616,6 +617,47 @@ fn extract_gp2d_features(
     f
 }
 
+// ---------------------------------------------------------------------------
+// Kilonova features
+// ---------------------------------------------------------------------------
+
+const KILONOVA_KEYS: [&str; 11] = [
+    "kn_prior_cost", "kn_chi2_per_obs", "kn_free_chi2_per_obs", "kn_a1", "kn_a2",
+    "kn_log_t1", "kn_beta", "kn_t_exp", "kn_free_log_t1", "kn_free_beta", "kn_n_obs",
+];
+
+/// Options for the kilonova features: the first 10 days of the light curve, by which time
+/// a kilonova has faded below survey limits.
+pub fn kilonova_feature_options() -> KilonovaOptions {
+    KilonovaOptions { max_days: Some(10.0), ..Default::default() }
+}
+
+/// Features from `fit_kilonova`: the prior cost, fit quality, and the shape and
+/// explosion time of the prior-held and free fits. `kn_t_exp` is in the data's
+/// time frame (days from the first observation for `build_mag_bands` input).
+pub fn extract_kilonova_features(kn: &Option<KilonovaResult>) -> FeatureMap {
+    let mut f = FeatureMap::new();
+    match kn {
+        Some(k) => {
+            let n = k.n_obs as f64;
+            let (p, q) = (&k.kn_prior.params, &k.free.params);
+            let vals = [
+                k.prior_cost, k.kn_prior.chi2 / n, k.free.chi2 / n, p[1], p[2],
+                p[3], p[4], k.kn_prior.t_exp, q[3], q[4], n,
+            ];
+            for (key, v) in KILONOVA_KEYS.iter().zip(vals) {
+                f.insert(key.to_string(), opt(Some(v)));
+            }
+        }
+        None => {
+            for key in KILONOVA_KEYS {
+                f.insert(key.to_string(), None);
+            }
+        }
+    }
+    f
+}
+
 // ===========================================================================
 // Public API
 // ===========================================================================
@@ -672,9 +714,12 @@ pub fn extract_features(
         None => (None, None),
     };
 
+    let kilonova = fit_kilonova(mag_bands, &kilonova_feature_options());
+
     extract_features_from_results(&np_results, &param_results, &thermal, &sbpl, &gp2d_result, &gp2d_thermal, ref_band)
         .into_iter()
         .chain(beta_features)
+        .chain(extract_kilonova_features(&kilonova))
         .collect()
 }
 

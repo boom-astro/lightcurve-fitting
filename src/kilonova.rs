@@ -245,6 +245,8 @@ pub struct KilonovaOptions {
     pub prior_inflate: f64,
     /// Prior to use in place of the built-in one, e.g. retrained on other model grids.
     pub prior: Option<KilonovaPrior>,
+    /// Use only points within this many days after the first point.
+    pub max_days: Option<f64>,
 }
 
 impl Default for KilonovaOptions {
@@ -257,6 +259,7 @@ impl Default for KilonovaOptions {
             sys_err: 0.1,
             prior_inflate: 1.5,
             prior: None,
+            max_days: None,
         }
     }
 }
@@ -503,10 +506,14 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
             used.push(name.clone());
         }
     }
+    let t_first = obs.iter().map(|o| o.t).fold(f64::INFINITY, f64::min);
+    if let Some(days) = opts.max_days {
+        obs.retain(|o| o.t <= t_first + days);
+        used.retain(|name| bands[name].times.iter().any(|&t| t.is_finite() && t <= t_first + days));
+    }
     if obs.len() < 3 {
         return None;
     }
-    let t_first = obs.iter().map(|o| o.t).fold(f64::INFINITY, f64::min);
     let mut t_lo = t_first - opts.t_exp_window;
     if let Some(tn) = opts.t_last_nondet.filter(|tn| tn.is_finite() && *tn < t_first) {
         t_lo = t_lo.max(tn);

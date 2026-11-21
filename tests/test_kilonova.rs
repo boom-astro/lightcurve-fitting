@@ -258,3 +258,33 @@ fn runtime_prior_and_offsets() {
     bad.covs[0][1][1] = -1.0;
     assert!(fit_kilonova(&data, &KilonovaOptions { prior: Some(bad), ..Default::default() }).is_none());
 }
+
+#[test]
+fn extract_features_includes_kilonova() {
+    use lightcurve_fitting::{build_flux_bands, extract_features};
+    let data = synthetic(&KN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
+    let (mut t, mut m, mut e, mut b) = (vec![], vec![], vec![], vec![]);
+    for (name, bd) in &data {
+        t.extend(&bd.times);
+        m.extend(&bd.values);
+        e.extend(&bd.errors);
+        b.extend(std::iter::repeat(name.clone()).take(bd.times.len()));
+    }
+    let flux = build_flux_bands(&t, &m, &e, &b);
+    let features = extract_features(&data, &flux, "ztfr");
+    let cost = features["kn_prior_cost"].expect("kilonova features present");
+    assert!(cost < 1.0, "prior cost {cost}");
+    assert_eq!(features["kn_n_obs"], Some(10.0));
+}
+
+#[test]
+fn max_days_drops_late_points() {
+    let mut data = synthetic(&KN, -0.7, 0.0, 5, &["ztfg", "ztfr"], 36.0);
+    // A late, unrelated point in a third band that the window should drop.
+    data.insert("ztfi".to_string(), band(vec![30.0], vec![18.0], 0.05));
+    let opts = KilonovaOptions { max_days: Some(10.0), ..Default::default() };
+    let res = fit_kilonova(&data, &opts).unwrap();
+    assert_eq!(res.n_obs, 10);
+    assert_eq!(res.bands_used, vec!["ztfg".to_string(), "ztfr".to_string()]);
+    assert!(res.prior_cost < 1.0);
+}
