@@ -97,6 +97,26 @@ fn parametric_n_obs_correct() {
 }
 
 #[test]
+fn parametric_output_independent_of_band_iteration_order() {
+    // All bands have the same number of points; each build_flux_bands call
+    // makes a HashMap with a fresh iteration order.
+    let (times, mags, errs, bands) = synthetic::generate_bazin_source(30, 1300);
+    for fit_all_models in [false, true] {
+        let fit = || {
+            let flux_bands = build_flux_bands(&times, &mags, &errs, &bands);
+            let mut r = fit_parametric(&flux_bands, fit_all_models, UncertaintyMethod::Laplace);
+            r.sort_by(|a, b| a.band.cmp(&b.band));
+            // Compare as Values so HashMap fields match by content, not key order.
+            serde_json::to_value(&r).unwrap()
+        };
+        let first = fit();
+        for _ in 0..4 {
+            assert_eq!(fit(), first, "fit_all_models={fit_all_models}: output depends on band order");
+        }
+    }
+}
+
+#[test]
 fn parametric_empty_bands() {
     let results = fit_parametric(&std::collections::HashMap::new(), false, UncertaintyMethod::Svi);
     assert!(results.is_empty());

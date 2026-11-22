@@ -548,7 +548,7 @@ fn main() {
         for (vi, flux_bands) in valid_flux_bands.iter().enumerate() {
             // Sort bands by descending obs count (matches fit_parametric ordering)
             let mut sorted_bands: Vec<(&String, &BandData)> = flux_bands.iter().collect();
-            sorted_bands.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()));
+            sorted_bands.sort_by(|a, b| b.1.times.len().cmp(&a.1.times.len()).then_with(|| a.0.cmp(b.0)));
 
             for (band_name, bd) in &sorted_bands {
                 if bd.values.is_empty() { continue; }
