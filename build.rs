@@ -13,6 +13,7 @@ fn build_cuda() {
         .file("cuda/gp.cu")
         .file("cuda/gp2d.cu")
         .file("cuda/svi.cu")
+        .file("cuda/flare.cu")
         .compile("lightcurve_cuda");
 
     // Link against the CUDA runtime
@@ -22,6 +23,7 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed=cuda/gp.cu");
     println!("cargo:rerun-if-changed=cuda/gp2d.cu");
     println!("cargo:rerun-if-changed=cuda/svi.cu");
+    println!("cargo:rerun-if-changed=cuda/flare.cu");
 }
 
 #[cfg(feature = "metal")]
@@ -34,6 +36,7 @@ fn build_metal() {
         "metal/gp.metal",
         "metal/gp2d.metal",
         "metal/svi.metal",
+        "metal/flare.metal",
     ];
 
     let strict_math = std::env::var_os("LCF_METAL_STRICT_MATH").is_some();

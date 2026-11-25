@@ -14,6 +14,7 @@ pub mod gp2d;
 pub mod sparse_gp;
 pub mod thermal;
 pub mod sbpl;
+pub mod flare;
 pub mod features;
 
 pub use batch::{FastFitResult, fit_batch_fast, fit_batch_parametric};
@@ -26,6 +27,9 @@ pub use gpu::{GpBandInput, GpBandOutput};
 pub use parametric::{eval_model_flux, metzger_kn_mags, fit_parametric, fit_parametric_model, fit_parametric_multiband, finalize_parametric_from_gpu, finalize_parametric_with_gpu_svi, finalize_all_models_with_gpu_svi, svi_prior_for_model, svi_model_meta, GpuPsoBandResult, MultiBazinResult, ParametricBandResult, SviModelName, UncertaintyMethod};
 pub use thermal::{fit_thermal, ThermalResult};
 pub use sbpl::{fit_sbpl, SbplResult};
+pub use flare::{davenport_area, davenport_template, fit_flares, fit_flares_batch, flare_flux, flare_model, FlareComponent, FlareFitOptions, FlareFitResult};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use flare::fit_flares_batch_gpu;
 pub use gp::fit_gp_predict;
 pub use gp2d::{fit_gp_2d, fit_gp_2d_with_thermal, get_band_wavelength, DenseGP2D, Gp2dResult, Gp2dThermalResult};
 #[cfg(any(feature = "cuda", feature = "metal"))]

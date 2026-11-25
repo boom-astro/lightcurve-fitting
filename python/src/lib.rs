@@ -19,6 +19,8 @@ use ::lightcurve_fitting::{
     metzger_kn_mags as rs_metzger_kn_mags,
     extract_features as rs_extract_features,
     extract_features_batch as rs_extract_features_batch,
+    fit_flares as rs_fit_flares, fit_flares_batch as rs_fit_flares_batch,
+    flare_model as rs_flare_model, FlareComponent, FlareFitOptions,
     BandData, FastFitResult, SviModelName, UncertaintyMethod,
 };
 
@@ -498,6 +500,114 @@ fn fit_gp_2d(py: Python<'_>, bands: &PyBandDataMap, n_time_steps: usize) -> PyRe
 }
 
 // ---------------------------------------------------------------------------
+// Stellar flares
+// ---------------------------------------------------------------------------
+
+fn flare_options(
+    max_flares: usize,
+    exposure_time: Option<f64>,
+    baseline_order: usize,
+    min_delta_bic: f64,
+    t_half_min: Option<f64>,
+    t_half_max: Option<f64>,
+) -> FlareFitOptions {
+    FlareFitOptions { max_flares, exposure_time, baseline_order, min_delta_bic, t_half_min, t_half_max }
+}
+
+/// Fit a sum of Davenport et al. (2014) flare templates to one band.
+///
+/// Flux should be normalised to the quiescent level (F/F_q or F/F_q - 1) so
+/// that ``equivalent_duration`` is the usual ED, in the input time unit.
+///
+/// Args:
+///     times, flux, flux_err: Parallel sequences for a single band.
+///     max_flares: Largest number of template components tried.
+///     exposure_time: Exposure length (same unit as times); the template is
+///         averaged over each exposure. None samples it at each timestamp.
+///     baseline_order: 0 for a constant baseline, 1 for linear.
+///     min_delta_bic: BIC gain required to accept each extra component.
+///     t_half_min, t_half_max: Bounds on the FWHM; None picks them from the data.
+///
+/// Returns a dict with ``flares`` (list of dicts), ``baseline``, ``chi2``,
+/// ``reduced_chi2``, ``bic`` and ``per_k_bic``, or None for too few points.
+#[pyfunction]
+#[pyo3(signature = (times, flux, flux_err, max_flares=4, exposure_time=None, baseline_order=0, min_delta_bic=10.0, t_half_min=None, t_half_max=None))]
+#[allow(clippy::too_many_arguments)]
+fn fit_flares(
+    py: Python<'_>,
+    times: Vec<f64>,
+    flux: Vec<f64>,
+    flux_err: Vec<f64>,
+    max_flares: usize,
+    exposure_time: Option<f64>,
+    baseline_order: usize,
+    min_delta_bic: f64,
+    t_half_min: Option<f64>,
+    t_half_max: Option<f64>,
+) -> PyResult<PyObject> {
+    let opts = flare_options(max_flares, exposure_time, baseline_order, min_delta_bic, t_half_min, t_half_max);
+    let result = py.allow_threads(|| rs_fit_flares(&times, &flux, &flux_err, &opts));
+    Ok(pythonize(py, &result)?.unbind())
+}
+
+/// Fit many ``(times, flux, flux_err)`` windows in parallel; same options as
+/// ``fit_flares``. Returns a list of result dicts (or None).
+#[pyfunction]
+#[pyo3(signature = (windows, max_flares=4, exposure_time=None, baseline_order=0, min_delta_bic=10.0, t_half_min=None, t_half_max=None))]
+#[allow(clippy::too_many_arguments)]
+fn fit_flares_batch(
+    py: Python<'_>,
+    windows: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
+    max_flares: usize,
+    exposure_time: Option<f64>,
+    baseline_order: usize,
+    min_delta_bic: f64,
+    t_half_min: Option<f64>,
+    t_half_max: Option<f64>,
+) -> PyResult<PyObject> {
+    let opts = flare_options(max_flares, exposure_time, baseline_order, min_delta_bic, t_half_min, t_half_max);
+    let bands: Vec<BandData> = windows
+        .into_iter()
+        .map(|(times, values, errors)| BandData { times, values, errors })
+        .collect();
+    let results = py.allow_threads(|| rs_fit_flares_batch(&bands, &opts));
+    Ok(pythonize(py, &results)?.unbind())
+}
+
+/// Sum of flare templates (no baseline) at ``times``.
+#[pyfunction]
+#[pyo3(signature = (times, t_peak, t_half, amplitude, exposure_time=None))]
+fn flare_model(
+    times: Vec<f64>,
+    t_peak: Vec<f64>,
+    t_half: Vec<f64>,
+    amplitude: Vec<f64>,
+    exposure_time: Option<f64>,
+) -> PyResult<Vec<f64>> {
+    if t_peak.len() != t_half.len() || t_peak.len() != amplitude.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "t_peak, t_half and amplitude must have the same length",
+        ));
+    }
+    let flares: Vec<FlareComponent> = t_peak
+        .iter()
+        .zip(&t_half)
+        .zip(&amplitude)
+        .map(|((&t_peak, &t_half), &amplitude)| FlareComponent {
+            t_peak,
+            t_half,
+            amplitude,
+            equivalent_duration: f64::NAN,
+            t_peak_err: None,
+            t_half_err: None,
+            amplitude_err: None,
+            equivalent_duration_err: None,
+        })
+        .collect();
+    Ok(rs_flare_model(&times, &flares, exposure_time.unwrap_or(0.0)))
+}
+
+// ---------------------------------------------------------------------------
 // Feature extraction
 // ---------------------------------------------------------------------------
 
@@ -574,5 +684,8 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_gp_2d, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_flares, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_flares_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(flare_model, m)?)?;
     Ok(())
 }

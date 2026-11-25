@@ -298,3 +298,44 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Stellar flares
+# ---------------------------------------------------------------------------
+
+def make_flare_lc(n=300, cadence=1.0 / 1440, seed=3):
+    import random
+    rng = random.Random(seed)
+    t = [i * cadence for i in range(n)]
+    model = lcf.flare_model(t, [0.06], [5.0 / 1440], [0.02], cadence)
+    f = [m + rng.gauss(0, 1e-3) for m in model]
+    return t, f, [1e-3] * n
+
+
+def test_flare_model_shape():
+    t = [-0.5, 0.0, 0.5, 3.0]
+    y = lcf.flare_model(t, [0.0], [1.0], [2.0])
+    assert y[1] == 2.0
+    assert 0 < y[0] < 2.0 and 0 < y[2] < 2.0 and y[3] < y[2]
+
+
+def test_fit_flares():
+    t, f, e = make_flare_lc()
+    res = lcf.fit_flares(t, f, e, exposure_time=1.0 / 1440)
+    assert len(res["flares"]) == 1
+    fl = res["flares"][0]
+    assert abs(fl["t_peak"] - 0.06) < 3 * fl["t_peak_err"]
+    assert abs(fl["amplitude"] - 0.02) < 3 * fl["amplitude_err"]
+    assert len(res["per_k_bic"]) >= 2
+
+
+def test_fit_flares_batch():
+    windows = [make_flare_lc(seed=s) for s in range(3)]
+    out = lcf.fit_flares_batch(windows, exposure_time=1.0 / 1440)
+    assert len(out) == 3
+    assert all(len(r["flares"]) == 1 for r in out)
+
+
+def test_fit_flares_too_few_points():
+    assert lcf.fit_flares([0.0, 1.0], [0.0, 0.0], [1.0, 1.0]) is None
