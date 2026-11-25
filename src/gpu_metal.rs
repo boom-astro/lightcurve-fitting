@@ -1433,6 +1433,9 @@ impl GpuContext {
         };
         let ks = read_i32(&d_k);
         let nbics = read_i32(&d_nbic);
+        if nbics.iter().any(|&n| n < 1) {
+            return Err("batch_flare_fit: the Metal kernel did not complete".to_string());
+        }
 
         Ok((0..n_windows)
             .map(|i| FlareBatchOutput {
