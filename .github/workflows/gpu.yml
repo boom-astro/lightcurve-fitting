@@ -21,11 +21,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # No GPU on hosted runners, so this only checks that the kernels, their
-      # Rust bindings and the extract-features binary compile and link.
+      # Rust bindings, the extract-features binary and the examples compile and link.
       - name: Build with CUDA kernels
         env:
           RUSTFLAGS: -L /usr/local/cuda/lib64
-        run: cargo build --release --features cuda,cli --bins --tests
+        run: cargo build --release --features cuda,cli --bins --tests --examples
 
   metal:
     name: Metal
@@ -38,8 +38,8 @@ jobs:
       - name: Install Metal toolchain
         run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
       - name: Metal tests
-        run: cargo test --release --features metal --test test_metal
+        run: cargo test --release --features metal --test test_metal --test test_flare
       - name: Metal tests without fast-math
         env:
           LCF_METAL_STRICT_MATH: "1"
-        run: cargo test --release --features metal --test test_metal
+        run: cargo test --release --features metal --test test_metal --test test_flare

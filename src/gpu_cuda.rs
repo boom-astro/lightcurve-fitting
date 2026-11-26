@@ -163,6 +163,33 @@ extern "C" {
     );
 }
 
+// Batch flare search launcher
+extern "C" {
+    fn launch_batch_flare_fit(
+        all_t: *const f64,
+        all_y: *const f64,
+        all_w: *const f64,
+        all_s: *const f64,
+        offsets: *const c_int,
+        win_params: *const f64,
+        out_theta: *mut f64,
+        out_k: *mut c_int,
+        out_bic: *mut f64,
+        out_nbic: *mut c_int,
+        n_windows: c_int,
+        max_k: c_int,
+        nb: c_int,
+        iters_per_dim: c_int,
+        min_dbic: f64,
+        area: f64,
+        min_cov: f64,
+        tol_abs: f64,
+        tol_rel: f64,
+        grid: c_int,
+        block: c_int,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Safe wrappers
 // ---------------------------------------------------------------------------
@@ -1419,6 +1446,74 @@ impl GpuContext {
             .collect();
 
         Ok(results)
+    }
+
+    /// Search flare components for every window (one warp per window).
+    pub fn batch_flare_fit(&self, input: &FlareBatchInput) -> Result<Vec<FlareBatchOutput>, String> {
+        let n_windows = input.offsets.len().saturating_sub(1);
+        if n_windows == 0 {
+            return Ok(Vec::new());
+        }
+        let max_dim = 2 * FLARE_GPU_MAX_K;
+        let n_bic = FLARE_GPU_MAX_K + 1;
+
+        let d_t = DevBuf::upload(&input.times)?;
+        let d_y = DevBuf::upload(&input.flux)?;
+        let d_w = DevBuf::upload(&input.weight)?;
+        let d_s = DevBuf::upload(&input.support)?;
+        let d_off = DevBuf::upload(&input.offsets)?;
+        let d_wp = DevBuf::upload(&input.window_params)?;
+        let d_theta = DevBuf::alloc(n_windows * max_dim * size_of::<f64>())?;
+        let d_k = DevBuf::alloc(n_windows * size_of::<c_int>())?;
+        let d_bic = DevBuf::alloc(n_windows * n_bic * size_of::<f64>())?;
+        let d_nbic = DevBuf::alloc(n_windows * size_of::<c_int>())?;
+
+        let block: c_int = 128;
+        let grid: c_int = ((n_windows * 32) as c_int + block - 1) / block;
+        unsafe {
+            launch_batch_flare_fit(
+                d_t.ptr as _,
+                d_y.ptr as _,
+                d_w.ptr as _,
+                d_s.ptr as _,
+                d_off.ptr as _,
+                d_wp.ptr as _,
+                d_theta.ptr as _,
+                d_k.ptr as _,
+                d_bic.ptr as _,
+                d_nbic.ptr as _,
+                n_windows as c_int,
+                input.max_flares as c_int,
+                input.n_baseline as c_int,
+                150,
+                input.min_delta_bic,
+                input.template_area,
+                input.min_coverage,
+                // Same simplex tolerance as the CPU search.
+                1e-5,
+                0.0,
+                grid,
+                block,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+
+        let mut theta = vec![0.0f64; n_windows * max_dim];
+        let mut bic = vec![0.0f64; n_windows * n_bic];
+        let mut ks = vec![0 as c_int; n_windows];
+        let mut nbics = vec![0 as c_int; n_windows];
+        d_theta.download_into(&mut theta)?;
+        d_bic.download_into(&mut bic)?;
+        d_k.download_into(&mut ks)?;
+        d_nbic.download_into(&mut nbics)?;
+
+        Ok((0..n_windows)
+            .map(|i| FlareBatchOutput {
+                theta: theta[i * max_dim..i * max_dim + 2 * ks[i] as usize].to_vec(),
+                per_k_bic: bic[i * n_bic..i * n_bic + nbics[i] as usize].to_vec(),
+            })
+            .collect())
     }
 }
 

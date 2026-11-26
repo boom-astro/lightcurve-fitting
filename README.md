@@ -2,7 +2,7 @@
 
 Lightcurve fitting library for astronomical transients, written in Rust.
 
-Provides three complementary fitters that operate on multi-band photometry (ZTF g/r/i):
+Provides three complementary fitters that operate on multi-band photometry (ZTF g/r/i), plus a single-band stellar flare fitter:
 
 | Fitter | Input | Method | Key outputs |
 |--------|-------|--------|-------------|
@@ -10,6 +10,7 @@ Provides three complementary fitters that operate on multi-band photometry (ZTF 
 | **Parametric** | fluxes | PSO model selection → SVI or Laplace uncertainty | best-fit model (Bazin, Villar, TDE, Arnett, Magnetar, …), posterior means & uncertainties |
 | **Thermal** | magnitudes | Blackbody color fitting via PSO | log temperature at peak, cooling rate |
 | **Kilonova** | magnitudes | Joint multi-band, bandpass-integrated blackbody with a grid-trained prior, Levenberg–Marquardt | luminosity and temperature evolution, merger time, kilonova-prior cost |
+| **Flares** | relative flux | Sum of Davenport (2014) templates, variable projection, BIC for the number of components | peak time, FWHM, amplitude, equivalent duration (with uncertainties) per component |
 
 ## Quick start
 
@@ -41,6 +42,10 @@ cargo build --release --features cuda
 
 Requires CUDA toolkit (tested with 12.x). The build system auto-detects
 `nvcc` via the `CUDA_PATH` environment variable or standard locations.
+
+The stellar flare fitter also has a GPU batch path, `fit_flares_batch_gpu`,
+for both `--features cuda` and `--features metal`
+(see [docs/models/flares.md](docs/models/flares.md)).
 
 ## Building
 

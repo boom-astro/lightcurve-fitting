@@ -16,6 +16,7 @@ pub mod thermal;
 pub mod sbpl;
 pub mod kilonova;
 mod kilonova_tables;
+pub mod flare;
 pub mod features;
 
 pub use batch::{FastFitResult, fit_batch_fast, fit_batch_parametric};
@@ -29,6 +30,9 @@ pub use parametric::{eval_model_flux, metzger_kn_mags, fit_parametric, fit_param
 pub use thermal::{fit_thermal, ThermalResult};
 pub use sbpl::{fit_sbpl, SbplResult};
 pub use kilonova::{fit_kilonova, fit_kilonova_batch, kilonova_band_supported, kilonova_mags, KilonovaFit, KilonovaOptions, KilonovaPrior, KilonovaResult, KILONOVA_PARAM_NAMES};
+pub use flare::{davenport_area, davenport_template, fit_flares, fit_flares_batch, flare_flux, flare_model, FlareComponent, FlareFitOptions, FlareFitResult};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use flare::fit_flares_batch_gpu;
 pub use gp::fit_gp_predict;
 pub use gp2d::{fit_gp_2d, fit_gp_2d_with_thermal, get_band_wavelength, DenseGP2D, Gp2dResult, Gp2dThermalResult};
 #[cfg(any(feature = "cuda", feature = "metal"))]

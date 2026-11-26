@@ -42,6 +42,7 @@ nav:
     - Parametric Models: models/parametric.md
     - Thermal Fitting: models/thermal.md
     - Kilonova Blackbody: models/kilonova.md
+    - Stellar Flares: models/flares.md
   - Examples:
     - SN Ia: examples/sn_ia.md
     - TDE: examples/tde.md

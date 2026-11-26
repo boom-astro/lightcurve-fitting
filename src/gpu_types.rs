@@ -203,3 +203,46 @@ pub struct SviBatchOutput {
     pub log_sigma: Vec<f64>,
     pub elbo: f64,
 }
+
+// ---------------------------------------------------------------------------
+// Stellar flare types
+// ---------------------------------------------------------------------------
+
+/// Largest number of flare components the GPU kernels search over.
+pub const FLARE_GPU_MAX_K: usize = 6;
+/// Largest baseline polynomial order (number of terms − 1) the GPU kernels support.
+pub const FLARE_GPU_MAX_BASELINE_ORDER: usize = 1;
+/// Per-window parameters: half exposure, t_peak lower/upper bound,
+/// ln t_half lower/upper bound, cadence.
+pub const FLARE_WINDOW_PARAMS: usize = 6;
+
+/// Packed flare windows for the GPU search, already rescaled per window
+/// (times in cadence units from the window start, flux median-subtracted and
+/// divided by the median error) so float32 kernels stay well conditioned.
+pub struct FlareBatchInput {
+    pub times: Vec<f64>,
+    pub flux: Vec<f64>,
+    /// Inverse variances.
+    pub weight: Vec<f64>,
+    /// Time each point represents, for the coverage check.
+    pub support: Vec<f64>,
+    /// Start of each window in the packed arrays, followed by the total length.
+    pub offsets: Vec<i32>,
+    /// `FLARE_WINDOW_PARAMS` values per window.
+    pub window_params: Vec<f64>,
+    pub max_flares: usize,
+    /// Number of baseline polynomial terms (1 or 2).
+    pub n_baseline: usize,
+    pub min_delta_bic: f64,
+    pub template_area: f64,
+    pub min_coverage: f64,
+}
+
+/// GPU search result for one window, in that window's rescaled units.
+#[derive(Clone, Debug)]
+pub struct FlareBatchOutput {
+    /// [t_peak, ln t_half] for each accepted component.
+    pub theta: Vec<f64>,
+    /// BIC for K = 0, 1, …, up to the first rejected K.
+    pub per_k_bic: Vec<f64>,
+}
