@@ -486,23 +486,26 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
     let dm = opts.distance_modulus.unwrap_or(0.0);
     let mut obs = Vec::new();
     let mut skipped = Vec::new();
+    let mut t_first = f64::INFINITY;
     for (k, name) in names.iter().enumerate() {
         let bd = &bands[*name];
-        let Some(info) = band_info(name, prior.offsets.as_ref()) else {
+        let info = band_info(name, prior.offsets.as_ref());
+        if info.is_none() {
             skipped.push((*name).clone());
-            continue;
-        };
+        }
         let detected = detection_mask(&bd.values, &bd.errors);
         for i in 0..bd.times.len() {
             let (t, m, e) = (bd.times[i], bd.values[i], bd.errors[i]);
             if !(detected[i] && t.is_finite() && m.is_finite() && e.is_finite()) {
                 continue;
             }
-            let err = (e * e + opts.sys_err * opts.sys_err).sqrt();
-            obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info, band: k });
+            t_first = t_first.min(t);
+            if let Some(info) = info {
+                let err = (e * e + opts.sys_err * opts.sys_err).sqrt();
+                obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info, band: k });
+            }
         }
     }
-    let t_first = obs.iter().map(|o| o.t).fold(f64::INFINITY, f64::min);
     if let Some(days) = opts.max_days {
         obs.retain(|o| o.t <= t_first + days);
     }

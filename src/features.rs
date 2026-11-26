@@ -632,6 +632,24 @@ pub fn kilonova_feature_options() -> KilonovaOptions {
     KilonovaOptions { max_days: Some(10.0), ..Default::default() }
 }
 
+fn kilonova_ztf_bands(mag_bands: &HashMap<String, BandData>) -> HashMap<String, BandData> {
+    let mut names: Vec<&String> = mag_bands.keys().collect();
+    names.sort();
+    let mut out: HashMap<String, BandData> = HashMap::new();
+    for name in names {
+        let bd = &mag_bands[name];
+        let key = match name.as_str() {
+            "g" | "r" | "i" => format!("ztf{name}"),
+            _ => name.clone(),
+        };
+        let e = out.entry(key).or_insert_with(|| BandData { times: Vec::new(), values: Vec::new(), errors: Vec::new() });
+        e.times.extend_from_slice(&bd.times);
+        e.values.extend_from_slice(&bd.values);
+        e.errors.extend_from_slice(&bd.errors);
+    }
+    out
+}
+
 /// Features from `fit_kilonova`: the prior cost, fit quality, and the shape and
 /// explosion time of the prior-held and free fits. `kn_t_exp` is in the data's
 /// time frame (days from the first observation for `build_mag_bands` input).
@@ -714,7 +732,7 @@ pub fn extract_features(
         None => (None, None),
     };
 
-    let kilonova = fit_kilonova(mag_bands, &kilonova_feature_options());
+    let kilonova = fit_kilonova(&kilonova_ztf_bands(mag_bands), &kilonova_feature_options());
 
     extract_features_from_results(&np_results, &param_results, &thermal, &sbpl, &gp2d_result, &gp2d_thermal, ref_band)
         .into_iter()
