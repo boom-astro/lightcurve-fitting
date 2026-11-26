@@ -30,6 +30,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::BandData;
+use crate::nonparametric::detection_mask;
 use crate::kilonova_tables::{
     BANDPASS_TABLES, LOGT_MIN, LOGT_STEP, N_LOGT, PRIOR_COVS, PRIOR_MEANS, PRIOR_WEIGHTS, SED_OFFSETS,
 };
@@ -310,6 +311,7 @@ struct Obs {
     mag: f64,
     w: f64,
     info: BandInfo,
+    band: usize,
 }
 
 /// Residual vector with log_l1 solved exactly, plus that log_l1.
@@ -447,13 +449,14 @@ fn fit_once(
     }
     let (mut shape, mut t_exp, mut cost) = best.expect("at least one start");
     if t_exp_fixed.is_none() {
-        let x0 = [shape[0], shape[1], shape[2], shape[3], t_exp];
-        let lo = [SHAPE_LO[0], SHAPE_LO[1], SHAPE_LO[2], SHAPE_LO[3], t_exp_range.0];
-        let hi = [SHAPE_HI[0], SHAPE_HI[1], SHAPE_HI[2], SHAPE_HI[3], t_exp_range.1];
-        let (x, c) = levenberg_marquardt(|p| profiled_residuals(obs, prior, &p[..4], p[4]).0, &x0, &lo, &hi, 100);
+        let t_ref = t_exp_range.1;
+        let x0 = [shape[0], shape[1], shape[2], shape[3], t_exp - t_ref];
+        let lo = [SHAPE_LO[0], SHAPE_LO[1], SHAPE_LO[2], SHAPE_LO[3], t_exp_range.0 - t_ref];
+        let hi = [SHAPE_HI[0], SHAPE_HI[1], SHAPE_HI[2], SHAPE_HI[3], 0.0];
+        let (x, c) = levenberg_marquardt(|p| profiled_residuals(obs, prior, &p[..4], t_ref + p[4]).0, &x0, &lo, &hi, 100);
         if c < cost {
             shape = x[..4].to_vec();
-            t_exp = x[4];
+            t_exp = t_ref + x[4];
             cost = c;
         }
     }
@@ -482,35 +485,33 @@ pub fn fit_kilonova(bands: &HashMap<String, BandData>, opts: &KilonovaOptions) -
     names.sort();
     let dm = opts.distance_modulus.unwrap_or(0.0);
     let mut obs = Vec::new();
-    let (mut used, mut skipped) = (Vec::new(), Vec::new());
-    for name in names {
-        let bd = &bands[name];
+    let mut skipped = Vec::new();
+    for (k, name) in names.iter().enumerate() {
+        let bd = &bands[*name];
         let Some(info) = band_info(name, prior.offsets.as_ref()) else {
-            skipped.push(name.clone());
+            skipped.push((*name).clone());
             continue;
         };
-        let mut any = false;
+        let detected = detection_mask(&bd.values, &bd.errors);
         for i in 0..bd.times.len() {
             let (t, m, e) = (bd.times[i], bd.values[i], bd.errors[i]);
-            if !(t.is_finite() && m.is_finite() && e.is_finite() && e >= 0.0) {
+            if !(detected[i] && t.is_finite() && m.is_finite() && e.is_finite()) {
                 continue;
             }
             let err = (e * e + opts.sys_err * opts.sys_err).sqrt();
-            if err <= 0.0 {
-                continue;
-            }
-            obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info });
-            any = true;
-        }
-        if any {
-            used.push(name.clone());
+            obs.push(Obs { t, mag: m - dm, w: 1.0 / err, info, band: k });
         }
     }
     let t_first = obs.iter().map(|o| o.t).fold(f64::INFINITY, f64::min);
     if let Some(days) = opts.max_days {
         obs.retain(|o| o.t <= t_first + days);
-        used.retain(|name| bands[name].times.iter().any(|&t| t.is_finite() && t <= t_first + days));
     }
+    let used: Vec<String> = names
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| obs.iter().any(|o| o.band == *k))
+        .map(|(_, name)| (*name).clone())
+        .collect();
     if obs.len() < 3 {
         return None;
     }

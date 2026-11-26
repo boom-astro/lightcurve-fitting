@@ -134,7 +134,7 @@ fn power_law_afterglow_has_large_prior_cost() {
 
 #[test]
 fn at2017gfo_full_fit_matches_reference() {
-    // Independent SciPy fit of the same model: free fit, merger time known, 0.4-10 d.
+    // Independent fit of the same model: free fit, merger time known, 0.4-10 d, SNR >= 3.
     let mut data = at2017gfo();
     for bd in data.values_mut() {
         let keep: Vec<usize> = (0..bd.times.len()).filter(|&i| bd.times[i] > 0.4 && bd.times[i] < 10.0).collect();
@@ -146,12 +146,12 @@ fn at2017gfo_full_fit_matches_reference() {
     }
     let opts = KilonovaOptions { t_exp: Some(0.0), distance_modulus: Some(0.0), sys_err: 0.05, ..Default::default() };
     let res = fit_kilonova(&data, &opts).unwrap();
-    assert_eq!(res.n_obs, 112);
-    let want = [41.6839, -0.5698, -0.3994, 3.7509, 0.4084];
+    assert_eq!(res.n_obs, 110);
+    let want = [41.6838, -0.5703, -0.3984, 3.7509, 0.4087];
     for (got, w) in res.free.params.iter().zip(want) {
         assert!((got - w).abs() < 0.01, "free params {:?} vs {:?}", res.free.params, want);
     }
-    assert!((res.free.rms - 0.3192).abs() < 0.005, "rms {}", res.free.rms);
+    assert!((res.free.rms - 0.3074).abs() < 0.005, "rms {}", res.free.rms);
 }
 
 #[test]

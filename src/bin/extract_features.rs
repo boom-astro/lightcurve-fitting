@@ -89,7 +89,9 @@ struct SourceEntry {
 // NPZ reader (AppleCider format)
 // ---------------------------------------------------------------------------
 
-fn read_photometry_npz(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+type Photometry = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>, Vec<String>);
+
+fn read_photometry_npz(path: &Path) -> Option<Photometry> {
     let file = fs::File::open(path).ok()?;
     let mut npz = NpzReader::new(file).ok()?;
     let data: Array2<f32> = npz.by_name("data.npy").ok()?;
@@ -101,6 +103,7 @@ fn read_photometry_npz(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec
     let mut mags = Vec::with_capacity(n_rows);
     let mut mag_errs = Vec::with_capacity(n_rows);
     let mut bands = Vec::with_capacity(n_rows);
+    let mut kn_bands = Vec::with_capacity(n_rows);
 
     for i in 0..n_rows {
         let dt = data[[i, 0]] as f64;
@@ -124,10 +127,11 @@ fn read_photometry_npz(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec
         mags.push(mag);
         mag_errs.push(mag_err);
         bands.push(band_name.to_string());
+        kn_bands.push(format!("ztf{band_name}"));
     }
 
     if times.is_empty() { return None; }
-    Some((times, mags, mag_errs, bands))
+    Some((times, mags, mag_errs, bands, kn_bands))
 }
 
 // ---------------------------------------------------------------------------
@@ -158,12 +162,12 @@ fn build_datacube_index(dir: &Path) -> HashMap<String, PathBuf> {
     index
 }
 
-fn read_photometry_datacube(index: &HashMap<String, PathBuf>, obj_id: &str) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+fn read_photometry_datacube(index: &HashMap<String, PathBuf>, obj_id: &str) -> Option<Photometry> {
     let path = index.get(obj_id)?;
     parse_datacube_csv(path)
 }
 
-fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+fn parse_datacube_csv(path: &Path) -> Option<Photometry> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -180,6 +184,7 @@ fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
     let mut mags = Vec::new();
     let mut mag_errs = Vec::new();
     let mut bands = Vec::new();
+    let mut kn_bands = Vec::new();
 
     for result in rdr.records() {
         let record = match result {
@@ -232,10 +237,11 @@ fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
         mags.push(mag);
         mag_errs.push(mag_err);
         bands.push(band.to_string());
+        kn_bands.push(filter);
     }
 
     if times.is_empty() { return None; }
-    Some((times, mags, mag_errs, bands))
+    Some((times, mags, mag_errs, bands, kn_bands))
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +251,7 @@ fn parse_datacube_csv(path: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
 /// Read ZTF photometry.csv from a source directory.
 /// Columns: jd, fid (1=g, 2=r, 3=i), magpsf, sigmapsf, diffmaglim.
 /// Rows without magpsf are non-detections (upper limits via diffmaglim).
-fn read_photometry_ztf(dir: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>)> {
+fn read_photometry_ztf(dir: &Path) -> Option<Photometry> {
     let csv_path = dir.join("photometry.csv");
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -263,6 +269,7 @@ fn read_photometry_ztf(dir: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
     let mut mags = Vec::new();
     let mut mag_errs = Vec::new();
     let mut bands = Vec::new();
+    let mut kn_bands = Vec::new();
 
     for result in rdr.records() {
         let record = match result {
@@ -299,6 +306,7 @@ fn read_photometry_ztf(dir: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
             mags.push(mag);
             mag_errs.push(err);
             bands.push(band.to_string());
+            kn_bands.push(format!("ztf{band}"));
         } else if let Some(li) = lim_idx {
             // Non-detection: use diffmaglim as upper limit magnitude with large error
             if let Some(lim) = record.get(li).and_then(|s| s.parse::<f64>().ok()) {
@@ -307,13 +315,14 @@ fn read_photometry_ztf(dir: &Path) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<
                     mags.push(lim);
                     mag_errs.push(1.0); // Large error → SNR < 3 → treated as upper limit
                     bands.push(band.to_string());
+                    kn_bands.push(format!("ztf{band}"));
                 }
             }
         }
     }
 
     if times.is_empty() { return None; }
-    Some((times, mags, mag_errs, bands))
+    Some((times, mags, mag_errs, bands, kn_bands))
 }
 
 /// Discover ZTF source directories (each contains photometry.csv).
@@ -480,6 +489,7 @@ fn main() {
         // Read all photometry for this batch
         let mut mag_bands_vec: Vec<Option<HashMap<String, BandData>>> = Vec::with_capacity(batch.len());
         let mut flux_bands_vec: Vec<Option<HashMap<String, BandData>>> = Vec::with_capacity(batch.len());
+        let mut kn_bands_vec: Vec<Option<HashMap<String, BandData>>> = Vec::with_capacity(batch.len());
         let mut source_ids: Vec<&str> = Vec::with_capacity(batch.len());
 
         for entry in batch {
@@ -496,15 +506,17 @@ fn main() {
             };
 
             match photo {
-                Some((times, mags, mag_errs, bands)) if times.len() >= 2 => {
+                Some((times, mags, mag_errs, bands, kn_bands)) if times.len() >= 2 => {
                     let mb = build_mag_bands(&times, &mags, &mag_errs, &bands);
                     let fb = build_flux_bands(&times, &mags, &mag_errs, &bands);
                     mag_bands_vec.push(Some(mb));
                     flux_bands_vec.push(Some(fb));
+                    kn_bands_vec.push(Some(build_mag_bands(&times, &mags, &mag_errs, &kn_bands)));
                 }
                 _ => {
                     mag_bands_vec.push(None);
                     flux_bands_vec.push(None);
+                    kn_bands_vec.push(None);
                 }
             }
         }
@@ -735,7 +747,7 @@ fn main() {
             // Thermal using trained GPs from nonparametric
             let (_, ref gps) = np_results[vi];
             let thermal = fit_thermal(mag, Some(gps));
-            let kilonova = fit_kilonova(mag, &kilonova_feature_options());
+            let kilonova = fit_kilonova(kn_bands_vec[orig_idx].as_ref().unwrap(), &kilonova_feature_options());
 
             (param, thermal, kilonova)
         }).collect();
