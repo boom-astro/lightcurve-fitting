@@ -46,7 +46,7 @@ impl GpPredictor for SparseGP {
 const SNR_THRESHOLD: f64 = 3.0;
 
 /// Returns boolean mask: true = detection (SNR >= 3), false = upper limit.
-fn detection_mask(mags: &[f64], mag_errs: &[f64]) -> Vec<bool> {
+pub(crate) fn detection_mask(mags: &[f64], mag_errs: &[f64]) -> Vec<bool> {
     let zp = 23.9;
     mags.iter()
         .zip(mag_errs.iter())

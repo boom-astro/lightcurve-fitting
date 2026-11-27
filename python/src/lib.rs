@@ -448,6 +448,111 @@ fn metzger_kn_mags(
     Ok(pythonize(py, &result)?.unbind())
 }
 
+/// Options shared by `fit_kilonova` and `fit_kilonova_batch`.
+#[allow(clippy::too_many_arguments)]
+fn kilonova_options(
+    t_exp: Option<f64>,
+    t_exp_window: f64,
+    t_last_nondet: Option<f64>,
+    distance_modulus: Option<f64>,
+    sys_err: f64,
+    prior_inflate: f64,
+    prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
+) -> PyResult<::lightcurve_fitting::KilonovaOptions> {
+    let prior = match prior {
+        Some(p) => Some(pythonize::depythonize::<::lightcurve_fitting::KilonovaPrior>(p)?),
+        None => None,
+    };
+    Ok(::lightcurve_fitting::KilonovaOptions { t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days })
+}
+
+/// Fit the chromatic blackbody kilonova model to magnitude bands.
+///
+/// log10 L = log_l1 + a1 x + a2 x^2 and log10 T = log_t1 - beta x with
+/// x = log10(t - t_exp); band magnitudes add fixed offsets learned from the
+/// POSSIS Bu2019 grid. The light curve is fit once freely and once held to the
+/// grid prior; `prior_cost` is the chi2 increase from the prior.
+///
+/// Args:
+///     bands: Magnitude BandDataMap (from `build_mag_bands`).
+///     t_exp: Fixed explosion time in the bands' time frame, or None to fit it
+///         within `t_exp_window` days before the first point.
+///     t_exp_window: Search window for a free explosion time (days).
+///     t_last_nondet: Time of the last non-detection before the first point;
+///         a free explosion time is kept after it.
+///     distance_modulus: If given, magnitudes are made absolute and log_l1
+///         joins the prior.
+///     sys_err: Systematic error (mag) added in quadrature.
+///     prior_inflate: Factor on the prior standard deviations.
+///     prior: Optional dict with "weights", "means" (5-vectors) and "covs"
+///         (5x5) of a Gaussian mixture on (log_l1, a1, a2, log_t1, beta), used
+///         in place of the built-in prior (see `kilonova_default_prior`).
+///     max_days: Use only points within this many days after the first point.
+///
+/// Returns a dict, or None with fewer than three usable points or an invalid prior.
+#[pyfunction]
+#[pyo3(signature = (bands, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None, max_days=None))]
+fn fit_kilonova(
+    py: Python<'_>,
+    bands: &PyBandDataMap,
+    t_exp: Option<f64>,
+    t_exp_window: f64,
+    t_last_nondet: Option<f64>,
+    distance_modulus: Option<f64>,
+    sys_err: f64,
+    prior_inflate: f64,
+    prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
+) -> PyResult<PyObject> {
+    let inner = bands.inner.clone();
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days)?;
+    let result = py.allow_threads(|| ::lightcurve_fitting::fit_kilonova(&inner, &opts));
+    Ok(pythonize(py, &result)?.unbind())
+}
+
+/// `fit_kilonova` over a list of BandDataMap objects in parallel.
+#[pyfunction]
+#[pyo3(signature = (sources, t_exp=None, t_exp_window=3.0, t_last_nondet=None, distance_modulus=None, sys_err=0.1, prior_inflate=1.5, prior=None, max_days=None))]
+fn fit_kilonova_batch(
+    py: Python<'_>,
+    sources: Vec<PyBandDataMap>,
+    t_exp: Option<f64>,
+    t_exp_window: f64,
+    t_last_nondet: Option<f64>,
+    distance_modulus: Option<f64>,
+    sys_err: f64,
+    prior_inflate: f64,
+    prior: Option<&Bound<'_, PyAny>>,
+    max_days: Option<f64>,
+) -> PyResult<PyObject> {
+    let inner: Vec<HashMap<String, BandData>> = sources.into_iter().map(|s| s.inner).collect();
+    let opts = kilonova_options(t_exp, t_exp_window, t_last_nondet, distance_modulus, sys_err, prior_inflate, prior, max_days)?;
+    let results = py.allow_threads(move || ::lightcurve_fitting::fit_kilonova_batch(&inner, &opts));
+    Ok(pythonize(py, &results)?.unbind())
+}
+
+/// The built-in kilonova prior as a dict of "weights", "means" and "covs".
+#[pyfunction]
+fn kilonova_default_prior(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(pythonize(py, &::lightcurve_fitting::KilonovaPrior::default())?.unbind())
+}
+
+/// Absolute AB magnitudes of the chromatic blackbody kilonova model.
+///
+/// Args:
+///     params: [log_l1, a1, a2, log_t1, beta].
+///     times: Days since explosion.
+///     band: Band name, e.g. "ztfg", "lsstr", "ps1::i", "2massj".
+#[pyfunction]
+fn kilonova_mags(params: Vec<f64>, times: Vec<f64>, band: &str) -> PyResult<Vec<f64>> {
+    if params.len() != 5 {
+        return Err(pyo3::exceptions::PyValueError::new_err("params must have 5 elements"));
+    }
+    ::lightcurve_fitting::kilonova_mags(&params, &times, band)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unsupported band: {band}")))
+}
+
 // ---------------------------------------------------------------------------
 // Batch nonparametric
 // ---------------------------------------------------------------------------
@@ -681,6 +786,10 @@ fn lightcurve_fitting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_batch_parametric, m)?)?;
     m.add_function(wrap_pyfunction!(fit_gp_predict, m)?)?;
     m.add_function(wrap_pyfunction!(metzger_kn_mags, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_kilonova, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_kilonova_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(kilonova_mags, m)?)?;
+    m.add_function(wrap_pyfunction!(kilonova_default_prior, m)?)?;
     m.add_function(wrap_pyfunction!(fit_gp_2d, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features_batch, m)?)?;
